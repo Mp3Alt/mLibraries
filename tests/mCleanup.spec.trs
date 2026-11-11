@@ -1,0 +1,311 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mCleanup = import("/mLibraries/mCleanup")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local Run = func():
+    local suite = mTestKit.New("mCleanup")
+
+    suite.Test("cleanup drains in reverse registration order", func():
+        local owner = mCleanup.New()
+        local log = ""
+        owner.Add(func():
+            log += "A"
+        )
+        owner.Add(func():
+            log += "B"
+        )
+        owner.Add(func():
+            log += "C"
+        )
+        suite.Equal(owner.GetCount(), 3, "each registration is counted")
+        local errors = owner.Clean()
+        suite.Equal(log, "CBA", "dependents clean before dependencies")
+        suite.Equal(errors.length, 0, "successful cleanup has no failures")
+        suite.Equal(owner.GetCount(), 0, "batch is no longer queued")
+    )
+
+    suite.Test("clean is idempotent and the owner is reusable", func():
+        local owner = mCleanup.New()
+        local calls = 0
+        owner.Add(func():
+            calls += 1
+        )
+        owner.Clean()
+        local emptyErrors = owner.Clean()
+        suite.Equal(calls, 1, "second clean cannot repeat work")
+        suite.Equal(emptyErrors.length, 0, "empty clean succeeds")
+        suite.Expect(not owner.IsDestroyed(), "clean leaves registration open")
+        owner.Add(func():
+            calls += 10
+        )
+        owner.Clean()
+        suite.Equal(calls, 11, "next generation of work drains normally")
+    )
+
+    suite.Test("callbacks are returned unchanged", func():
+        local owner = mCleanup.New()
+        local callback = func():
+            return nil
+        local registered = owner.Add(callback)
+        suite.Equal(registered, callback, "Add returns its input")
+        owner.Destroy()
+    )
+
+    suite.Test("cleanup errors preserve order and do not stop later tasks", func():
+        local owner = mCleanup.New()
+        local calls = 0
+        owner.Add(func():
+            throw "oldest failure"
+        )
+        owner.Add(func():
+            calls += 1
+        )
+        owner.Add(func():
+            throw "newest failure"
+        )
+        local errors = owner.Clean()
+        suite.Equal(calls, 1, "middle callback runs despite an earlier failure")
+        suite.Equal(errors.length, 2, "both failures are collected")
+        suite.Equal(errors[0], "newest failure", "errors follow execution order")
+        suite.Equal(errors[1], "oldest failure", "original thrown values are retained")
+        suite.Equal(owner.GetCount(), 0, "failed tasks leave no queued registrations")
+        local reused = 0
+        owner.Add(func():
+            reused += 1
+        )
+        owner.Clean()
+        suite.Equal(reused, 1, "failure releases the cleaning guard")
+    )
+
+    suite.Test("reentrant clean leaves the active batch to its caller", func():
+        local owner = mCleanup.New()
+        local calls = 0
+        local nestedFailures = -1
+        local queuedDuringCallback = -1
+        owner.Add(func():
+            calls += 1
+        )
+        owner.Add(func():
+            nestedFailures = owner.Clean().length
+            queuedDuringCallback = owner.GetCount()
+            calls += 10
+        )
+        local errors = owner.Clean()
+        suite.Equal(calls, 11, "all callbacks execute exactly once")
+        suite.Equal(nestedFailures, 0, "nested clean does not drain again")
+        suite.Equal(queuedDuringCallback, 0, "active batch is detached")
+        suite.Equal(errors.length, 0, "reentry is safe")
+    )
+
+    suite.Test("destroy during clean closes registration and completes the batch", func():
+        local owner = mCleanup.New()
+        local log = ""
+        local nestedFailures = -1
+        owner.Add(func():
+            log += "old;"
+        )
+        owner.Add(func():
+            nestedFailures = owner.Destroy().length
+            log += "new;"
+        )
+        local errors = owner.Clean()
+        suite.Equal(log, "new;old;", "destroy does not abandon active teardown")
+        suite.Equal(nestedFailures, 0, "nested destroy returns an empty result")
+        suite.Equal(errors.length, 0, "outer call owns the active result")
+        suite.Expect(owner.IsDestroyed(), "nested destroy permanently closes the owner")
+        suite.Equal(owner.Destroy().length, 0, "repeat destroy cannot repeat work")
+        local addAfterDestroy = func():
+            owner.Add(func():
+                log += "late;"
+            )
+        suite.Throws(addAfterDestroy, "destroyed owner rejects new work")
+    )
+
+    suite.Test("registration during clean fails without losing old work", func():
+        local owner = mCleanup.New()
+        local calls = 0
+        owner.Add(func():
+            calls += 1
+        )
+        owner.Add(func():
+            owner.Add(func():
+                calls += 100
+            )
+        )
+        local errors = owner.Clean()
+        suite.Equal(errors.length, 1, "rejected registration is a captured callback failure")
+        suite.Equal(calls, 1, "older work still runs and rejected work never runs")
+        suite.Equal(owner.GetCount(), 0, "rejected registration is not queued")
+        suite.Equal(owner.Clean().length, 0, "rejected work cannot run later")
+    )
+
+    suite.Test("destroy closes registration before callbacks begin", func():
+        local owner = mCleanup.New()
+        local observedDestroyed = false
+        owner.Add(func():
+            observedDestroyed = owner.IsDestroyed()
+        )
+        owner.Destroy()
+        suite.Expect(observedDestroyed, "callbacks observe a closed owner")
+        suite.Equal(owner.Clean().length, 0, "clean after destroy has no work")
+        local addAfterDestroy = func():
+            owner.Add(func():
+                return nil
+            )
+        suite.Throws(addAfterDestroy, "Add after destroy throws")
+        local addConnectionAfterDestroy = func():
+            owner.AddConnection({})
+        suite.Throws(addConnectionAfterDestroy, "connection registration after destroy throws")
+        local addInstanceAfterDestroy = func():
+            owner.AddInstance({})
+        suite.Throws(addInstanceAfterDestroy, "instance registration after destroy throws")
+    )
+
+    suite.Test("explicit connection and instance adapters use their named methods", func():
+        local owner = mCleanup.New()
+        local log = ""
+        local connection = {}
+        connection.Disconnect = func():
+            log += "connection;"
+        local instance = {}
+        instance.Destroy = func():
+            log += "instance;"
+        local returnedConnection = owner.AddConnection(connection)
+        local returnedInstance = owner.AddInstance(instance)
+        suite.Equal(returnedConnection, connection, "connection adapter returns input")
+        suite.Equal(returnedInstance, instance, "instance adapter returns input")
+        local errors = owner.Destroy()
+        suite.Equal(log, "instance;connection;", "adapters honor reverse ownership order")
+        suite.Equal(errors.length, 0, "both named methods ran")
+        owner.Destroy()
+        suite.Equal(log, "instance;connection;", "adapters are not invoked twice")
+    )
+
+    suite.Test("adapter failures are isolated during cleanup", func():
+        local owner = mCleanup.New()
+        local calls = 0
+        owner.Add(func():
+            calls += 1
+        )
+        owner.AddInstance({})
+        local errors = owner.Clean()
+        suite.Equal(errors.length, 1, "missing adapter method is returned as a failure")
+        suite.Equal(calls, 1, "bad adapter does not stop other teardown")
+        suite.Equal(owner.GetCount(), 0, "bad adapter does not stay queued")
+    )
+
+    suite.Test("nil registrations do not alter ownership", func():
+        local owner = mCleanup.New()
+        local addNil = func():
+            owner.Add(nil)
+        suite.Throws(addNil, "nil callback is rejected")
+        local addConnectionNil = func():
+            owner.AddConnection(nil)
+        suite.Throws(addConnectionNil, "nil connection is rejected")
+        local addInstanceNil = func():
+            owner.AddInstance(nil)
+        suite.Throws(addInstanceNil, "nil instance is rejected")
+        suite.Equal(owner.GetCount(), 0, "nil values never enter the batch")
+    )
+
+    suite.Test("cleanup owners remain independent", func():
+        local first = mCleanup.New()
+        local second = mCleanup.New()
+        local calls = 0
+        first.Add(func():
+            calls += 1
+        )
+        second.Add(func():
+            calls += 10
+        )
+        first.Destroy()
+        suite.Equal(calls, 1, "first owner drains its own task")
+        suite.Equal(second.GetCount(), 1, "other task remains queued")
+        second.Clean()
+        suite.Equal(calls, 11, "other owner remains reusable")
+    )
+
+    return suite.Report()
+
+# Native-script stress entry point. It yields and must not run in run_truscript.
+local RunConcurrent = func():
+    local suite = mTestKit.New("mCleanupConcurrent")
+    local owners = []
+    local calls = []
+    local accepted = []
+    local workers = { Done = 0, Errors = [], Stop = false }
+    for i in range(256):
+        calls.push(0)
+        accepted.push(false)
+        local owner = mCleanup.New()
+        owner.Add(func():
+            calls[i] += 1
+        )
+        owners.push(owner)
+
+    spawn(func():
+        try:
+            for owner in owners:
+                if workers.Stop:
+                    return
+                local failures = owner.Clean()
+                if failures.length != 0:
+                    workers.Errors.push("unexpected cleanup failure")
+        catch failure:
+            workers.Errors.push(failure)
+        finally:
+            workers.Done += 1
+    )
+    spawn(func():
+        try:
+            for owner in owners:
+                if workers.Stop:
+                    return
+                local failures = owner.Destroy()
+                if failures.length != 0:
+                    workers.Errors.push("unexpected destroy failure")
+        catch failure:
+            workers.Errors.push(failure)
+        finally:
+            workers.Done += 1
+    )
+    spawn(func():
+        try:
+            for i in range(owners.length):
+                if workers.Stop:
+                    return
+                try:
+                    owners[i].Add(func():
+                        calls[i] += 1
+                    )
+                    accepted[i] = true
+                catch expectedRejection:
+                    pass
+        catch failure:
+            workers.Errors.push(failure)
+        finally:
+            workers.Done += 1
+    )
+
+    local deadline = host.time() + 20
+    while workers.Done < 3 and host.time() < deadline:
+        wait()
+    workers.Stop = true
+    suite.Test("concurrent add clean and destroy cannot lose or duplicate work", func():
+        suite.Equal(workers.Done, 3, "all lifecycle workers completed")
+        suite.Equal(workers.Errors.length, 0, "lifecycle workers produced no failures")
+        for i in range(owners.length):
+            local expected = 1
+            if accepted[i]:
+                expected += 1
+            suite.Equal(calls[i], expected, "every accepted registration ran exactly once")
+            suite.Expect(owners[i].IsDestroyed(), "each owner is permanently closed")
+            suite.Equal(owners[i].GetCount(), 0, "closed owner has no stranded work")
+    )
+    for owner in owners:
+        owner.Destroy()
+    return suite.Report()
+
+return { Run = Run, RunConcurrent = RunConcurrent }

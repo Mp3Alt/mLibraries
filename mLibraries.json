@@ -1,0 +1,23 @@
+{
+  "formatVersion": 1,
+  "name": "mLibraries",
+  "author": "Mp3",
+  "version": "0.1.0-dev",
+  "license": "MIT",
+  "description": "Original TruScript utility libraries for TruWorlds. This is the repository's source map, not a native engine configuration file.",
+  "modules": [
+    { "name": "mSignal", "source": "packages/mSignal/src/mSignal.trs", "path": "mLibraries/mSignal", "type": "module" },
+    { "name": "mCleanup", "source": "packages/mCleanup/src/mCleanup.trs", "path": "mLibraries/mCleanup", "type": "module" },
+    { "name": "mAsync", "source": "packages/mAsync/src/mAsync.trs", "path": "mLibraries/mAsync", "type": "module" }
+  ],
+  "tests": [
+    { "source": "tests/mTestKit.trs", "path": "mLibraries/mTestKit", "type": "module" },
+    { "source": "tests/mSignal.spec.trs", "path": "mLibraries/tests/mSignalSpec", "type": "module" },
+    { "source": "tests/mCleanup.spec.trs", "path": "mLibraries/tests/mCleanupSpec", "type": "module" },
+    { "source": "tests/mAsync.spec.trs", "path": "mLibraries/tests/mAsyncSpec", "type": "module" },
+    { "source": "tests/mRunAll.trs", "path": "mLibraries/tests/mRunAll", "type": "module" },
+    { "source": "tests/mNativeSmoke.trs", "path": "mLibraries/tests/mNativeSmoke", "type": "module" },
+    { "source": "tests/mNativeSmokeServer.trs", "path": "mLibraries/tests/mNativeSmokeServer", "type": "server", "attach_to": ["ScriptSystem/mLibrariesTests"] },
+    { "source": "tests/mNativeSmokeClient.trs", "path": "mLibraries/tests/mNativeSmokeClient", "type": "client", "attach_to": ["ScriptSystem/mLibrariesTests"] }
+  ]
+}

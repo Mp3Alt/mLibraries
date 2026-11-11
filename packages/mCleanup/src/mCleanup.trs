@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+# Owns synchronous teardown callbacks and drains them in reverse order.
+# Example:
+# local mCleanup = import("/mLibraries/mCleanup")
+# local owner = mCleanup.New()
+# owner.Add(expr(): print("cleaned"))
+# owner.Destroy()
+
+local MakeGate = func():
+    local busy = 0
+    local gate = {}
+    gate.Add = expr(state, callback): not state.Destroyed and busy == 0 and (state.Tasks.push(callback) or true)
+    gate.Take = expr(state): busy++ == 0 and state.Tasks
+    gate.Count = expr(state): busy == 0 and state.Tasks.length or 0
+    gate.Reset = func():
+        busy = 0
+    return gate
+
+local AddCallback = func(state, callback):
+    if callback == nil:
+        throw new Error("mCleanup requires a callback")
+    local added = state.Gate.Add(state, callback)
+    if not added:
+        throw new Error("Cannot add while mCleanup is cleaning or destroyed")
+    return callback
+
+local AddConnectionTask = func(state, connection):
+    if connection == nil:
+        throw new Error("mCleanup requires a connection")
+    local callback = func():
+        connection.Disconnect()
+    AddCallback(state, callback)
+    return connection
+
+local AddInstanceTask = func(state, instance):
+    if instance == nil:
+        throw new Error("mCleanup requires an instance")
+    local callback = func():
+        instance.Destroy()
+    AddCallback(state, callback)
+    return instance
+
+local CleanState = func(state):
+    local errors = []
+    # Capture the gate and its batch together before any other statement.
+    local batch = state.Gate.Take(state)
+    if not batch:
+        return errors
+
+    state.Tasks = []
+    try:
+        while batch.length > 0:
+            local callback = batch.pop()
+            try:
+                callback()
+            catch failure:
+                errors.push(failure)
+    finally:
+        state.Gate.Reset()
+    return errors
+
+local DestroyState = func(state):
+    if state.Destroyed:
+        return []
+    state.Destroyed = true
+    return CleanState(state)
+
+local New = func():
+    local state = { Tasks = [], Gate = MakeGate(), Destroyed = false }
+    local cleanup = {}
+    cleanup.Add = expr(callback): AddCallback(state, callback)
+    cleanup.AddConnection = expr(connection): AddConnectionTask(state, connection)
+    cleanup.AddInstance = expr(instance): AddInstanceTask(state, instance)
+    cleanup.Clean = expr(): CleanState(state)
+    cleanup.Destroy = expr(): DestroyState(state)
+    cleanup.GetCount = expr(): state.Gate.Count(state)
+    cleanup.IsDestroyed = expr(): state.Destroyed
+    return cleanup
+
+return { New = New }

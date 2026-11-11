@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+# Synchronous, single-payload events for TruScript.
+# Example:
+# local mSignal = import("/mLibraries/mSignal")
+# local changed = mSignal.New()
+# changed.Connect(expr(value): print(value))
+# changed.Fire("ready")
+# changed.Destroy()
+
+local MakeRecord = func(owner, handler, once):
+    local claims = 0
+    local record = { Entry = { Owner = owner, Handler = handler }, Once = once }
+    owner = nil
+    handler = nil
+    once = nil
+    record.Take = func(forFire, consume):
+        local ticket = 0
+        if consume:
+            ticket = claims++
+        else:
+            ticket = claims
+        # Entry is immutable; capture the mutable slot exactly once.
+        local entry = record.Entry
+        return ticket == 0 and entry != nil and (consume or not forFire or not entry.Owner.Destroyed) and entry
+    record.IsConnected = func():
+        local entry = record.Entry
+        return claims == 0 and entry != nil and not entry.Owner.Destroyed
+    return record
+
+local DisconnectRecord = func(record, forFire):
+    local claimed = record.Take(forFire, true)
+    if not claimed:
+        return nil
+    record.Entry = nil
+    claimed.Owner.Listeners.remove(record)
+    return (not forFire or not claimed.Owner.Destroyed) and claimed
+
+local MakeConnection = func(record):
+    local connection = {}
+    connection.Disconnect = func():
+        DisconnectRecord(record, false)
+    connection.IsConnected = expr(): record.IsConnected()
+    return connection
+
+local ConnectRecord = func(state, handler, once):
+    if handler == nil:
+        throw new Error("mSignal requires a handler")
+
+    local record = MakeRecord(state, handler, once)
+    local added = not state.Destroyed and (state.Listeners.push(record) or true)
+    if not added:
+        record.Entry = nil
+        throw new Error("Cannot connect to a destroyed mSignal")
+    if state.Destroyed:
+        DisconnectRecord(record, false)
+        throw new Error("Cannot connect to a destroyed mSignal")
+    return MakeConnection(record)
+
+local MakeBulkGate = func():
+    local busy = 0
+    local gate = {}
+    gate.Take = expr(state): (state.Destroyed or busy++ == 0) and state.Listeners
+    gate.Reset = func():
+        busy = 0
+    return gate
+
+local DisconnectRecords = func(state):
+    # Destroy bypasses the bulk gate: it must also drain any newer list.
+    local records = state.BulkGate.Take(state)
+    if not records:
+        return
+    try:
+        state.Listeners = []
+        for record in records:
+            DisconnectRecord(record, false)
+    finally:
+        state.BulkGate.Reset()
+
+local FireRecords = func(state, payload):
+    local errors = []
+    if state.Destroyed:
+        return errors
+
+    local snapshot = []
+    for record in state.Listeners:
+        snapshot.push(record)
+
+    for record in snapshot:
+        local pending = nil
+        if record.Once:
+            pending = DisconnectRecord(record, true)
+        else:
+            pending = record.Take(true, false)
+        if pending:
+            try:
+                pending.Handler(payload)
+            catch failure:
+                errors.push(failure)
+    return errors
+
+local DestroyState = func(state):
+    if state.Destroyed:
+        return
+    state.Destroyed = true
+    DisconnectRecords(state)
+
+local New = func():
+    local state = { Listeners = [], Destroyed = false, BulkGate = MakeBulkGate() }
+    local signal = {}
+    signal.Connect = expr(handler): ConnectRecord(state, handler, false)
+    signal.Once = expr(handler): ConnectRecord(state, handler, true)
+    signal.Fire = expr(payload): FireRecords(state, payload)
+    signal.DisconnectAll = func():
+        DisconnectRecords(state)
+    signal.Destroy = func():
+        DestroyState(state)
+    signal.GetListenerCount = expr(): not state.Destroyed and state.Listeners.length or 0
+    signal.IsDestroyed = expr(): state.Destroyed
+    return signal
+
+return { New = New }

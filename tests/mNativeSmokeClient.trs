@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+local mNativeSmoke = import("/mLibraries/tests/mNativeSmoke")
+mNativeSmoke.Run("client")

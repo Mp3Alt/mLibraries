@@ -1,0 +1,485 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mSignal = import("/mLibraries/mSignal")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local DescribeFailures = func(failures):
+    local details = ""
+    for failure in failures:
+        details += " | " + tostring(failure)
+        try:
+            local trace = failure.stackTrace
+            if trace != nil:
+                details += "\n" + trace
+        catch unavailableTrace:
+            pass
+    return details
+
+local Run = func():
+    local suite = mTestKit.New("mSignal")
+
+    suite.Test("dispatches in connection order", func():
+        local signal = mSignal.New()
+        local log = ""
+        signal.Connect(func(payload):
+            log += "A"
+        )
+        signal.Connect(func(payload):
+            log += "B"
+        )
+        signal.Connect(func(payload):
+            log += "C"
+        )
+        local errors = signal.Fire(nil)
+        suite.Equal(log, "ABC", "listeners run in registration order")
+        suite.Equal(errors.length, 0, "successful dispatch has no failures")
+        signal.Destroy()
+    )
+
+    suite.Test("disconnect is idempotent and releases membership", func():
+        local signal = mSignal.New()
+        local calls = 0
+        local connection = signal.Connect(func(payload):
+            calls += 1
+        )
+        suite.Expect(connection.IsConnected(), "new connection is active")
+        connection.Disconnect()
+        connection.Disconnect()
+        signal.Fire(nil)
+        suite.Equal(calls, 0, "disconnected handler does not run")
+        suite.Equal(signal.GetListenerCount(), 0, "record leaves active membership")
+        suite.Expect(not connection.IsConnected(), "connection reports inactive")
+    )
+
+    suite.Test("a listener can disconnect itself", func():
+        local signal = mSignal.New()
+        local firstCalls = 0
+        local secondCalls = 0
+        local first = nil
+        first = signal.Connect(func(payload):
+            firstCalls += 1
+            first.Disconnect()
+        )
+        signal.Connect(func(payload):
+            secondCalls += 1
+        )
+        signal.Fire(nil)
+        signal.Fire(nil)
+        suite.Equal(firstCalls, 1, "self disconnect takes effect")
+        suite.Equal(secondCalls, 2, "other listeners keep working")
+        signal.Destroy()
+    )
+
+    suite.Test("disconnect before a listener's turn skips it", func():
+        local signal = mSignal.New()
+        local log = ""
+        local last = nil
+        signal.Connect(func(payload):
+            log += "A"
+            last.Disconnect()
+        )
+        signal.Connect(func(payload):
+            log += "B"
+        )
+        last = signal.Connect(func(payload):
+            log += "C"
+        )
+        signal.Fire(nil)
+        suite.Equal(log, "AB", "disconnected snapshot record is skipped")
+        signal.Destroy()
+    )
+
+    suite.Test("new listeners wait for the next fire", func():
+        local signal = mSignal.New()
+        local log = ""
+        local added = false
+        signal.Connect(func(payload):
+            log += "A"
+            if not added:
+                added = true
+                signal.Connect(func(value):
+                    log += "C"
+                )
+        )
+        signal.Connect(func(payload):
+            log += "B"
+        )
+        signal.Fire(nil)
+        suite.Equal(log, "AB", "new listener is excluded from active snapshot")
+        log = ""
+        signal.Fire(nil)
+        suite.Equal(log, "ABC", "next fire includes the listener")
+        signal.Destroy()
+    )
+
+    suite.Test("once disconnects before a nested fire", func():
+        local signal = mSignal.New()
+        local log = ""
+        local once = signal.Once(func(payload):
+            log += "once;"
+            signal.Fire("inner")
+        )
+        signal.Connect(func(payload):
+            log += payload + ";"
+        )
+        signal.Fire("outer")
+        suite.Equal(log, "once;inner;outer;", "nested fire runs depth first without repeating once")
+        suite.Expect(not once.IsConnected(), "one-shot connection is inactive")
+        suite.Equal(signal.GetListenerCount(), 1, "only recurring listener remains")
+        signal.Destroy()
+    )
+
+    suite.Test("nested fire sees listeners connected by its caller", func():
+        local signal = mSignal.New()
+        local log = ""
+        signal.Once(func(payload):
+            signal.Connect(func(value):
+                log += value + ";"
+            )
+            signal.Fire("inner")
+        )
+        signal.Fire("outer")
+        suite.Equal(log, "inner;", "new connection joins nested fire but not outer snapshot")
+        signal.Destroy()
+    )
+
+    suite.Test("errors do not stop remaining listeners", func():
+        local signal = mSignal.New()
+        local calls = 0
+        signal.Connect(func(payload):
+            throw "first failure"
+        )
+        signal.Connect(func(payload):
+            calls += 1
+        )
+        signal.Connect(func(payload):
+            throw "second failure"
+        )
+        local errors = signal.Fire(nil)
+        suite.Equal(calls, 1, "middle listener survives earlier failure")
+        suite.Equal(errors.length, 2, "both failures are returned")
+        suite.Equal(errors[0], "first failure", "first thrown value is preserved")
+        suite.Equal(errors[1], "second failure", "failures retain dispatch order")
+        signal.Destroy()
+    )
+
+    suite.Test("a failing one-shot listener stays disconnected", func():
+        local signal = mSignal.New()
+        local once = signal.Once(func(payload):
+            throw "once failure"
+        )
+        local firstErrors = signal.Fire(nil)
+        local nextErrors = signal.Fire(nil)
+        suite.Equal(firstErrors.length, 1, "first invocation captures the failure")
+        suite.Equal(nextErrors.length, 0, "failing once is not retried")
+        suite.Expect(not once.IsConnected(), "failure cannot reconnect once")
+        suite.Equal(signal.GetListenerCount(), 0, "failing once leaves no record")
+    )
+
+    suite.Test("disconnect all suppresses the remaining active fire", func():
+        local signal = mSignal.New()
+        local calls = 0
+        signal.Connect(func(payload):
+            calls += 1
+            signal.DisconnectAll()
+        )
+        local later = signal.Connect(func(payload):
+            calls += 10
+        )
+        signal.Fire(nil)
+        suite.Equal(calls, 1, "remaining disconnected callback is skipped")
+        suite.Expect(not later.IsConnected(), "every handle becomes inactive")
+        suite.Equal(signal.GetListenerCount(), 0, "all records are removed")
+        signal.Connect(func(payload):
+            calls += 1
+        )
+        signal.Fire(nil)
+        suite.Equal(calls, 2, "signal can be reused after disconnect all")
+        signal.Destroy()
+    )
+
+    suite.Test("destroy inside a callback closes the signal", func():
+        local signal = mSignal.New()
+        local calls = 0
+        signal.Connect(func(payload):
+            calls += 1
+            signal.Destroy()
+        )
+        local later = signal.Connect(func(payload):
+            calls += 10
+        )
+        local errors = signal.Fire(nil)
+        signal.Destroy()
+        suite.Equal(calls, 1, "destroy suppresses remaining listeners")
+        suite.Equal(errors.length, 0, "destroy is not an observer failure")
+        suite.Expect(signal.IsDestroyed(), "destroyed state is visible")
+        suite.Expect(not later.IsConnected(), "destroy invalidates connections")
+        suite.Equal(signal.GetListenerCount(), 0, "destroy removes membership")
+        suite.Equal(signal.Fire(nil).length, 0, "fire after destroy returns no failures")
+        local connectAfterDestroy = func():
+            signal.Connect(func(payload):
+                calls += 100
+            )
+        suite.Throws(connectAfterDestroy, "connect after destruction throws")
+        local onceAfterDestroy = func():
+            signal.Once(func(payload):
+                calls += 100
+            )
+        suite.Throws(onceAfterDestroy, "once after destruction throws")
+    )
+
+    suite.Test("nil false and zero remain distinct payloads", func():
+        local signal = mSignal.New()
+        local values = []
+        signal.Connect(func(payload):
+            values.push(payload)
+        )
+        signal.Fire(nil)
+        signal.Fire(false)
+        signal.Fire(0)
+        suite.Equal(values.length, 3, "every payload was delivered")
+        suite.Equal(values[0], nil, "nil stays nil")
+        suite.Equal(values[1], false, "false stays false")
+        suite.Equal(values[2], 0, "zero stays zero")
+        signal.Destroy()
+    )
+
+    suite.Test("table payload identity is shared between listeners", func():
+        local signal = mSignal.New()
+        local payload = { Count = 0 }
+        local received = nil
+        signal.Connect(func(value):
+            value.Count += 1
+        )
+        signal.Connect(func(value):
+            received = value
+        )
+        signal.Fire(payload)
+        suite.Equal(received, payload, "payload is not cloned")
+        suite.Equal(payload.Count, 1, "first listener mutation remains visible")
+        signal.Destroy()
+    )
+
+    suite.Test("signals own independent listener sets", func():
+        local first = mSignal.New()
+        local second = mSignal.New()
+        local calls = 0
+        first.Connect(func(payload):
+            calls += 1
+        )
+        second.Connect(func(payload):
+            calls += 10
+        )
+        first.Destroy()
+        second.Fire(nil)
+        suite.Equal(calls, 10, "destroy does not affect another signal")
+        suite.Equal(second.GetListenerCount(), 1, "other membership is intact")
+        second.Destroy()
+    )
+
+    suite.Test("repeated connection churn leaves no active records", func():
+        local signal = mSignal.New()
+        for i in range(250):
+            local connection = signal.Connect(func(payload):
+                return nil
+            )
+            connection.Disconnect()
+        suite.Equal(signal.GetListenerCount(), 0, "disconnected membership is removed")
+        suite.Equal(signal.Fire(nil).length, 0, "empty signal remains usable")
+        signal.Destroy()
+    )
+
+    suite.Test("retained disconnected handles stay inert while the owner is reused", func():
+        local signal = mSignal.New()
+        local oldCalls = 0
+        local newCalls = 0
+        local retained = []
+        for i in range(25):
+            local connection = signal.Connect(func(payload):
+                oldCalls += 1
+            )
+            retained.push(connection)
+            connection.Disconnect()
+        local current = signal.Connect(func(payload):
+            newCalls += 1
+        )
+        for connection in retained:
+            connection.Disconnect()
+            suite.Expect(not connection.IsConnected(), "retained handle remains inactive")
+        signal.Fire(nil)
+        suite.Equal(oldCalls, 0, "retained handles cannot receive new fires")
+        suite.Equal(newCalls, 1, "new listener remains active")
+        suite.Equal(signal.GetListenerCount(), 1, "only new membership is retained by the owner")
+        signal.Destroy()
+        suite.Expect(not current.IsConnected(), "destroy disconnects the current handle")
+    )
+
+    suite.Test("bulk disconnect invalidates retained recurring and once handles", func():
+        local signal = mSignal.New()
+        local retained = []
+        for i in range(10):
+            retained.push(signal.Connect(func(payload):
+                return nil
+            ))
+            retained.push(signal.Once(func(payload):
+                return nil
+            ))
+        signal.DisconnectAll()
+        suite.Equal(signal.GetListenerCount(), 0, "bulk removal empties active membership")
+        for connection in retained:
+            suite.Expect(not connection.IsConnected(), "bulk removal invalidates every handle")
+            connection.Disconnect()
+        signal.Destroy()
+        suite.Equal(signal.Fire(nil).length, 0, "retained handles do not reactivate destroyed owner")
+    )
+
+    suite.Test("nil handlers are rejected", func():
+        local signal = mSignal.New()
+        local connectNil = func():
+            signal.Connect(nil)
+        suite.Throws(connectNil, "nil recurring handler is rejected")
+        local onceNil = func():
+            signal.Once(nil)
+        suite.Throws(onceNil, "nil one-shot handler is rejected")
+        suite.Equal(signal.GetListenerCount(), 0, "failed registration changes no membership")
+        signal.Destroy()
+    )
+
+    return suite.Report()
+
+# Native-script stress entry point. It yields and must not run in run_truscript.
+local RunConcurrent = func():
+    local suite = mTestKit.New("mSignalConcurrent")
+    local workers = { Done = 0, Errors = [], Stop = false }
+    local deadline = host.time() + 20
+    local signals = []
+    local calls = []
+    local retained = []
+    for i in range(256):
+        calls.push(0)
+        local signal = mSignal.New()
+        retained.push(signal.Once(func(payload):
+            calls[i] += 1
+        ))
+        signals.push(signal)
+
+    for worker in range(6):
+        spawn(func():
+            try:
+                for signal in signals:
+                    if workers.Stop:
+                        return
+                    local failures = signal.Fire(nil)
+                    if failures.length != 0:
+                        workers.Errors.push("unexpected observer failure")
+                    signal.Fire(nil)
+            catch failure:
+                workers.Errors.push(failure)
+            finally:
+                workers.Done += 1
+        )
+    while workers.Done < 6 and host.time() < deadline:
+        wait()
+    workers.Stop = true
+
+    suite.Test("concurrent fires claim every one-shot exactly once", func():
+        suite.Equal(workers.Done, 6, "all fire workers completed")
+        suite.Equal(workers.Errors.length, 0, "fire workers produced no failures" + DescribeFailures(workers.Errors))
+        for count in calls:
+            suite.Equal(count, 1, "each one-shot ran exactly once")
+        for connection in retained:
+            suite.Expect(not connection.IsConnected(), "every one-shot handle is inactive")
+    )
+    for signal in signals:
+        signal.Destroy()
+    if workers.Done < 6:
+        return suite.Report()
+
+    local signal = mSignal.New()
+    local handles = []
+    for i in range(256):
+        handles.push(signal.Connect(func(payload):
+            return nil
+        ))
+    workers = { Done = 0, Errors = [], Stop = false }
+    deadline = host.time() + 20
+    for worker in range(6):
+        spawn(func():
+            try:
+                for connection in handles:
+                    if workers.Stop:
+                        return
+                    connection.Disconnect()
+                    connection.Disconnect()
+                    signal.Fire(nil)
+            catch failure:
+                workers.Errors.push(failure)
+            finally:
+                workers.Done += 1
+        )
+    while workers.Done < 6 and host.time() < deadline:
+        wait()
+    workers.Stop = true
+    suite.Test("concurrent repeated disconnects never read a cleared owner", func():
+        suite.Equal(workers.Done, 6, "all disconnect workers completed")
+        suite.Equal(workers.Errors.length, 0, "disconnect workers produced no failures" + DescribeFailures(workers.Errors))
+        suite.Equal(signal.GetListenerCount(), 0, "all membership was removed")
+        for connection in handles:
+            suite.Expect(not connection.IsConnected(), "retained handles remain inactive")
+    )
+    signal.Destroy()
+    if workers.Done < 6:
+        return suite.Report()
+
+    local candidates = []
+    local registrations = []
+    for index in range(256):
+        candidates.push(mSignal.New())
+    workers = { Done = 0, Errors = [], Stop = false }
+    deadline = host.time() + 20
+    spawn(func():
+        try:
+            for candidate in candidates:
+                if workers.Stop:
+                    return
+                try:
+                    registrations.push(candidate.Connect(func(payload):
+                        return nil
+                    ))
+                catch closed:
+                    if not candidate.IsDestroyed():
+                        workers.Errors.push(closed)
+        catch failure:
+            workers.Errors.push(failure)
+        finally:
+            workers.Done += 1
+    )
+    spawn(func():
+        try:
+            for candidate in candidates:
+                if workers.Stop:
+                    return
+                candidate.Destroy()
+        catch failure:
+            workers.Errors.push(failure)
+        finally:
+            workers.Done += 1
+    )
+    while workers.Done < 2 and host.time() < deadline:
+        wait()
+    workers.Stop = true
+    suite.Test("registration overlapping destruction leaves no live handles", func():
+        suite.Equal(workers.Done, 2, "both registration workers completed")
+        suite.Equal(workers.Errors.length, 0, "registration workers produced no failures" + DescribeFailures(workers.Errors))
+        for candidate in candidates:
+            suite.Expect(candidate.IsDestroyed(), "candidate is permanently closed")
+            suite.Equal(candidate.GetListenerCount(), 0, "closed candidate has no remaining membership")
+        for connection in registrations:
+            suite.Expect(not connection.IsConnected(), "concurrent registration cannot escape destruction")
+    )
+    for candidate in candidates:
+        candidate.Destroy()
+    return suite.Report()
+
+return { Run = Run, RunConcurrent = RunConcurrent }

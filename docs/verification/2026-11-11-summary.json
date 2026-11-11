@@ -1,0 +1,40 @@
+{
+  "date": "2026-11-11",
+  "timezone": "America/Chicago",
+  "library_version": "0.1.0-dev",
+  "creator_version": "2026.43.7",
+  "docs_bundle": "2026.43.7+876eaeb2",
+  "world": "The beginning / The beginning",
+  "test_mode": "local one-player server and client",
+  "native_evidence": "Observed Creator Script Console summaries at log times 01:34:39 through 01:34:41",
+  "contexts": {
+    "server": {
+      "contracts": { "passed": 52, "failed": 0 },
+      "native": { "passed": 9, "failed": 0 },
+      "signal_concurrency": { "passed": 3, "failed": 0 },
+      "cleanup_concurrency": { "passed": 1, "failed": 0 }
+    },
+    "client": {
+      "contracts": { "passed": 52, "failed": 0 },
+      "native": { "passed": 9, "failed": 0 },
+      "signal_concurrency": { "passed": 3, "failed": 0 },
+      "cleanup_concurrency": { "passed": 1, "failed": 0 }
+    }
+  },
+  "installed_assets_verified": 11,
+  "documentation_update": {
+    "change": "Short usage example comments in all three public modules",
+    "executable_bodies_unchanged": true,
+    "editor_compilation_problems": 0,
+    "source_readback_verified": 11
+  },
+  "saved_project": {
+    "relative_path": "TruWorlds/The beginning.trux",
+    "bytes": 83348,
+    "sha256": "89a4b6185367dcde496d1c9f8e5ffe0e8202ad4c7cd260dddd0f13f07f085289",
+    "creator_kind": "saved_file",
+    "unsaved_changes": false,
+    "playtest_state": "none"
+  },
+  "scope": "Development baseline on one desktop environment; no comparative performance benchmark or universal concurrency proof."
+}

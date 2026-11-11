@@ -1,0 +1,220 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Run from an attached server or client script in a local playtest.
+
+local mAsync = import("/mLibraries/mAsync")
+local mCleanup = import("/mLibraries/mCleanup")
+local mRunAll = import("/mLibraries/tests/mRunAll")
+local mTestKit = import("/mLibraries/mTestKit")
+local mSignalSpec = import("/mLibraries/tests/mSignalSpec")
+local mCleanupSpec = import("/mLibraries/tests/mCleanupSpec")
+
+local Await = func(job):
+    for turn in range(300):
+        local outcome = job.GetOutcome()
+        if outcome.Status != "Pending" and outcome.Status != "Running":
+            return outcome
+        wait(0)
+    throw "job did not settle within 300 scheduler turns"
+
+local WaitFor = func(predicate):
+    for turn in range(300):
+        if predicate():
+            return
+        wait(0)
+    throw "condition did not become true within 300 scheduler turns"
+
+local Run = func(side):
+    local contracts = mRunAll.Run()
+    print("mLibraries contracts " + side + ": " + contracts.Passed + " passed, " + contracts.Failed + " failed")
+    for report in contracts.Suites:
+        for failure in report.Failures:
+            print(report.Name + ": " + failure)
+
+    local suite = mTestKit.New("native " + side)
+    local tasks = mAsync.New(nil)
+
+    suite.Test("native Run preserves a result", func():
+        local job = tasks.Run(func(token, payload):
+            token.Checkpoint()
+            return payload
+        , false)
+        local result = Await(job)
+        suite.Equal(result.Status, "Succeeded", "native Run settles")
+        suite.Equal(result.Value, false, "native result preserves false")
+    )
+
+    suite.Test("native Defer and Delay settle", func():
+        local deferred = tasks.Defer(func(token, payload):
+            return payload
+        , 0)
+        local delayed = tasks.Delay(0.02, func(token, payload):
+            return payload
+        , "delayed")
+        local first = Await(deferred)
+        local second = Await(delayed)
+        suite.Equal(first.Status, "Succeeded", "deferred job settles")
+        suite.Equal(first.Value, 0, "deferred job preserves zero")
+        suite.Equal(second.Status, "Succeeded", "delayed job settles")
+        suite.Equal(second.Value, "delayed", "delayed payload arrives")
+    )
+
+    suite.Test("pending cancellation suppresses native delayed work", func():
+        local calls = 0
+        local waiting = false
+        local release_wait = false
+        local runner_done = false
+        local runtime = {}
+        runtime.Spawn = func(task):
+            spawn(func():
+                try:
+                    task()
+                finally:
+                    runner_done = true
+            )
+        runtime.Wait = func(seconds):
+            waiting = true
+            wait(seconds)
+            while not release_wait:
+                wait(0)
+
+        local observed_tasks = mAsync.New(runtime)
+        local job = observed_tasks.Delay(0.02, func(token, payload):
+            calls += 1
+        , nil)
+        local accepted = false
+        try:
+            WaitFor(expr(): waiting)
+            accepted = job.Cancel()
+        finally:
+            release_wait = true
+        WaitFor(expr(): runner_done)
+        suite.Expect(accepted, "pending cancellation is accepted")
+        suite.Equal(job.GetOutcome().Status, "Cancelled", "cancelled job stays terminal")
+        suite.Equal(calls, 0, "sleeping shell never invokes cancelled work")
+    )
+
+    suite.Test("native work stops at a checkpoint after waiting", func():
+        local started = false
+        local open = false
+        local escaped = false
+        local job = tasks.Run(func(token, payload):
+            started = true
+            while not open:
+                wait(0)
+            token.Checkpoint()
+            escaped = true
+        , nil)
+        local accepted = false
+        try:
+            WaitFor(expr(): started)
+            accepted = job.Cancel()
+        finally:
+            open = true
+        local result = Await(job)
+        suite.Expect(accepted, "running request is accepted")
+        suite.Equal(result.Status, "Cancelled", "checkpoint cancellation is captured across wait")
+        suite.Expect(not escaped, "work after checkpoint does not execute")
+    )
+
+    suite.Test("native running work may ignore a cancellation request", func():
+        local started = false
+        local open = false
+        local job = tasks.Run(func(token, payload):
+            started = true
+            while not open:
+                wait(0)
+            return payload
+        , 0)
+        local accepted = false
+        try:
+            WaitFor(expr(): started)
+            accepted = job.Cancel()
+        finally:
+            open = true
+        local result = Await(job)
+        suite.Expect(accepted, "running request is accepted")
+        suite.Equal(result.Status, "Succeeded", "ignored request does not force cancellation")
+        suite.Equal(result.Value, 0, "successful result is retained")
+        suite.Equal(result.CancellationRequested, true, "accepted request remains visible")
+        suite.Equal(job.Cancel(), false, "completed work rejects a late request")
+    )
+
+    suite.Test("native errors after a wait remain failures", func():
+        local job = tasks.Run(func(token, payload):
+            wait(0)
+            throw "native failure"
+        , nil)
+        local result = Await(job)
+        suite.Equal(result.Status, "Failed", "error crosses a native wait")
+        suite.Equal(result.Error, "native failure", "original thrown value is retained")
+    )
+
+    suite.Test("concurrent jobs publish complete outcome records", func():
+        local jobs = []
+        for index in range(128):
+            local job = tasks.Run(func(token, payload):
+                local total = 0
+                for item in range(1000):
+                    total += item
+                return payload
+            , index)
+            jobs.push({ Job = job, Expected = index })
+        for entry in jobs:
+            local result = Await(entry.Job)
+            suite.Equal(result.Status, "Succeeded", "each concurrent job settles")
+            suite.Equal(result.Value, entry.Expected, "terminal status always includes its result")
+            entry.Job.Cancel()
+            suite.Expect(not entry.Job.GetOutcome().CancellationRequested, "late request does not alter completion")
+    )
+
+    suite.Test("cleanup owns a native connection", func():
+        local container = new Folder() { Name = "mConnectionProbe", Parent = world }
+        local calls = 0
+        local connection = container.ChildAdded.Connect(func(child):
+            calls += 1
+        )
+        local owner = mCleanup.New()
+        owner.AddConnection(connection)
+        local errors = []
+        local observed = -1
+        try:
+            local first = new Folder() { Parent = container }
+            WaitFor(expr(): calls == 1)
+            errors = owner.Clean()
+            local second = new Folder() { Parent = container }
+            wait(0)
+            wait(0)
+            observed = calls
+        finally:
+            owner.Destroy()
+            container.Destroy()
+        suite.Equal(errors.length, 0, "native connection disconnects without error")
+        suite.Equal(observed, 1, "disconnected native handler receives no later events")
+    )
+
+    suite.Test("cleanup owns a native instance", func():
+        local fixture = new Folder() { Name = "mInstanceProbe", Parent = world }
+        local owner = mCleanup.New()
+        owner.AddInstance(fixture)
+        local errors = owner.Destroy()
+        suite.Equal(errors.length, 0, "native instance destroys without error")
+        suite.Expect(not fixture.IsInDataModel, "owned native instance leaves the model")
+    )
+
+    local native = suite.Report()
+    print("mLibraries native " + side + ": " + native.Passed + " passed, " + native.Failed + " failed")
+    for failure in native.Failures:
+        print(failure)
+
+    local concurrent = []
+    concurrent.push(mSignalSpec.RunConcurrent())
+    concurrent.push(mCleanupSpec.RunConcurrent())
+    for report in concurrent:
+        print("mLibraries concurrent " + side + " " + report.Name + ": " + report.Passed + " passed, " + report.Failed + " failed")
+        for failure in report.Failures:
+            print(report.Name + ": " + failure)
+
+    return { Contracts = contracts, Native = native, Concurrent = concurrent }
+
+return { Run = Run }

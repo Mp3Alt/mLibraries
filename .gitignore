@@ -1,0 +1,16 @@
+# Local project context and engine research.
+/AGENTS.md
+/research/
+/TruWorlds/
+/docs/tooling/
+/docs/research/
+/tools/research/
+
+# Generated downloads and local diagnostic output.
+/dist/
+/docs/verification/*-compile.json
+/docs/verification/*-contracts.json
+/docs/verification/*-sync-initial.json
+__pycache__/
+*.pyc
+.DS_Store

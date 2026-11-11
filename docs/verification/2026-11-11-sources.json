@@ -1,0 +1,84 @@
+{
+  "creator_version": "2026.43.7",
+  "normalization": "CRLF to LF; ignore terminal newline omitted by read_script ranges",
+  "documentation_update": "Short usage comments added; executable module bodies unchanged.",
+  "sources": [
+    {
+      "source": "packages/mSignal/src/mSignal.trs",
+      "asset_path": "mLibraries/mSignal",
+      "type": "module",
+      "revision": "r-3dd301",
+      "sha256_canonical": "4b77cd83050c3d6d8fa0ebcb0edca06eda5481f61c5cdf781903eedb145b3784"
+    },
+    {
+      "source": "packages/mCleanup/src/mCleanup.trs",
+      "asset_path": "mLibraries/mCleanup",
+      "type": "module",
+      "revision": "r-ee2482",
+      "sha256_canonical": "672c7be6fe63ca4531dd2c0df2537822fa5bd2a180c0ed8c00ed7ccf1d378bba"
+    },
+    {
+      "source": "packages/mAsync/src/mAsync.trs",
+      "asset_path": "mLibraries/mAsync",
+      "type": "module",
+      "revision": "r-b1102a",
+      "sha256_canonical": "45243d88db23033aa121a0373e2b0038a3a1245a92eb3e254bc9f4731ea7d603"
+    },
+    {
+      "source": "tests/mTestKit.trs",
+      "asset_path": "mLibraries/mTestKit",
+      "type": "module",
+      "revision": "r-99fc2b",
+      "sha256_canonical": "86646dd511695f014f8c3f9cdc8b33a0f85812c8b4ac86a535de90a631a67afe"
+    },
+    {
+      "source": "tests/mSignal.spec.trs",
+      "asset_path": "mLibraries/tests/mSignalSpec",
+      "type": "module",
+      "revision": "r-6e5d74",
+      "sha256_canonical": "7efd94afc419b0970a50e8e25d7941a5f8c6d935a20f40c816d87c25678930be"
+    },
+    {
+      "source": "tests/mCleanup.spec.trs",
+      "asset_path": "mLibraries/tests/mCleanupSpec",
+      "type": "module",
+      "revision": "r-9c078a",
+      "sha256_canonical": "cc0c25c26b727e4904f1595659fe9163a2723498f6ad9cc1f1305982fef71042"
+    },
+    {
+      "source": "tests/mAsync.spec.trs",
+      "asset_path": "mLibraries/tests/mAsyncSpec",
+      "type": "module",
+      "revision": "r-2d8ae7",
+      "sha256_canonical": "fd870a509dca1b44a82ddbef8cdcb29d44fbdc45a7f5a387c0fcdc7d7c2a2ddf"
+    },
+    {
+      "source": "tests/mRunAll.trs",
+      "asset_path": "mLibraries/tests/mRunAll",
+      "type": "module",
+      "revision": "r-43a047",
+      "sha256_canonical": "0e8510de9695e87b052de03fd612e081db6cb3522e0b20e2bcc998701561964a"
+    },
+    {
+      "source": "tests/mNativeSmoke.trs",
+      "asset_path": "mLibraries/tests/mNativeSmoke",
+      "type": "module",
+      "revision": "r-1f3607",
+      "sha256_canonical": "2e59d11a94196bba3bc2272dbec360fd4a1184929657b0c489b822c5e2b27492"
+    },
+    {
+      "source": "tests/mNativeSmokeServer.trs",
+      "asset_path": "mLibraries/tests/mNativeSmokeServer",
+      "type": "server",
+      "revision": "r-5b8d34",
+      "sha256_canonical": "29e68ae7a4d1eae9632972f2632e9b7054ba0c4fec6d0a09e689f3f35dde654e"
+    },
+    {
+      "source": "tests/mNativeSmokeClient.trs",
+      "asset_path": "mLibraries/tests/mNativeSmokeClient",
+      "type": "client",
+      "revision": "r-3c15b5",
+      "sha256_canonical": "4cd8f726e70170d404e28c72ddd0fb2a2206862ad1f8ea4f125dea6ae139d3c2"
+    }
+  ]
+}

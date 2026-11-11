@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Cooperative jobs using native or injected scheduling.
+# Example (run in an attached script during Play):
+# local mAsync = import("/mLibraries/mAsync")
+# local tasks = mAsync.New(nil)
+# tasks.Delay(1, expr(token, message): print(message), "ready")
+local mAsync = {}
+
+mAsync.New = func(runtime):
+    if runtime == nil:
+        runtime = {
+            Spawn = func(task): return spawn(task),
+            Wait = func(seconds): return wait(seconds)
+        }
+
+    local start = nil
+    local pause = nil
+    try:
+        start = runtime.Spawn
+        pause = runtime.Wait
+    catch problem:
+        throw new Error("mAsync.New requires Spawn and Wait functions")
+
+    if start == nil or pause == nil:
+        throw new Error("mAsync.New requires Spawn and Wait functions")
+
+    local instance = {}
+
+    local schedule = func(should_wait, seconds, work, payload):
+        if work == nil:
+            throw new Error("mAsync requires a work function")
+
+        # Publish each outcome as one record: automatic yielding can occur
+        # between statements, so Status and its result must change together.
+        local outcome = {
+            Status = "Pending",
+            Value = nil,
+            Error = nil,
+            CancellationRequested = false
+        }
+        local execution = { Work = work, Payload = payload }
+
+        # Closures retain their enclosing scope, including parameters.
+        work = nil
+        payload = nil
+
+        local cancellation = {}
+        local cancel_gate = 0
+        local run_gate = 0
+        local job = {}
+        local token = {}
+
+        local release = func():
+            execution = {}
+
+        local finish = func(status, value, problem):
+            release()
+            outcome = (outcome.Status == "Pending" or outcome.Status == "Running") and {
+                Status = status,
+                Value = value,
+                Error = problem,
+                CancellationRequested = cancel_gate > 0
+            } or outcome
+
+        token.IsCancellationRequested = func():
+            return outcome.CancellationRequested or ((outcome.Status == "Pending" or outcome.Status == "Running") and cancel_gate > 0)
+
+        token.Checkpoint = func():
+            if token.IsCancellationRequested():
+                throw cancellation
+
+        job.GetOutcome = func():
+            # Keep this one statement. Reading the record, yielding, then
+            # reading the gate could combine observations from different times.
+            return {
+                Status = outcome.Status,
+                Value = outcome.Value,
+                Error = outcome.Error,
+                CancellationRequested = outcome.CancellationRequested or ((outcome.Status == "Pending" or outcome.Status == "Running") and cancel_gate > 0)
+            }
+
+        job.Cancel = func():
+            # Capture eligibility and claim the first request together. A
+            # rejected call after settlement must not change the terminal flag.
+            local claim = {
+                Active = outcome.Status == "Pending" or outcome.Status == "Running",
+                Ticket = cancel_gate++
+            }
+            if not claim.Active or claim.Ticket != 0:
+                return false
+
+            outcome = outcome.Status == "Pending" and {
+                Status = "Cancelled",
+                Value = nil,
+                Error = nil,
+                CancellationRequested = true
+            } or outcome
+            if outcome.Status == "Cancelled":
+                release()
+            return true
+
+        local run = func():
+            local ticket = run_gate++
+            if ticket != 0 or outcome.Status != "Pending":
+                return
+
+            local task = nil
+            local data = nil
+            try:
+                if should_wait:
+                    pause(seconds)
+
+                if outcome.Status != "Pending":
+                    return
+
+                # The gate is authoritative even if Cancel yielded after its
+                # claim. Preserve any terminal record published in the meantime.
+                outcome = outcome.Status == "Pending" and {
+                    Status = cancel_gate > 0 and "Cancelled" or "Running",
+                    Value = nil,
+                    Error = nil,
+                    CancellationRequested = cancel_gate > 0
+                } or outcome
+                if outcome.Status != "Running":
+                    release()
+                    return
+
+                task = execution.Work
+                data = execution.Payload
+                release()
+                local value = task(token, data)
+                task = nil
+                data = nil
+                finish("Succeeded", value, nil)
+            catch problem:
+                task = nil
+                data = nil
+                # Pending cancellation has already settled the job. A sleeping
+                # adapter may still wake or fail; neither may settle it again.
+                if outcome.Status == "Cancelled":
+                    return
+                if problem == cancellation:
+                    finish("Cancelled", nil, nil)
+                else:
+                    finish("Failed", nil, problem)
+
+        try:
+            start(run)
+        catch problem:
+            if outcome.Status == "Pending":
+                finish("Failed", nil, problem)
+
+        return job
+
+    instance.Run = func(work, payload):
+        return schedule(false, 0, work, payload)
+
+    instance.Defer = func(work, payload):
+        return schedule(true, 0, work, payload)
+
+    instance.Delay = func(seconds, work, payload):
+        local number = tonumber(seconds)
+        if math.is_nan(number) or math.is_infinite(number) or seconds != number or number < 0:
+            throw new Error("mAsync.Delay requires finite, nonnegative seconds")
+        return schedule(true, number, work, payload)
+
+    return instance
+
+return mAsync

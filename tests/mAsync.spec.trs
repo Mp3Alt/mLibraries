@@ -1,0 +1,304 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mAsync = import("/mLibraries/mAsync")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local fake_runtime = func():
+    local queue = []
+    local waits = []
+    local runtime = {}
+    runtime.Spawn = func(task):
+        queue.push(task)
+    runtime.Wait = func(seconds):
+        waits.push(seconds)
+        if runtime.WaitHook != nil:
+            runtime.WaitHook(seconds)
+
+    local flush = func():
+        while queue.length > 0:
+            local task = queue.remove_at(0)
+            task()
+
+    return { Runtime = runtime, Queue = queue, Waits = waits, Flush = flush }
+
+local Run = func():
+    local suite = mTestKit.New("mAsync")
+
+    suite.Test("Run waits for its injected dispatcher and forwards payload", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local payload = { Number = 7 }
+        local seen = nil
+        local job = tasks.Run(func(token, data):
+            seen = data
+            suite.Equal(token.IsCancellationRequested(), false, "new token")
+            return data.Number * 2
+        , payload)
+        suite.Equal(job.GetOutcome().Status, "Pending", "queued status")
+        suite.Equal(fake.Queue.length, 1, "one task queued")
+        fake.Flush()
+        suite.Equal(seen, payload, "payload reference")
+        suite.Equal(job.GetOutcome().Status, "Succeeded", "success status")
+        suite.Equal(job.GetOutcome().Value, 14, "returned value")
+        suite.Equal(fake.Waits.length, 0, "Run does not wait")
+    )
+
+    suite.Test("successful nil false and zero remain successful", func():
+        local values = [nil, false, 0]
+        for value in values:
+            local fake = fake_runtime()
+            local tasks = mAsync.New(fake.Runtime)
+            local job = tasks.Run(func(token, data): return data, value)
+            fake.Flush()
+            suite.Equal(job.GetOutcome().Status, "Succeeded", "tagged success")
+            suite.Equal(job.GetOutcome().Value, value, "unaltered value")
+    )
+
+    suite.Test("GetOutcome returns an independent snapshot", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local job = tasks.Run(func(token, data): return 4, nil)
+        local before = job.GetOutcome()
+        before.Status = "Changed"
+        before.CancellationRequested = true
+        suite.Equal(job.GetOutcome().Status, "Pending", "private status")
+        suite.Equal(job.GetOutcome().CancellationRequested, false, "private flag")
+        fake.Flush()
+        suite.Equal(before.Status, "Changed", "snapshot not updated")
+        suite.Equal(job.GetOutcome().Value, 4, "private outcome")
+    )
+
+    suite.Test("pending Cancel settles immediately and skips work and wait", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local calls = 0
+        local job = tasks.Delay(8, func(token, data): calls += 1, {})
+        suite.Equal(job.Cancel(), true, "first request accepted")
+        suite.Equal(job.Cancel(), false, "repeat request ignored")
+        suite.Equal(job.GetOutcome().Status, "Cancelled", "immediate settlement")
+        suite.Equal(job.GetOutcome().CancellationRequested, true, "request recorded")
+        fake.Flush()
+        suite.Equal(calls, 0, "callback skipped")
+        suite.Equal(fake.Waits.length, 0, "unscheduled wait skipped")
+    )
+
+    suite.Test("Defer crosses one wait boundary with zero seconds", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local calls = 0
+        local job = tasks.Defer(func(token, data): calls += 1, nil)
+        suite.Equal(calls, 0, "not run by construction")
+        fake.Flush()
+        suite.Equal(fake.Waits.length, 1, "one wait")
+        suite.Equal(fake.Waits[0], 0, "minimum wait requested")
+        suite.Equal(calls, 1, "one callback")
+        suite.Equal(job.GetOutcome().Status, "Succeeded", "settled")
+    )
+
+    suite.Test("Delay forwards seconds without using the Wait return value", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local job = tasks.Delay(1.25, func(token, data): return data, "done")
+        fake.Flush()
+        suite.Equal(fake.Waits[0], 1.25, "delay passed to adapter")
+        suite.Equal(job.GetOutcome().Value, "done", "nil Wait result is harmless")
+    )
+
+    suite.Test("cancellation during a delay suppresses its callback", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local called = false
+        local job = tasks.Delay(3, func(token, data): called = true, nil)
+        fake.Runtime.WaitHook = func(seconds):
+            suite.Equal(job.GetOutcome().Status, "Pending", "waiting is pending")
+            job.Cancel()
+        fake.Flush()
+        suite.Equal(called, false, "callback suppressed")
+        suite.Equal(job.GetOutcome().Status, "Cancelled", "cancel preserved after wake")
+    )
+
+    suite.Test("Checkpoint stops running work after a request", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local after = false
+        local job = nil
+        job = tasks.Run(func(token, data):
+            suite.Equal(job.GetOutcome().Status, "Running", "running status")
+            suite.Equal(job.Cancel(), true, "request accepted")
+            suite.Equal(job.GetOutcome().Status, "Running", "request is cooperative")
+            suite.Equal(token.IsCancellationRequested(), true, "token sees request")
+            token.Checkpoint()
+            after = true
+        , nil)
+        fake.Flush()
+        suite.Equal(after, false, "execution stopped at checkpoint")
+        suite.Equal(job.GetOutcome().Status, "Cancelled", "cooperative cancellation")
+        suite.Equal(job.GetOutcome().Error, nil, "sentinel not exposed")
+    )
+
+    suite.Test("running work may ignore a cancellation request and succeed", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local job = nil
+        job = tasks.Run(func(token, data):
+            job.Cancel()
+            return false
+        , nil)
+        fake.Flush()
+        suite.Equal(job.GetOutcome().Status, "Succeeded", "ignored request is not force kill")
+        suite.Equal(job.GetOutcome().Value, false, "result retained")
+        suite.Equal(job.GetOutcome().CancellationRequested, true, "request remains visible")
+    )
+
+    suite.Test("a real callback error wins over running cancellation", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local problem = { Code = 19 }
+        local job = nil
+        job = tasks.Run(func(token, data):
+            job.Cancel()
+            throw problem
+        , nil)
+        fake.Flush()
+        suite.Equal(job.GetOutcome().Status, "Failed", "real failure")
+        suite.Equal(job.GetOutcome().Error, problem, "original error retained")
+    )
+
+    suite.Test("nil string and table thrown values are retained as failures", func():
+        local problems = [nil, "failed", { Code = 2 }]
+        for problem in problems:
+            local fake = fake_runtime()
+            local tasks = mAsync.New(fake.Runtime)
+            local job = tasks.Run(func(token, data): throw data, problem)
+            fake.Flush()
+            suite.Equal(job.GetOutcome().Status, "Failed", "failure tag")
+            suite.Equal(job.GetOutcome().Error, problem, "thrown value")
+            suite.Equal(job.Cancel(), false, "settled failure cannot be cancelled")
+    )
+
+    suite.Test("settled success cannot be cancelled", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local job = tasks.Run(func(token, data): return 1, nil)
+        fake.Flush()
+        suite.Equal(job.Cancel(), false, "settled cancellation rejected")
+        suite.Equal(job.GetOutcome().CancellationRequested, false, "no late request")
+        suite.Equal(job.GetOutcome().Status, "Succeeded", "terminal status retained")
+    )
+
+    suite.Test("rejected late cancellation does not cancel a retained token", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local saved_token = nil
+        local job = tasks.Run(func(token, data):
+            saved_token = token
+            return 23
+        , nil)
+        fake.Flush()
+        suite.Equal(job.Cancel(), false, "first late request rejected")
+        suite.Equal(job.Cancel(), false, "second late request rejected")
+        suite.Equal(saved_token.IsCancellationRequested(), false, "retained token stays uncancelled")
+        saved_token.Checkpoint()
+        local result = job.GetOutcome()
+        suite.Equal(result.Status, "Succeeded", "terminal status")
+        suite.Equal(result.Value, 23, "terminal result")
+        suite.Equal(result.CancellationRequested, false, "terminal flag")
+    )
+
+    suite.Test("invalid delays reject before enqueue", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local bad = [-1, tonumber("not a number"), tonumber("1e999"), "2", nil, false]
+        for seconds in bad:
+            suite.Throws(func():
+                tasks.Delay(seconds, func(token, data): return nil, nil)
+            , "invalid delay")
+        suite.Equal(fake.Queue.length, 0, "nothing queued")
+    )
+
+    suite.Test("zero delay is accepted", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local job = tasks.Delay(0, func(token, data): return true, nil)
+        fake.Flush()
+        suite.Equal(fake.Waits[0], 0, "zero delay")
+        suite.Equal(job.GetOutcome().Status, "Succeeded", "zero succeeds")
+    )
+
+    suite.Test("invalid adapter shape rejects at construction", func():
+        suite.Throws(func(): mAsync.New({}), "missing methods")
+        suite.Throws(func(): mAsync.New(4), "non-record adapter")
+        suite.Throws(func(): mAsync.New({ Spawn = func(task): return nil }), "missing Wait")
+    )
+
+    suite.Test("missing work rejects before enqueue", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        suite.Throws(func(): tasks.Run(nil, nil), "missing work")
+        suite.Equal(fake.Queue.length, 0, "missing work not queued")
+    )
+
+    suite.Test("a synchronous Spawn error becomes a failed job", func():
+        local problem = { Code = "spawn" }
+        local tasks = mAsync.New({
+            Spawn = func(task): throw problem,
+            Wait = func(seconds): return nil
+        })
+        local job = tasks.Run(func(token, data): return true, nil)
+        suite.Equal(job.GetOutcome().Status, "Failed", "scheduling failure")
+        suite.Equal(job.GetOutcome().Error, problem, "adapter error retained")
+        suite.Equal(job.Cancel(), false, "failed dispatch is terminal")
+    )
+
+    suite.Test("a Wait error becomes a failed job", func():
+        local fake = fake_runtime()
+        local problem = { Code = "wait" }
+        fake.Runtime.WaitHook = func(seconds): throw problem
+        local tasks = mAsync.New(fake.Runtime)
+        local job = tasks.Delay(1, func(token, data): return true, nil)
+        fake.Flush()
+        suite.Equal(job.GetOutcome().Status, "Failed", "wait failure")
+        suite.Equal(job.GetOutcome().Error, problem, "wait error retained")
+    )
+
+    suite.Test("a late Wait error does not replace pending cancellation", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local job = tasks.Delay(1, func(token, data): return true, nil)
+        fake.Runtime.WaitHook = func(seconds):
+            job.Cancel()
+            throw "late wait failure"
+        fake.Flush()
+        suite.Equal(job.GetOutcome().Status, "Cancelled", "terminal cancellation preserved")
+        suite.Equal(job.GetOutcome().Error, nil, "late failure discarded")
+    )
+
+    suite.Test("immediate Spawn is supported without referring to an unreturned job", func():
+        local tasks = mAsync.New({
+            Spawn = func(task): task(),
+            Wait = func(seconds): return nil
+        })
+        local job = tasks.Run(func(token, data):
+            token.Checkpoint()
+            return data
+        , 12)
+        suite.Equal(job.GetOutcome().Status, "Succeeded", "immediate completion")
+        suite.Equal(job.GetOutcome().Value, 12, "immediate result")
+    )
+
+    suite.Test("duplicate dispatcher invocation cannot run work twice", func():
+        local fake = fake_runtime()
+        local tasks = mAsync.New(fake.Runtime)
+        local calls = 0
+        local job = tasks.Run(func(token, data): calls += 1, nil)
+        local runner = fake.Queue[0]
+        fake.Flush()
+        runner()
+        suite.Equal(calls, 1, "only one dispatch")
+        suite.Equal(job.GetOutcome().Status, "Succeeded", "outcome retained")
+    )
+
+    return suite.Report()
+
+return { Run = Run }

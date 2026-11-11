@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Small assertion runner shared by the development suites.
+
+local New = func(name):
+    local passed = 0
+    local failures = []
+
+    local Expect = func(condition, message):
+        if not condition:
+            throw message
+
+    local Equal = func(actual, expected, message):
+        if actual != expected:
+            throw message + " (expected " + tostring(expected) + ", got " + tostring(actual) + ")"
+
+    local Throws = func(callback, message):
+        local raised = false
+        try:
+            callback()
+        catch problem:
+            raised = true
+        if not raised:
+            throw message
+
+    local Test = func(title, callback):
+        try:
+            callback()
+            passed += 1
+        catch problem:
+            failures.push(title + ": " + tostring(problem))
+
+    local Report = func():
+        local copy = []
+        for failure in failures:
+            copy.push(failure)
+        return { Name = name, Passed = passed, Failed = failures.length, Failures = copy }
+
+    return { Test = Test, Equal = Equal, Expect = Expect, Throws = Throws, Report = Report }
+
+return { New = New }

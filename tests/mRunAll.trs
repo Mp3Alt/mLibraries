@@ -4,12 +4,41 @@
 local mSignalTests = import("/mLibraries/tests/mSignalSpec")
 local mCleanupTests = import("/mLibraries/tests/mCleanupSpec")
 local mAsyncTests = import("/mLibraries/tests/mAsyncSpec")
+local mCommandTests = import("/mLibraries/tests/mCommandSpec")
+local mPacketTests = import("/mLibraries/tests/mPacketSpec")
+local mNetTests = import("/mLibraries/tests/mNetSpec")
+local mStateTests = import("/mLibraries/tests/mStateSpec")
+local mPlayerTests = import("/mLibraries/tests/mPlayerSpec")
+local mDataTests = import("/mLibraries/tests/mDataSpec")
+local mSpringTests = import("/mLibraries/tests/mSpringSpec")
+
+local mBindTests = import("/mLibraries/tests/mBindSpec")
+local mReactiveTests = import("/mLibraries/tests/mReactiveSpec")
+local mControlsTests = import("/mLibraries/tests/mControlsSpec")
+local mWidgetsTests = import("/mLibraries/tests/mWidgetsSpec")
+local mStoreTests = import("/mLibraries/tests/mStoreSpec")
+local mBanTests = import("/mLibraries/tests/mBanSpec")
+local mMessagingTests = import("/mLibraries/tests/mMessagingSpec")
 
 local Run = func():
     local suites = []
     suites.push(mSignalTests.Run())
     suites.push(mCleanupTests.Run())
     suites.push(mAsyncTests.Run())
+    suites.push(mCommandTests.Run())
+    suites.push(mPacketTests.Run())
+    suites.push(mNetTests.Run())
+    suites.push(mStateTests.Run())
+    suites.push(mPlayerTests.Run())
+    suites.push(mDataTests.Run())
+    suites.push(mSpringTests.Run())
+    suites.push(mBindTests.Run())
+    suites.push(mReactiveTests.Run())
+    suites.push(mControlsTests.Run())
+    suites.push(mWidgetsTests.Run())
+    suites.push(mStoreTests.Run())
+    suites.push(mBanTests.Run())
+    suites.push(mMessagingTests.Run())
     local passed = 0
     local failed = 0
     for suite in suites:

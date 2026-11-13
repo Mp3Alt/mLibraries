@@ -1,0 +1,228 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mWidgets = import("/mLibraries/mWidgets")
+local mState = import("/mLibraries/mState")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local Run = func():
+    local suite = mTestKit.New("mWidgets")
+    suite.Test("readable detection preserves ordinary falsey configuration", func():
+        suite.Equal(mWidgets.IsSource(false), false, "false is a literal")
+        suite.Equal(mWidgets.IsSource(0), false, "zero is a literal")
+        suite.Equal(mWidgets.IsSource(""), false, "empty string is a literal")
+        suite.Equal(mWidgets.IsSource({ Text = "label" }), false, "plain table is a literal")
+        local value = mState.New(false)
+        suite.Expect(mWidgets.IsSource(value), "mState is readable")
+        value.Destroy()
+    )
+    suite.Test("theme is the copied native control contract", func():
+        suite.Equal(mWidgets.Theme({ Radius = 0 }).Radius, 0, "explicit square shape")
+        suite.Throws(func(): mWidgets.Theme({ TextSize = -2 }), "bad token rejected")
+        suite.Throws(func(): mWidgets.New({}), "parent required")
+    )
+    return suite.Report()
+
+local RunNative = func():
+    local suite = mTestKit.New("mWidgets native")
+    local screen = new ScreenUI() { Name = "mWidgetsSpec", Parent = game.UICanvas }
+    local kit = mWidgets.New({ Parent = screen, AutoStep = false })
+    try:
+        suite.Test("text visibility and disabled sources bind initially and later", func():
+            local text = kit.Scope.Value("")
+            local visible = kit.Scope.Value(false)
+            local disabled = kit.Scope.Value(true)
+            local button = kit.Button({ Text = text, Visible = visible, Disabled = disabled })
+            suite.Equal(button.Root.Text, "", "empty initial text")
+            suite.Equal(button.Root.Visible, false, "false initial visibility")
+            suite.Equal(button.GetDisabled(), true, "initial disabled state")
+            text.Set("Ready")
+            visible.Set(true)
+            disabled.Set(false)
+            suite.Equal(button.Root.Text, "Ready", "text update")
+            suite.Equal(button.Root.Visible, true, "visibility update")
+            suite.Equal(button.GetDisabled(), false, "disabled update")
+            suite.Throws(func(): button.SetText("Override"), "one writer enforced")
+            button.Destroy()
+            text.Set("After teardown")
+            suite.Equal(kit.GetCount(), 0, "subscriptions and registration disposed")
+        )
+        suite.Test("controlled values require explicit caller commits", func():
+            local state = kit.Scope.Value(false)
+            local calls = 0
+            local accepted = kit.Toggle({ Value = state, OnChanged = func(value):
+                calls += 1
+                state.Set(value)
+            })
+            accepted.Activate()
+            suite.Equal(state.Get(), true, "caller committed")
+            suite.Equal(accepted.GetValue(), true, "control reflects committed state")
+            suite.Equal(calls, 1, "one callback without feedback")
+            suite.Throws(func(): accepted.SetValue(false), "controlled setter refused")
+            local readonly = kit.Scope.Computed([state], expr(values): not values[0])
+            local requested = nil
+            local rejected = kit.Toggle({ Value = readonly, OnChanged = func(value): requested = value })
+            rejected.Activate()
+            suite.Equal(requested, true, "user request delivered")
+            suite.Equal(readonly.Get(), false, "computed never treated as writable")
+            suite.Equal(rejected.GetValue(), false, "uncommitted request reconciled")
+            accepted.Destroy()
+            rejected.Destroy()
+        )
+        suite.Test("literal controls retain silent imperative setters", func():
+            local calls = 0
+            local slider = kit.Slider({ Min = 0, Max = 10, Value = 0, OnChanged = func(value): calls += 1 })
+            slider.SetValue(5)
+            suite.Equal(slider.GetValue(), 5, "literal value updates")
+            suite.Equal(calls, 0, "programmatic update stayed silent")
+            slider.Destroy()
+        )
+        suite.Test("dynamic themes validate before replacing the last native values", func():
+            local tokens = kit.Scope.Value({ Text = new Color4(0.2, 0.8, 0.3) })
+            local label = kit.Text({ Text = "Theme", Theme = tokens })
+            local expected = label.Root.TextColor.ToHex()
+            tokens.Set({ TextSize = -1 })
+            suite.Equal(label.Root.TextColor.ToHex(), expected, "invalid theme retains last style")
+            suite.Expect(label.GetBindingError("Theme") != nil, "binding exposes the failure")
+            tokens.Set({ Text = new Color4(0.8, 0.3, 0.2) })
+            suite.Equal(label.GetBindingError("Theme"), nil, "successful update clears error")
+            suite.Expect(label.Root.TextColor.ToHex() != expected, "valid theme applied")
+            label.Destroy()
+        )
+        suite.Test("failed initial reactive configuration releases the control", func():
+            local bad = kit.Scope.Value({ Height = -1 })
+            local before = screen.GetChildren().length
+            suite.Throws(func(): kit.Button({ Theme = bad }), "invalid initial theme")
+            suite.Equal(screen.GetChildren().length, before, "native tree cleaned")
+            local text = kit.Scope.Value("unsupported")
+            suite.Throws(func(): kit.Panel({ Text = text }), "unsupported source property")
+            suite.Equal(kit.GetCount(), 0, "partial component not retained")
+            text.Set("no retained callback")
+        )
+        suite.Test("controlled window visibility follows the caller's close decision", func():
+            local visible = kit.Scope.Value(true)
+            local window = kit.Window({ Visible = visible })
+            window.Close()
+            suite.Equal(window.Root.Visible, true, "readonly visibility request rejected")
+            window.Destroy()
+            local accepted = kit.Window({ Visible = visible, OnClosed = func(): visible.Set(false) })
+            accepted.Close()
+            suite.Equal(accepted.Root.Visible, false, "caller accepted close")
+            accepted.Destroy()
+        )
+        suite.Test("external root destruction removes reactive subscriptions", func():
+            local text = kit.Scope.Value("before")
+            local label = kit.Text({ Text = text })
+            label.Root.Destroy()
+            for turn in range(5):
+                if label.IsDestroyed(): break
+                wait(0)
+            suite.Expect(label.IsDestroyed(), "reactive scope disposed after native deletion")
+            suite.Equal(kit.GetCount(), 0, "reactive registration released")
+            suite.Equal(text.Set("after").length, 0, "state update has no disposed binding")
+        )
+        suite.Test("kit disposal owns component subscriptions and native roots", func():
+            local state = mState.New("before")
+            local label = kit.Text({ Text = state })
+            kit.Destroy()
+            suite.Expect(label.IsDestroyed(), "component scope disposed")
+            suite.Equal(state.Set("after").length, 0, "external state remains usable")
+            suite.Equal(screen.GetChildren().length, 0, "all native roots disposed")
+            state.Destroy()
+        )
+    finally:
+        kit.Destroy()
+        screen.Destroy()
+    return suite.Report()
+
+local RunDragAuditNative = func():
+    local suite = mTestKit.New("mWidgets controlled drag")
+    local viewport = game.UICanvas.ViewportSize
+    if viewport.X < 300 or viewport.Y < 200:
+        local report = suite.Report()
+        report.Skipped = 1
+        report.SkipReason = "The client has no usable active viewport."
+        report.Viewport = [viewport.X, viewport.Y]
+        return report
+    local observed = { Requests = [], SourceAfterRejected = nil, SourceAfterAccepted = nil }
+    suite.Test("a rejected controlled slider value does not end the current drag", func():
+        local mBind = import("/mLibraries/mBind")
+        local original_scope = mBind.Scope
+        local wrapped = {}
+        local callbacks = {}
+        local Wrap = nil
+        Wrap = func(scope):
+            if wrapped[scope] == true: return scope
+            wrapped[scope] = true
+            local child = scope.Child
+            local on = scope.On
+            scope.Child = func(): return Wrap(child())
+            scope.On = func(instance, name, callback):
+                if instance.Name == "mWidgetsDragAuditSlider" and (name == "DragStarted" or name == "Dragged" or name == "DragEnded"):
+                    callbacks[name] = callback
+                return on(instance, name, callback)
+            return scope
+        local screen = new ScreenUI() {
+            Name = "mWidgetsDragAudit", Scale = 1, MobileScale = 1,
+            UseSafeArea = false, Parent = game.UICanvas
+        }
+        local kit = nil
+        local source = nil
+        local slider = nil
+        local finish = nil
+        try:
+            # Only construction is observed. Restore the export before waiting,
+            # invoking handlers or running any other fixture work.
+            try:
+                mBind.Scope = func(): return Wrap(original_scope())
+                kit = mWidgets.New({ Parent = screen, AutoStep = false })
+                source = kit.Scope.Value(0.5)
+                slider = kit.Slider({
+                    Name = "mWidgetsDragAuditSlider", Position = new Vector2(24, 120),
+                    Size = new Vector2(240, 36), Min = 0, Max = 1, Value = source,
+                    Theme = { AnimationSpeed = 0 },
+                    OnChanged = func(value):
+                        observed.Requests.push(value)
+                        if value <= 0.8: source.Set(value)
+                })
+            finally:
+                mBind.Scope = original_scope
+            suite.Expect(mBind.Scope == original_scope, "scope export restored after construction")
+            suite.Expect(callbacks.DragStarted != nil and callbacks.Dragged != nil and callbacks.DragEnded != nil, "actual native drag handlers captured")
+            local track = slider.Root.FindFirstChild("Track")
+            for turn in range(12):
+                if track.AbsoluteSize.X > 100 and track.AbsoluteSize.Y > 0: break
+                wait(0)
+            suite.Expect(track.AbsoluteSize.X > 100 and track.AbsoluteSize.Y > 0, "native track has usable rendered geometry")
+            local At = func(fraction):
+                local point = track.AbsolutePosition + new Vector2(track.AbsoluteSize.X * fraction, track.AbsoluteSize.Y / 2)
+                return screen.LocalToViewport(point)
+            local start = At(0.5)
+            finish = At(0.7)
+            callbacks.DragStarted({ Position = start, StartPosition = start, Cancelled = false })
+            callbacks.Dragged({ Position = At(0.9), StartPosition = start, Cancelled = false })
+            observed.SourceAfterRejected = source.Get()
+            suite.Expect(math.abs(source.Get() - 0.5) < 0.0001, "caller rejects the first requested value")
+            suite.Expect(math.abs(slider.GetValue() - 0.5) < 0.0001, "control reconciles to the unchanged source")
+            callbacks.Dragged({ Position = finish, StartPosition = start, Cancelled = false })
+            observed.SourceAfterAccepted = source.Get()
+            suite.Expect(math.abs(source.Get() - 0.7) < 0.0001, "later motion in the same drag reaches the caller")
+            suite.Expect(math.abs(slider.GetValue() - 0.7) < 0.0001, "accepted value is displayed")
+            callbacks.DragEnded({ Position = finish, StartPosition = start, Cancelled = false })
+            finish = nil
+            suite.Equal(observed.Requests.length, 2, "one rejected and one accepted request without a new drag")
+            suite.Expect(math.abs(observed.Requests[0] - 0.9) < 0.0001 and math.abs(observed.Requests[1] - 0.7) < 0.0001, "requests retain gesture order")
+        finally:
+            mBind.Scope = original_scope
+            if finish != nil and callbacks.DragEnded != nil:
+                callbacks.DragEnded({ Position = finish, StartPosition = finish, Cancelled = true })
+            if kit != nil: kit.Destroy()
+            screen.Destroy()
+    )
+    local report = suite.Report()
+    report.Skipped = 0
+    report.Viewport = [viewport.X, viewport.Y]
+    report.Observed = observed
+    return report
+
+return { Run = Run, RunNative = RunNative, RunDragAuditNative = RunDragAuditNative }

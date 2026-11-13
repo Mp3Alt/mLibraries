@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+local mSpring = import("/mLibraries/mSpring")
+local kit = import("/mLibraries/mTestKit")
+
+local Near = func(suite, actual, expected, tolerance):
+    suite.Expect(math.abs(actual - expected) <= tolerance, "numeric reference mismatch")
+
+local Run = func():
+    local suite = kit.New("mSpring")
+    suite.Test("new spring is at rest and does not advance on retarget", func():
+        local spring = mSpring.New(0, nil)
+        suite.Expect(spring.IsResting(), "initial rest")
+        spring.SetTarget(10)
+        suite.Equal(spring.GetValue(), 0, "retarget keeps value")
+        suite.Equal(spring.GetVelocity(), 0, "retarget keeps velocity")
+        suite.Expect(not spring.IsResting(), "new target wakes spring")
+        suite.Equal(spring.Step(0), 0, "zero time does not advance")
+    )
+    # SciPy1.18.1 scipy.linalg.expm([[0,1],[-w*w,-2*z*w]]*dt) @ [-3,-3].
+    # Position = 5 + first component; independent matrix-exponential algorithm.
+    for row in [
+        [1.5, 0, 0.23, 6.42298221009423, 25.07140243816647],
+        [1.5, 0.35, 0.23, 5.010441084049519, 13.760083412374632],
+        [1.5, 0.99999999, 0.23, 3.833495388677574, 7.414992007385907],
+        [1.5, 1, 0.23, 3.8334953774957157, 7.414991959479936],
+        [1.5, 1.00000001, 0.23, 3.8334953663138567, 7.414991911573952],
+        [1.5, 2, 0.23, 3.140581282710889, 4.692462066961166],
+        [0.001, 4, 60, -53.493946193759086, -0.10765200642812889],
+        [8, 0.2, 10, 5, 2.3052823043987723e-42]
+    ]:
+        suite.Test("closed form matches matrix reference " + row[1] + "/" + row[2], func():
+            local spring = mSpring.New(2, { Frequency = row[0], Damping = row[1], PositionTolerance = 0, VelocityTolerance = 0 })
+            spring.SetTarget(5)
+            spring.Impulse(-3)
+            Near(suite, spring.Step(row[2]), row[3], 0.00000001)
+            Near(suite, spring.GetVelocity(), row[4], 0.00000001)
+        )
+    suite.Test("partitioned time agrees when automatic snapping is disabled", func():
+        local options = { Frequency = 2, Damping = 0.45, PositionTolerance = 0, VelocityTolerance = 0 }
+        local one = mSpring.New(-2, options)
+        local many = mSpring.New(-2, options)
+        one.SetTarget(7)
+        many.SetTarget(7)
+        one.Impulse(3)
+        many.Impulse(3)
+        one.Step(0.37)
+        for turn in range(37): many.Step(0.01)
+        Near(suite, many.GetValue(), one.GetValue(), 0.00000001)
+        Near(suite, many.GetVelocity(), one.GetVelocity(), 0.00000001)
+    )
+    suite.Test("retarget preserves moving velocity and impulses add velocity", func():
+        local spring = mSpring.New(0, nil)
+        spring.SetTarget(1)
+        spring.Step(0.03)
+        local velocity = spring.GetVelocity()
+        spring.SetTarget(-4)
+        Near(suite, spring.GetVelocity(), velocity, 0.00000001)
+        spring.Impulse(2)
+        Near(suite, spring.GetVelocity(), velocity + 2, 0.00000001)
+    )
+    suite.Test("snap reset and large elapsed time have explicit outcomes", func():
+        local spring = mSpring.New(0, nil)
+        spring.SetTarget(8)
+        spring.Impulse(10)
+        spring.Snap()
+        suite.Equal(spring.GetValue(), 8, "snap target")
+        suite.Equal(spring.GetVelocity(), 0, "snap velocity")
+        spring.Reset(-3)
+        suite.Equal(spring.GetTarget(), -3, "reset target")
+        suite.Expect(spring.IsResting(), "reset rest")
+        spring.SetTarget(6)
+        suite.Equal(spring.Step(60), 6, "stable large step settles")
+    )
+    suite.Test("per-component tolerances snap both position and velocity", func():
+        local spring = mSpring.New(0, { PositionTolerance = 0.01, VelocityTolerance = 0.01 })
+        spring.SetTarget(0.001)
+        spring.Step(0.1)
+        suite.Equal(spring.GetValue(), 0.001, "snapped position")
+        suite.Equal(spring.GetVelocity(), 0, "snapped velocity")
+    )
+    suite.Test("options are copied and zero damping is retained", func():
+        local options = { Frequency = 1, Damping = 0, PositionTolerance = 0, VelocityTolerance = 0 }
+        local spring = mSpring.New(0, options)
+        options.Damping = 4
+        options.Frequency = 60
+        spring.SetTarget(1)
+        Near(suite, spring.Step(0.5), 2, 0.00000001)
+    )
+    suite.Test("invalid inputs do not alter the spring", func():
+        local spring = mSpring.New(2, nil)
+        for value in [nil, false, "2", [], {}, tonumber("bad"), tonumber("1e999"), -1, 61]:
+            suite.Throws(func(): spring.Step(value), "invalid time rejected")
+        for value in [nil, false, "2", [], {}, tonumber("bad"), tonumber("1e999")]:
+            suite.Throws(func(): spring.SetTarget(value), "invalid target rejected")
+            suite.Throws(func(): spring.Impulse(value), "invalid impulse rejected")
+            suite.Throws(func(): spring.Reset(value), "invalid reset rejected")
+        suite.Equal(spring.GetValue(), 2, "value unchanged")
+        suite.Equal(spring.GetTarget(), 2, "target unchanged")
+        suite.Equal(spring.GetVelocity(), 0, "velocity unchanged")
+    )
+    suite.Test("invalid options reject at construction", func():
+        for options in [[], false, { Unknown = 1 }, { Frequency = 0 }, { Frequency = 61 }, { Damping = -1 }, { Damping = 5 }, { PositionTolerance = -1 }, { VelocityTolerance = false }]:
+            suite.Throws(func(): mSpring.New(0, options), "invalid options")
+    )
+    suite.Test("Vector2 axes follow independent scalar springs", func():
+        local vector = mSpring.New(new Vector2(1, -2), { Damping = 0.5 })
+        local first = mSpring.New(1, { Damping = 0.5 })
+        local second = mSpring.New(-2, { Damping = 0.5 })
+        vector.SetTarget(new Vector2(4, 3))
+        vector.Impulse(new Vector2(2, -1))
+        first.SetTarget(4)
+        second.SetTarget(3)
+        first.Impulse(2)
+        second.Impulse(-1)
+        local value = vector.Step(0.13)
+        Near(suite, value.X, first.Step(0.13), 0.00001)
+        Near(suite, value.Y, second.Step(0.13), 0.00001)
+        suite.Throws(func(): vector.SetTarget(new Vector3()), "wrong vector dimension")
+        suite.Throws(func(): vector.SetTarget({ X = 1, Y = 2 }), "forged vector")
+        suite.Throws(func(): vector.Impulse(2), "scalar is not a vector")
+    )
+    suite.Test("Vector3 getters and controls preserve all axes", func():
+        local vector = mSpring.New(new Vector3(1, 2, 3), nil)
+        vector.SetTarget(new Vector3(4, 5, 6))
+        vector.Impulse(new Vector3(1, -2, 3))
+        local velocity = vector.GetVelocity()
+        suite.Equal(velocity.X, 1, "velocity x")
+        suite.Equal(velocity.Y, -2, "velocity y")
+        suite.Equal(velocity.Z, 3, "velocity z")
+        vector.Snap()
+        suite.Equal(vector.GetValue().Z, 6, "snap z")
+        suite.Expect(vector.IsResting(), "vector rest")
+        vector.Reset(new Vector3())
+        suite.Equal(vector.GetTarget().Y, 0, "reset y")
+    )
+    return suite.Report()
+
+return { Run = Run }

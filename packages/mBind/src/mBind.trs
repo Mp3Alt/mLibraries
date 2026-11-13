@@ -1,0 +1,459 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Owned native UI construction and one-way state bindings.
+# local ui = import("/mLibraries/mBind").Scope()
+# local screen = ui.New("ScreenUI", { Parent = game.UICanvas })
+# local label = ui.New("UITextPanel", { Text = "Hello", Parent = screen })
+# ui.Destroy()
+
+local mCleanup = import("/mLibraries/mCleanup")
+local marker = {}
+local scope_marker = {}
+local writers = {}
+local writer_claims = 0
+local releases = []
+local factories = {}
+local properties = {}
+local events = {}
+
+# Native objects do not support string member indexing. These adapters are explicit.
+factories.ScreenUI = expr(): new ScreenUI()
+factories.UIPanel = expr(): new UIPanel()
+factories.UITextPanel = expr(): new UITextPanel()
+factories.UIButton = expr(): new UIButton()
+factories.UITextInput = expr(): new UITextInput()
+factories.UICircle = expr(): new UICircle()
+factories.UIScrollPanel = expr(): new UIScrollPanel()
+factories.UIHorizontalLayout = expr(): new UIHorizontalLayout()
+factories.UIVerticalLayout = expr(): new UIVerticalLayout()
+factories.UIGridLayout = expr(): new UIGridLayout()
+factories.UIBackgroundImage = expr(): new UIBackgroundImage()
+
+properties.Archivable = { Classes = ["Instance"], Set = func(instance, value): instance.Archivable = value }
+properties.Locked = { Classes = ["Instance"], Set = func(instance, value): instance.Locked = value }
+properties.Name = { Classes = ["Instance"], Set = func(instance, value): instance.Name = value }
+properties.Parent = { Classes = ["Instance"], Set = func(instance, value): instance.Parent = value }
+properties.IgnoreParent = { Classes = ["VisualInstance"], Set = func(instance, value): instance.IgnoreParent = value }
+properties.Transparency = { Classes = ["VisualInstance"], Set = func(instance, value): instance.Transparency = value }
+properties.Visible = { Classes = ["VisualInstance"], Set = func(instance, value): instance.Visible = value }
+properties.AnchorBottom = { Classes = ["UIObject"], Set = func(instance, value): instance.AnchorBottom = value }
+properties.AnchorLeft = { Classes = ["UIObject"], Set = func(instance, value): instance.AnchorLeft = value }
+properties.AnchorRight = { Classes = ["UIObject"], Set = func(instance, value): instance.AnchorRight = value }
+properties.AnchorTop = { Classes = ["UIObject"], Set = func(instance, value): instance.AnchorTop = value }
+properties.BlocksPointer = { Classes = ["UIObject"], Set = func(instance, value): instance.BlocksPointer = value }
+properties.ClipsChildren = { Classes = ["UIObject"], Set = func(instance, value): instance.ClipsChildren = value }
+properties.FitContents = { Classes = ["UIObject"], Set = func(instance, value): instance.FitContents = value }
+properties.FlexRatio = { Classes = ["UIObject"], Set = func(instance, value): instance.FlexRatio = value }
+properties.MinSize = { Classes = ["UIObject"], Set = func(instance, value): instance.MinSize = value }
+properties.Modal = { Classes = ["UIObject"], Set = func(instance, value): instance.Modal = value }
+properties.Padding = { Classes = ["UIObject"], Set = func(instance, value): instance.Padding = value }
+properties.Pivot = { Classes = ["UIObject"], Set = func(instance, value): instance.Pivot = value }
+properties.Position = { Classes = ["UIObject"], Set = func(instance, value): instance.Position = value }
+properties.Rotation = { Classes = ["UIObject"], Set = func(instance, value): instance.Rotation = value }
+properties.Scale = { Classes = ["UIObject", "ScreenUI"], Set = func(instance, value): instance.Scale = value }
+properties.Size = { Classes = ["UIObject"], Set = func(instance, value): instance.Size = value }
+properties.ZIndex = { Classes = ["UIObject"], Set = func(instance, value): instance.ZIndex = value }
+properties.BorderColor = { Classes = ["UIShape"], Set = func(instance, value): instance.BorderColor = value }
+properties.BorderPlacement = { Classes = ["UIShape"], Set = func(instance, value): instance.BorderPlacement = value }
+properties.BorderStyle = { Classes = ["UIShape"], Set = func(instance, value): instance.BorderStyle = value }
+properties.BorderWidth = { Classes = ["UIShape"], Set = func(instance, value): instance.BorderWidth = value }
+properties.Color = { Classes = ["UIShape"], Set = func(instance, value): instance.Color = value }
+properties.Roundness = { Classes = ["UIPanel"], Set = func(instance, value): instance.Roundness = value }
+properties.RoundnessBottomLeft = { Classes = ["UIPanel"], Set = func(instance, value): instance.RoundnessBottomLeft = value }
+properties.RoundnessBottomRight = { Classes = ["UIPanel"], Set = func(instance, value): instance.RoundnessBottomRight = value }
+properties.RoundnessTopLeft = { Classes = ["UIPanel"], Set = func(instance, value): instance.RoundnessTopLeft = value }
+properties.RoundnessTopRight = { Classes = ["UIPanel"], Set = func(instance, value): instance.RoundnessTopRight = value }
+properties.Style = { Classes = ["UIPanel"], Set = func(instance, value): instance.Style = value }
+properties.FontName = { Classes = ["UITextPanel", "UITextInput"], Set = func(instance, value): instance.FontName = value }
+properties.LineSpacing = { Classes = ["UITextPanel", "UITextInput"], Set = func(instance, value): instance.LineSpacing = value }
+properties.RichText = { Classes = ["UITextPanel"], Set = func(instance, value): instance.RichText = value }
+properties.StrokeColor = { Classes = ["UITextPanel", "UITextInput"], Set = func(instance, value): instance.StrokeColor = value }
+properties.StrokeWidth = { Classes = ["UITextPanel", "UITextInput"], Set = func(instance, value): instance.StrokeWidth = value }
+properties.Text = { Classes = ["UITextPanel", "UITextInput"], Set = func(instance, value): instance.Text = value }
+properties.TextAlignment = { Classes = ["UITextPanel"], Set = func(instance, value): instance.TextAlignment = value }
+properties.TextColor = { Classes = ["UITextPanel", "UITextInput"], Set = func(instance, value): instance.TextColor = value }
+properties.TextOverflow = { Classes = ["UITextPanel"], Set = func(instance, value): instance.TextOverflow = value }
+properties.TextSize = { Classes = ["UITextPanel", "UITextInput"], Set = func(instance, value): instance.TextSize = value }
+properties.TextVerticalAlignment = { Classes = ["UITextPanel"], Set = func(instance, value): instance.TextVerticalAlignment = value }
+properties.WrapText = { Classes = ["UITextPanel", "UITextInput"], Set = func(instance, value): instance.WrapText = value }
+properties.AutoTintColor = { Classes = ["UIButton"], Set = func(instance, value): instance.AutoTintColor = value }
+properties.Disabled = { Classes = ["UIButton"], Set = func(instance, value): instance.Disabled = value }
+properties.BlurOnSubmit = { Classes = ["UITextInput"], Set = func(instance, value): instance.BlurOnSubmit = value }
+properties.CaretColor = { Classes = ["UITextInput"], Set = func(instance, value): instance.CaretColor = value }
+properties.Editable = { Classes = ["UITextInput"], Set = func(instance, value): instance.Editable = value }
+properties.KeyboardType = { Classes = ["UITextInput"], Set = func(instance, value): instance.KeyboardType = value }
+properties.MaxLength = { Classes = ["UITextInput"], Set = func(instance, value): instance.MaxLength = value }
+properties.Placeholder = { Classes = ["UITextInput"], Set = func(instance, value): instance.Placeholder = value }
+properties.PlaceholderColor = { Classes = ["UITextInput"], Set = func(instance, value): instance.PlaceholderColor = value }
+properties.ReturnKeyType = { Classes = ["UITextInput"], Set = func(instance, value): instance.ReturnKeyType = value }
+properties.SelectAllOnFocus = { Classes = ["UITextInput"], Set = func(instance, value): instance.SelectAllOnFocus = value }
+properties.SelectionColor = { Classes = ["UITextInput"], Set = func(instance, value): instance.SelectionColor = value }
+properties.DisplayOrder = { Classes = ["ScreenUI"], Set = func(instance, value): instance.DisplayOrder = value }
+properties.MobileScale = { Classes = ["ScreenUI"], Set = func(instance, value): instance.MobileScale = value }
+properties.UseSafeArea = { Classes = ["ScreenUI"], Set = func(instance, value): instance.UseSafeArea = value }
+properties.ZIndexBehavior = { Classes = ["ScreenUI"], Set = func(instance, value): instance.ZIndexBehavior = value }
+properties.ArcStart = { Classes = ["UICircle"], Set = func(instance, value): instance.ArcStart = value }
+properties.ArcSweep = { Classes = ["UICircle"], Set = func(instance, value): instance.ArcSweep = value }
+properties.Ratio = { Classes = ["UICircle"], Set = func(instance, value): instance.Ratio = value }
+properties.ScrollEnabled = { Classes = ["UIScrollPanel"], Set = func(instance, value): instance.ScrollEnabled = value }
+properties.ScrollOffset = { Classes = ["UIScrollPanel"], Set = func(instance, value): instance.ScrollOffset = value }
+properties.ScrollStep = { Classes = ["UIScrollPanel"], Set = func(instance, value): instance.ScrollStep = value }
+properties.ScrollX = { Classes = ["UIScrollPanel"], Set = func(instance, value): instance.ScrollX = value }
+properties.ScrollY = { Classes = ["UIScrollPanel"], Set = func(instance, value): instance.ScrollY = value }
+properties.ScrollbarColor = { Classes = ["UIScrollPanel"], Set = func(instance, value): instance.ScrollbarColor = value }
+properties.ScrollbarTrackColor = { Classes = ["UIScrollPanel"], Set = func(instance, value): instance.ScrollbarTrackColor = value }
+properties.ScrollbarVisibility = { Classes = ["UIScrollPanel"], Set = func(instance, value): instance.ScrollbarVisibility = value }
+properties.ScrollbarWidth = { Classes = ["UIScrollPanel"], Set = func(instance, value): instance.ScrollbarWidth = value }
+properties.StickToEnd = { Classes = ["UIScrollPanel"], Set = func(instance, value): instance.StickToEnd = value }
+properties.CrossAlign = { Classes = ["UILayoutContainer"], Set = func(instance, value): instance.CrossAlign = value }
+properties.MainAlign = { Classes = ["UILayoutContainer"], Set = func(instance, value): instance.MainAlign = value }
+properties.Spacing = { Classes = ["UILayoutContainer"], Set = func(instance, value): instance.Spacing = value }
+properties.Columns = { Classes = ["UIGridLayout"], Set = func(instance, value): instance.Columns = value }
+properties.CrossSpacing = { Classes = ["UIGridLayout"], Set = func(instance, value): instance.CrossSpacing = value }
+properties.Fit = { Classes = ["UIBackgroundImage"], Set = func(instance, value): instance.Fit = value }
+properties.ImageId = { Classes = ["UIBackgroundImage"], Set = func(instance, value): instance.ImageId = value }
+properties.SliceRect = { Classes = ["UIBackgroundImage"], Set = func(instance, value): instance.SliceRect = value }
+properties.SliceScale = { Classes = ["UIBackgroundImage"], Set = func(instance, value): instance.SliceScale = value }
+properties.TileSize = { Classes = ["UIBackgroundImage"], Set = func(instance, value): instance.TileSize = value }
+
+events.ChildAdded = { Classes = ["Instance"], Get = expr(instance): instance.ChildAdded }
+events.ChildRemoved = { Classes = ["Instance"], Get = expr(instance): instance.ChildRemoved }
+events.DescendantAdded = { Classes = ["Instance"], Get = expr(instance): instance.DescendantAdded }
+events.DescendantRemoving = { Classes = ["Instance"], Get = expr(instance): instance.DescendantRemoving }
+events.Destroyed = { Classes = ["Instance"], Get = expr(instance): instance.Destroyed }
+events.ParentChanged = { Classes = ["Instance"], Get = expr(instance): instance.ParentChanged }
+events.Removed = { Classes = ["Instance"], Get = expr(instance): instance.Removed }
+events.SortIndexChanged = { Classes = ["Instance"], Get = expr(instance): instance.SortIndexChanged }
+events.Changed = { Classes = ["TruWorldsObject"], Get = expr(instance): instance.Changed }
+events.DragEnded = { Classes = ["UIObject"], Get = expr(instance): instance.DragEnded }
+events.DragStarted = { Classes = ["UIObject"], Get = expr(instance): instance.DragStarted }
+events.Dragged = { Classes = ["UIObject"], Get = expr(instance): instance.Dragged }
+events.FocusGained = { Classes = ["UIObject"], Get = expr(instance): instance.FocusGained }
+events.FocusLost = { Classes = ["UIObject"], Get = expr(instance): instance.FocusLost }
+events.MouseCancelled = { Classes = ["UIObject"], Get = expr(instance): instance.MouseCancelled }
+events.MouseDown = { Classes = ["UIObject"], Get = expr(instance): instance.MouseDown }
+events.MouseUp = { Classes = ["UIObject"], Get = expr(instance): instance.MouseUp }
+events.PointerEnter = { Classes = ["UIObject"], Get = expr(instance): instance.PointerEnter }
+events.PointerExit = { Classes = ["UIObject"], Get = expr(instance): instance.PointerExit }
+events.TouchStarted = { Classes = ["UIObject"], Get = expr(instance): instance.TouchStarted }
+events.Pressed = { Classes = ["UIButton"], Get = expr(instance): instance.Pressed }
+events.Submitted = { Classes = ["UITextInput"], Get = expr(instance): instance.Submitted }
+events.TextChanged = { Classes = ["UITextInput"], Get = expr(instance): instance.TextChanged }
+events.Scrolled = { Classes = ["UIScrollPanel"], Get = expr(instance): instance.Scrolled }
+
+
+local Compatible = func(instance, classes):
+    for name in classes:
+        if instance.IsA(name): return true
+    return false
+
+local Property = func(instance, name):
+    local adapter = properties[name]
+    if adapter == nil: throw "mBind: unknown property " + tostring(name)
+    if not Compatible(instance, adapter.Classes): throw "mBind: property " + name + " is not supported by " + instance.ClassName
+    return adapter
+
+local Event = func(instance, name):
+    local adapter = events[name]
+    if adapter == nil: throw "mBind: unknown event " + tostring(name)
+    if not Compatible(instance, adapter.Classes): throw "mBind: event " + name + " is not supported by " + instance.ClassName
+    return adapter.Get(instance)
+
+local Once = func():
+    local claims = 0
+    return expr(): claims++ == 0
+
+local Dispose = func(entry):
+    if not entry.Take(): return
+    entry.Dead = true
+    local owner = entry.Owner
+    local cleanup = entry.Cleanup
+    local list = entry.List
+    entry.Owner = nil
+    entry.Cleanup = nil
+    entry.List = nil
+    if list != nil: list.remove(entry)
+    if cleanup != nil: cleanup()
+
+local Register = func(state, cleanup):
+    if cleanup == nil: throw "mBind: cleanup callback is required"
+    if state.Destroyed: throw "mBind: scope is destroyed"
+    local list = state.Resources
+    local entry = { Owner = state, List = list, Cleanup = cleanup, Dead = false, Take = Once() }
+    list.push(entry)
+    if state.Destroyed:
+        Dispose(entry)
+        throw "mBind: scope is destroyed"
+    local handle = {}
+    handle.Destroy = expr(): Dispose(entry)
+    handle.Disconnect = handle.Destroy
+    handle.IsDestroyed = expr(): entry.Dead
+    return handle
+
+local Readable = func(source):
+    if source == nil: throw "mBind: source is required"
+    if source.Get == nil or source.Observe == nil: throw "mBind: source needs Get and Observe"
+    return source
+
+local Watch = func(state, source, apply, release):
+    Readable(source)
+    if apply == nil: throw "mBind: apply callback is required"
+    local live = true
+    local connection = nil
+    local dirty = false
+    local claims = 0
+    local last_error = nil
+    local work = apply
+    local readable = source
+    apply = nil
+    source = nil
+    local resource = Register(state, func():
+        live = false
+        local previous = connection
+        connection = nil
+        work = nil
+        readable = nil
+        state = nil
+        dirty = false
+        try:
+            if previous != nil: previous.Disconnect()
+        finally:
+            if release != nil:
+                local callback = release
+                release = nil
+                callback()
+    )
+    local Refresh = nil
+    Refresh = func():
+        if not live or state.Destroyed: return
+        dirty = true
+        local ticket = claims++
+        if ticket != 0: return
+        try:
+            while dirty and live and not state.Destroyed:
+                dirty = false
+                local current_source = readable
+                local current_work = work
+                try:
+                    local value = current_source.Get()
+                    if live and not state.Destroyed:
+                        current_work(value, expr(): live and not state.Destroyed)
+                        last_error = nil
+                catch failure:
+                    last_error = failure
+        finally:
+            claims = 0
+        # A producer can request an update while the previous owner releases.
+        if dirty and live and not state.Destroyed: Refresh()
+    try:
+        local subscribing = readable
+        connection = subscribing.Observe(func(value): Refresh())
+        if connection == nil or connection.Disconnect == nil: throw "mBind: Observe must return a connection"
+        if not live or state.Destroyed:
+            connection.Disconnect()
+            connection = nil
+            throw "mBind: scope was destroyed during subscription"
+        Refresh()
+        if last_error != nil: throw last_error
+        if not live or state.Destroyed: throw "mBind: scope was destroyed during initial application"
+    catch failure:
+        resource.Destroy()
+        throw failure
+    resource.GetError = expr(): last_error
+    resource.Refresh = Refresh
+    return resource
+
+local FlushReleases = nil
+FlushReleases = func():
+    local ticket = writer_claims++
+    if ticket != 0: return
+    try:
+        while releases.length > 0:
+            local entry = releases.remove_at(0)
+            local bucket = writers[entry.Instance]
+            if bucket != nil:
+                if bucket[entry.Name] == entry.Token: table.remove(bucket, entry.Name)
+                if table.count(bucket) == 0: table.remove(writers, entry.Instance)
+    finally:
+        writer_claims = 0
+    if releases.length > 0: FlushReleases()
+
+local ClaimWriter = func(instance, name):
+    FlushReleases()
+    local ticket = writer_claims++
+    if ticket != 0: throw "mBind: writer registration is busy"
+    local token = {}
+    try:
+        local bucket = writers[instance]
+        if bucket == nil:
+            bucket = {}
+            writers[instance] = bucket
+        if bucket[name] != nil: throw "mBind: property already has a writer: " + name
+        bucket[name] = token
+    finally:
+        writer_claims = 0
+        FlushReleases()
+    return token
+
+local Binding = func(state, instance, name, source, map):
+    local adapter = Property(instance, name)
+    Readable(source)
+    local token = ClaimWriter(instance, name)
+    local release_once = Once()
+    local destroyed = nil
+    local Release = func():
+        if not release_once(): return
+        try:
+            local previous = destroyed
+            destroyed = nil
+            if previous != nil: previous.Disconnect()
+        finally:
+            releases.push({ Instance = instance, Name = name, Token = token })
+            FlushReleases()
+    local binding = nil
+    try:
+        binding = Watch(state, source, func(value, alive):
+            local next_value = value
+            if map != nil: next_value = map(value)
+            if alive(): adapter.Set(instance, next_value)
+        , Release)
+        destroyed = instance.Destroyed.Connect(expr(): binding.Destroy())
+        if binding.IsDestroyed(): destroyed.Disconnect()
+    catch failure:
+        if binding != nil: binding.Destroy()
+        Release()
+        throw failure
+    return binding
+
+local Descriptor = func(value):
+    try: return value[marker]
+    catch failure: return nil
+
+local Value = func(source, map):
+    Readable(source)
+    local descriptor = {}
+    descriptor[marker] = { Source = source, Map = map }
+    return descriptor
+
+local Scope = nil
+Scope = func():
+    local state = { Destroyed = false, Resources = [], Parent = nil, Close = Once() }
+    local owner = mCleanup.New()
+    local scope = {}
+    local errors = []
+    owner.Add(func():
+        local batch = state.Resources
+        state.Resources = []
+        while batch.length > 0:
+            local entry = batch.pop()
+            if entry == nil: continue
+            entry.List = nil
+            try: Dispose(entry)
+            catch failure: errors.push(failure)
+    )
+    scope.IsDestroyed = expr(): state.Destroyed
+    scope.GetCount = expr(): state.Resources.length
+    scope.Add = expr(callback): Register(state, callback)
+    scope.Destroy = func():
+        if not state.Close(): return []
+        state.Destroyed = true
+        local parent = state.Parent
+        state.Parent = nil
+        if parent != nil: parent.Destroy()
+        for failure in owner.Destroy(): errors.push(failure)
+        local result = errors
+        errors = []
+        return result
+    scope.Child = func():
+        if state.Destroyed: throw "mBind: scope is destroyed"
+        local child = Scope()
+        local registration = scope.Add(func():
+            for failure in child.Destroy(): errors.push(failure)
+        )
+        local child_state = child[scope_marker]
+        child_state.Parent = registration
+        if child_state.Destroyed:
+            registration.Destroy()
+            throw "mBind: scope was destroyed during adoption"
+        return child
+    scope.Watch = expr(source, apply): Watch(state, source, apply, nil)
+    scope.Bind = expr(instance, name, source, map): Binding(state, instance, name, source, map)
+    scope.On = func(instance, name, callback):
+        if state.Destroyed: throw "mBind: scope is destroyed"
+        if callback == nil: throw "mBind: event callback is required"
+        local connection = Event(instance, name).Connect(callback)
+        try: return Register(state, expr(): connection.Disconnect())
+        catch failure:
+            connection.Disconnect()
+            throw failure
+    scope.Own = func(instance):
+        if instance == nil: throw "mBind: instance is required"
+        local connection = nil
+        local resource = Register(state, func():
+            if connection != nil: connection.Disconnect()
+            connection = nil
+            instance.Destroy()
+        )
+        try:
+            connection = instance.Destroyed.Connect(expr(): resource.Destroy())
+            if resource.IsDestroyed(): connection.Disconnect()
+        catch failure:
+            resource.Destroy()
+            throw failure
+        return resource
+    scope.New = func(class_name, config):
+        if state.Destroyed: throw "mBind: scope is destroyed"
+        local factory = factories[class_name]
+        if factory == nil: throw "mBind: unsupported class " + tostring(class_name)
+        if config == nil: config = {}
+        local node = scope.Child()
+        local instance = nil
+        local restored = []
+        try:
+            instance = factory()
+            node.Own(instance)
+            node.On(instance, "Destroyed", expr(): node.Destroy())
+            # Validate names before applying values or moving borrowed children.
+            for name in table.keys(config):
+                if name != "Events" and name != "Children": Property(instance, name)
+            if config.Events != nil:
+                for name in table.keys(config.Events): Event(instance, name)
+            for name in table.keys(config):
+                if name == "Parent" or name == "Events" or name == "Children": continue
+                local value = config[name]
+                local binding = Descriptor(value)
+                if binding == nil: Property(instance, name).Set(instance, value)
+                else: node.Bind(instance, name, binding.Source, binding.Map)
+            if config.Events != nil:
+                for name in table.keys(config.Events): node.On(instance, name, config.Events[name])
+            if config.Children != nil:
+                for child in config.Children:
+                    restored.push({ Instance = child, Parent = child.Parent })
+                    child.Parent = instance
+            if config.Parent != nil:
+                local parent_binding = Descriptor(config.Parent)
+                if parent_binding == nil: instance.Parent = config.Parent
+                else: node.Bind(instance, "Parent", parent_binding.Source, parent_binding.Map)
+            return instance
+        catch failure:
+            while restored.length > 0:
+                local previous = restored.pop()
+                try: previous.Instance.Parent = previous.Parent
+                catch ignored: print("mBind: could not restore a child after construction failed")
+            node.Destroy()
+            throw failure
+    scope[scope_marker] = state
+    return scope
+
+local Names = func(entries):
+    local result = []
+    for name in table.keys(entries): result.push(name)
+    return result
+
+return {
+    Scope = Scope,
+    Value = Value,
+    GetClasses = expr(): Names(factories),
+    GetProperties = expr(): Names(properties),
+    GetEvents = expr(): Names(events)
+}

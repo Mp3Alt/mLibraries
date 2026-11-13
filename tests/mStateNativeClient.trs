@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Optional native concurrency fixture. Leave unattached outside local tests.
+local suite = import("/mLibraries/tests/mStateSpec")
+local report = suite.RunConcurrent()
+print(report.Name + ": " + report.Passed + " passed, " + report.Failed + " failed")
+for failure in report.Failures: print(report.Name + ": " + failure)

@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Attach only with mPlayerNativeServer in an isolated two-player Creator Play.
+if game.ServerId != "": return
+local player = game.Players.LocalPlayer
+local deadline = host.time() + 5
+while player == nil and host.time() < deadline:
+    wait(0)
+    player = game.Players.LocalPlayer
+if player == nil or (player.UserId != -1 and player.UserId != -2): return
+local suite = import("/mLibraries/mTestKit").New("mPlayerNativeClient")
+local entries = []
+local errors = []
+local connections = []
+local stopped = false
+local watch = nil
+local request = nil
+local respawn = false
+local unexpected = 0
+local Find = func(id):
+    for entry in entries:
+        if entry.Player.UserId == id: return entry
+    return nil
+local options = {}
+options.OnPlayer = func(scope):
+    local entry = { Player = scope.GetPlayer(), Scope = scope, CharacterScope = nil, Characters = 0, Cleaned = 0, PlayerCleaned = 0, Inactive = true }
+    entries.push(entry)
+    scope.Add(func():
+        entry.Inactive = entry.Inactive and not scope.IsActive()
+        entry.PlayerCleaned += 1
+    )
+options.OnCharacter = func(scope):
+    local entry = Find(scope.GetPlayer().UserId)
+    if entry == nil: throw "Character callback preceded player callback."
+    entry.CharacterScope = scope
+    entry.Characters += 1
+    scope.Add(func():
+        entry.Inactive = entry.Inactive and not scope.IsActive()
+        entry.Cleaned += 1
+    )
+options.OnError = func(stage, failure): errors.push(stage + ": " + tostring(failure))
+local Stop = func():
+    if stopped: return
+    stopped = true
+    if watch != nil: watch.Destroy()
+    for connection in connections: connection.Disconnect()
+    connections.clear()
+local Await = func(predicate, seconds):
+    local finish_by = host.time() + seconds
+    while not stopped and not predicate() and host.time() < finish_by: wait(0)
+    if stopped or not predicate(): throw "mPlayer client deadline expired."
+try:
+    connections.push(this.Removed.Connect(Stop))
+    local channel = world.WaitForChild("mPlayerNativeTest", 10)
+    if channel == nil: throw "mPlayer native channel unavailable."
+    request = channel.WaitForChild("Request", 5)
+    local reply = channel.WaitForChild("Reply", 5)
+    local ready = channel.WaitForChild("Ready", 5)
+    if request == nil or reply == nil or ready == nil or not ready.Value: throw "mPlayer native channel not ready."
+    connections.push(channel.Destroyed.Connect(Stop))
+    connections.push(reply.Connect(func(actor, phase):
+        if stopped: return
+        if actor != player.UserId or phase != "Respawn" or respawn:
+            unexpected += 1
+            return
+        respawn = true
+    ))
+    watch = import("/mLibraries/mPlayer").New(options, nil)
+    Await(func():
+        local first = Find(-1)
+        local second = Find(-2)
+        return first != nil and second != nil and watch.GetCharacter(first.Player) != nil and watch.GetCharacter(second.Player) != nil
+    , 10)
+    local first = Find(-1)
+    local second = Find(-2)
+    local old_scope = first.CharacterScope
+    local old_character = old_scope.GetCharacter()
+    local before_characters = first.Characters
+    local before_cleaned = first.Cleaned
+    suite.Test("both native player and character lifetimes are observed", func():
+        suite.Equal(watch.GetPlayers().length, 2, "two players")
+        suite.Expect(first.Scope.IsActive() and second.Scope.IsActive(), "player scopes active")
+        suite.Expect(old_scope.IsActive(), "character active before barrier")
+        suite.Equal(errors.length, 0, "no observer errors")
+    )
+    request.Fire("Ready")
+    Await(expr(): respawn and first.CharacterScope != old_scope and watch.GetCharacter(first.Player) != nil and watch.GetCharacter(first.Player) != old_character, 12)
+    suite.Test("replicated respawn closes the previous character scope", func():
+        suite.Equal(old_scope.IsActive(), false, "old scope inactive")
+        suite.Equal(old_scope.GetPlayer(), nil, "old player reference released")
+        suite.Equal(old_scope.GetCharacter(), nil, "old character reference released")
+        suite.Equal(first.Cleaned, before_cleaned + 1, "old cleanup once")
+        suite.Expect(first.Inactive, "inactive before cleanup")
+        suite.Equal(first.Characters, before_characters + 1, "one new callback")
+        suite.Equal(watch.GetCharacter(first.Player), first.Player.Character, "new native character")
+        suite.Equal(unexpected, 0, "private phase reply")
+    )
+    watch.Destroy()
+    suite.Test("client teardown closes all owned lifetimes", func():
+        suite.Equal(watch.GetPlayers().length, 0, "closed roster")
+        suite.Equal(first.Cleaned, first.Characters, "first character cleanup")
+        suite.Equal(second.Cleaned, second.Characters, "second character cleanup")
+        suite.Equal(first.PlayerCleaned, 1, "first player cleanup")
+        suite.Equal(second.PlayerCleaned, 1, "second player cleanup")
+        suite.Expect(first.Inactive and second.Inactive, "all cleanup sees inactive")
+        suite.Equal(errors.length, 0, "no observer errors")
+    )
+    request.Fire("Done")
+catch failure:
+    suite.Test("native fixture setup and deadlines", func(): throw failure)
+finally:
+    Stop()
+local report = suite.Report()
+print(report.Name + ": " + report.Passed + " passed, " + report.Failed + " failed; account #" + player.UserId)
+for failure in report.Failures: warn(failure)

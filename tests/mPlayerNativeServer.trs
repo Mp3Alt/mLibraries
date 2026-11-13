@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Isolated two-player Creator fixture. Calls LoadCharacter for local Player1.
+if game.ServerId != "": return
+if world.FindFirstChild("mPlayerNativeTest") != nil:
+    throw "Use a fresh isolated Play session for mPlayer native checks."
+local mPlayer = import("/mLibraries/mPlayer")
+local suite = import("/mLibraries/mTestKit").New("mPlayerNativeServer")
+local entries = []
+local errors = []
+local connections = []
+local stopped = false
+local watch = nil
+local channel = new Folder() { Name = "mPlayerNativeTest" }
+local request = new RemoteEvent() { Name = "Request", Parent = channel }
+local reply = new RemoteEvent() { Name = "Reply", Parent = channel }
+local Find = func(player):
+    for entry in entries:
+        if entry.Player == player: return entry
+    return nil
+local ById = func(id):
+    for entry in entries:
+        if entry.Player.UserId == id: return entry
+    return nil
+local options = {}
+options.OnPlayer = func(scope):
+    local entry = { Player = scope.GetPlayer(), Scope = scope, CharacterScope = nil, Characters = 0, CharacterCleaned = 0, PlayerCleaned = 0, Inactive = true, Ready = false, Done = false, Requests = 0 }
+    entries.push(entry)
+    scope.Add(func():
+        entry.Inactive = entry.Inactive and not scope.IsActive()
+        entry.PlayerCleaned += 1
+    )
+options.OnCharacter = func(scope):
+    local entry = Find(scope.GetPlayer())
+    if entry == nil: throw "Character callback preceded player callback."
+    entry.CharacterScope = scope
+    entry.Characters += 1
+    scope.Add(func():
+        entry.Inactive = entry.Inactive and not scope.IsActive()
+        entry.CharacterCleaned += 1
+    )
+options.OnError = func(stage, failure): errors.push(stage + ": " + tostring(failure))
+local Stop = func():
+    if stopped: return
+    stopped = true
+    if watch != nil: watch.Destroy()
+    for connection in connections: connection.Disconnect()
+    connections.clear()
+    channel.Destroy()
+local Await = func(predicate, seconds):
+    local deadline = host.time() + seconds
+    while not stopped and not predicate() and host.time() < deadline: wait(0)
+    if stopped or not predicate(): throw "mPlayer native deadline expired."
+try:
+    connections.push(this.Removed.Connect(Stop))
+    connections.push(game.ShuttingDown.Connect(Stop))
+    connections.push(channel.Destroyed.Connect(Stop))
+    watch = mPlayer.New(options, nil)
+    connections.push(request.Connect(func(player, operation):
+        if stopped or (player.UserId != -1 and player.UserId != -2): return
+        local entry = Find(player)
+        if entry == nil: return
+        entry.Requests += 1
+        if entry.Requests > 4: return
+        if operation == "Ready": entry.Ready = true
+        elif operation == "Done": entry.Done = true
+    ))
+    local ready = new BoolValue() { Name = "Ready", Value = true, Parent = channel }
+    channel.Parent = world
+    Await(func():
+        local first = ById(-1)
+        local second = ById(-2)
+        return first != nil and second != nil and first.Ready and second.Ready and watch.GetCharacter(first.Player) != nil and watch.GetCharacter(second.Player) != nil
+    , 15)
+    local first = ById(-1)
+    local second = ById(-2)
+    local old_scope = first.CharacterScope
+    local old_character = old_scope.GetCharacter()
+    local before_characters = first.Characters
+    local before_cleaned = first.CharacterCleaned
+    suite.Test("both real local players have active scopes", func():
+        suite.Equal(watch.GetPlayers().length, 2, "two players")
+        suite.Expect(first.Scope.IsActive() and second.Scope.IsActive(), "player scopes active")
+        suite.Expect(old_scope.IsActive(), "old character active before respawn")
+        suite.Equal(errors.length, 0, "no observer failures")
+    )
+    first.Player.LoadCharacter()
+    Await(expr(): first.CharacterScope != old_scope and watch.GetCharacter(first.Player) != nil and watch.GetCharacter(first.Player) != old_character, 8)
+    suite.Test("real replacement invalidates and drains the old character", func():
+        suite.Equal(old_scope.IsActive(), false, "old scope inactive")
+        suite.Equal(old_scope.GetPlayer(), nil, "old player reference released")
+        suite.Equal(old_scope.GetCharacter(), nil, "old character reference released")
+        suite.Equal(first.CharacterCleaned, before_cleaned + 1, "old resources drained once")
+        suite.Expect(first.Inactive, "inactive before cleanup")
+    )
+    suite.Test("replacement notifications are deduplicated", func():
+        suite.Equal(first.Characters, before_characters + 1, "one setup for replacement")
+        suite.Expect(first.CharacterScope.IsActive(), "replacement active")
+        suite.Equal(watch.GetCharacter(first.Player), first.Player.Character, "native character agrees")
+        suite.Equal(errors.length, 0, "no observer errors")
+    )
+    reply.FireTo(first.Player, first.Player.UserId, "Respawn")
+    reply.FireTo(second.Player, second.Player.UserId, "Respawn")
+    Await(expr(): first.Done and second.Done, 10)
+    local first_scope = first.CharacterScope
+    local second_scope = second.CharacterScope
+    watch.Destroy()
+    suite.Test("Destroy invalidates all native scopes and drains once", func():
+        suite.Equal(watch.IsDestroyed(), true, "observer closed")
+        suite.Equal(watch.GetPlayers().length, 0, "closed roster")
+        suite.Equal(first_scope.IsActive(), false, "first character closed")
+        suite.Equal(second_scope.IsActive(), false, "second character closed")
+        suite.Equal(first.CharacterCleaned, first.Characters, "all first resources drained")
+        suite.Equal(second.CharacterCleaned, second.Characters, "all second resources drained")
+        suite.Equal(first.PlayerCleaned, 1, "first player cleanup once")
+        suite.Equal(second.PlayerCleaned, 1, "second player cleanup once")
+        suite.Expect(first.Inactive and second.Inactive, "cleanup sees inactive scopes")
+        suite.Equal(errors.length, 0, "native observer remained healthy")
+    )
+catch failure:
+    suite.Test("native fixture setup and deadlines", func(): throw failure)
+finally:
+    Stop()
+local report = suite.Report()
+print(report.Name + ": " + report.Passed + " passed, " + report.Failed + " failed")
+for failure in report.Failures: warn(failure)

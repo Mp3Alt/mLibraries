@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Local test receipts only. Leave unattached outside Creator checks.
+if game.ServerId != "": throw "mUi fixtures require a Creator playtest."
+local folder = new Folder() { Name = "mLibraryAuditReports" }
+local remote = new RemoteEvent() { Name = "Report", Parent = folder }
+local received = {}
+remote.Connect(func(player, text):
+    if received[player] != nil: return
+    try:
+        if string.length(text) > 48000: return
+        local report = new Folder() { Name = player.Name }
+        local offset = 0
+        while offset < string.length(text):
+            new StringValue() { Name = tostring(offset), Value = string.substring(text, offset, math.min(900, string.length(text) - offset)), Parent = report }
+            offset += 900
+        report.Parent = folder
+        received[player] = report
+    catch invalid:
+        print("mUi fixture ignored an invalid local receipt")
+)
+folder.Parent = world
+print("mUi native receipt collector ready")
+
+# Development-only native-script probe. Uses injected storage, not a DataStore.
+# Concurrent Subscribe calls must never deliver to more than 64 listeners.
+local mMessaging = import("/mLibraries/mMessaging")
+local suite = import("/mLibraries/mTestKit").New("mMessagingCapacityAudit")
+local time = 0
+local NewCandidate = func():
+    local row = nil
+    local hits = 0
+    local backend = {
+        GetAsync = expr(key): row,
+        UpdateAsync = func(key, transform):
+            local saved = transform(row)
+            if saved != nil: row = saved
+            return saved
+    }
+    local bus = mMessaging.New({ Topic = "audit", PollSeconds = 5 }, { Store = backend, Clock = expr(): time })
+    local handler = func(message): hits++
+    for index in range(63): bus.Subscribe(handler)
+    local initialized = bus.Step()
+    if not initialized.Ok: throw "Capacity audit could not initialize its injected topic."
+    return { Bus = bus, Handler = handler, Hits = expr(): hits }
+
+local candidates = []
+for index in range(128): candidates.push(NewCandidate())
+local completed = 0
+local stop = false
+local deadline = host.time() + 20
+for worker in range(6):
+    spawn(func():
+        try:
+            for candidate in candidates:
+                if stop: return
+                try: candidate.Bus.Subscribe(candidate.Handler)
+                catch capacity: pass
+        finally: completed++
+    )
+while completed < 6 and host.time() < deadline: wait()
+stop = true
+suite.Test("all subscription workers completed", func(): suite.Equal(completed, 6, "bounded native workers"))
+local maximum = 0
+local excess = 0
+try:
+    if completed == 6:
+        time = 5
+        for candidate in candidates:
+            local sent = candidate.Bus.Publish({ Kind = "membership" })
+            if not sent.Ok: throw "Capacity audit publication failed."
+            local read = candidate.Bus.Step()
+            if not read.Ok: throw "Capacity audit delivery failed."
+            local count = candidate.Hits()
+            maximum = math.max(maximum, count)
+            if count > 64: excess += 1
+        suite.Test("concurrent registration retains the subscriber cap", func(): suite.Equal(excess, 0, "no channel exceeds 64 listeners"))
+finally:
+    for candidate in candidates: candidate.Bus.Destroy()
+print("mMessagingCapacityAudit maximum listeners: " + maximum + "; channels above 64: " + excess)
+local report = suite.Report()
+print("mMessagingCapacityAudit complete: " + report.Passed + " passed, " + report.Failed + " failed")
+
+local encoded = game.HttpSystem.JsonEncode({ Report = report, Maximum = maximum, Excess = excess })
+local stored = new Folder() { Name = "Server", Parent = folder }
+local cursor = 0
+while cursor < string.length(encoded):
+    new StringValue() { Name = tostring(cursor), Value = string.substring(encoded, cursor, math.min(900, string.length(encoded) - cursor)), Parent = stored }
+    cursor += 900

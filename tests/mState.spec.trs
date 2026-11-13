@@ -1,0 +1,591 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mState = import("/mLibraries/mState")
+local mCleanup = import("/mLibraries/mCleanup")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local Run = func():
+    local suite = mTestKit.New("mState")
+
+    suite.Test("queued teardown closes during computation and unlinks after it", func():
+        local source = mState.New(2)
+        local victim = mState.New(7)
+        local dependent = mState.Derived([victim], expr(values): values[0] * 2)
+        local derived = mState.Derived([source], func(values):
+            suite.Equal(victim.RequestDestroy().length, 0, "teardown queued without yielding")
+            suite.Expect(victim.IsDestroyed(), "closed immediately")
+            suite.Throws(victim.Get, "closed state cannot be read")
+            return values[0] + 1
+        )
+        suite.Equal(derived.Get(), 3, "unrelated computation completes")
+        suite.Expect(dependent.IsDestroyed(), "dependent unlinked after computation")
+        suite.Equal(victim.RequestDestroy().length, 0, "queued teardown is idempotent")
+        derived.Destroy()
+        source.Destroy()
+    )
+    suite.Test("queued teardown of an initial dependency cancels graph construction", func():
+        local source = mState.New(1)
+        suite.Throws(func():
+            mState.Derived([source], func(values):
+                source.RequestDestroy()
+                return values[0]
+            )
+        , "closed dependency rejected")
+        suite.Expect(source.IsDestroyed(), "source is closed")
+        suite.Equal(source.RequestDestroy().length, 0, "later cleanup remains idempotent")
+        local next_source = mState.New(3)
+        local next_derived = mState.Derived([next_source], expr(values): values[0] + 1)
+        suite.Equal(next_derived.Get(), 4, "graph and drain gates released")
+        next_source.Destroy()
+    )
+
+    suite.Test("preserves false zero and nil", func():
+        local value = mState.New(false)
+        suite.Equal(value.Get(), false, "initial false")
+        suite.Equal(value.Set(0).length, 0, "zero write")
+        suite.Equal(value.Get(), 0, "zero retained")
+        value.Set(nil)
+        suite.Equal(value.Get(), nil, "nil retained")
+        value.Destroy()
+    )
+
+    suite.Test("observe subscribes to future changes in registration order", func():
+        local value = mState.New(0)
+        local log = ""
+        value.Observe(func(next_value): log += "A" + next_value)
+        value.Observe(func(next_value): log += "B" + next_value)
+        suite.Equal(log, "", "no implicit initial call")
+        value.Set(1)
+        suite.Equal(log, "A1B1", "ordered listeners")
+        value.Destroy()
+    )
+
+    suite.Test("equal native values do not notify", func():
+        local value = mState.New(4)
+        local calls = 0
+        value.Observe(func(next_value): calls += 1)
+        value.Set(4)
+        suite.Equal(calls, 0, "unchanged scalar")
+        local data = { Count = 1 }
+        value.Set(data)
+        data.Count = 2
+        value.Set(data)
+        suite.Equal(calls, 1, "in-place table edits are not observed")
+        value.Destroy()
+    )
+
+    suite.Test("observer failures are collected and later observers run", func():
+        local value = mState.New(0)
+        local received = 0
+        value.Observe(func(next_value): throw "observer failed")
+        value.Observe(func(next_value): received = next_value)
+        local failures = value.Set(7)
+        suite.Equal(failures.length, 1, "one failure")
+        suite.Equal(failures[0], "observer failed", "original thrown value")
+        suite.Equal(received, 7, "later observer runs")
+        value.Destroy()
+    )
+
+    suite.Test("reentrant writes wait until the current dispatch finishes", func():
+        local value = mState.New(0)
+        local log = ""
+        value.Observe(func(next_value):
+            log += "A" + next_value
+            if next_value == 1:
+                suite.Equal(value.Set(2).length, 0, "nested call is deferred")
+                suite.Equal(value.Get(), 1, "current dispatch retains its committed value")
+        )
+        value.Observe(func(next_value): log += "B" + next_value)
+        suite.Equal(value.Set(1).length, 0, "finite feedback succeeds")
+        suite.Equal(log, "A1B1A2B2", "queued rather than recursive order")
+        suite.Equal(value.Get(), 2, "queued write drained")
+        value.Destroy()
+    )
+
+    suite.Test("batch commits the final value and notifies once", func():
+        local value = mState.New(0)
+        local received = []
+        value.Observe(func(next_value): received.push(next_value))
+        local failures = mState.Batch(func():
+            value.Set(1)
+            value.Set(2)
+            value.Set(3)
+            suite.Equal(value.Get(), 0, "writes remain queued inside batch")
+            suite.Equal(received.length, 0, "no batch notification")
+        )
+        suite.Equal(failures.length, 0, "batch succeeds")
+        suite.Equal(value.Get(), 3, "last write committed")
+        suite.Equal(received.length, 1, "one notification")
+        suite.Equal(received[0], 3, "final value notified")
+        value.Destroy()
+    )
+
+    suite.Test("batch returning to its original value emits no change", func():
+        local value = mState.New(0)
+        local calls = 0
+        value.Observe(func(next_value): calls += 1)
+        mState.Batch(func():
+            value.Set(1)
+            value.Set(0)
+        )
+        suite.Equal(calls, 0, "cancelled change is coalesced")
+        value.Destroy()
+    )
+
+    suite.Test("nested batches coalesce and report callback failures outside", func():
+        local value = mState.New(0)
+        local calls = 0
+        value.Observe(func(next_value): calls += 1)
+        local failures = mState.Batch(func():
+            value.Set(1)
+            local inner = mState.Batch(func():
+                value.Set(2)
+                throw "nested batch failed"
+            )
+            suite.Equal(inner.length, 0, "outer batch owns the drain")
+            value.Set(3)
+        )
+        suite.Equal(failures.length, 1, "nested error reaches outer drain")
+        suite.Equal(failures[0], "nested batch failed", "error preserved")
+        suite.Equal(value.Get(), 3, "accepted writes are not rolled back")
+        suite.Equal(calls, 1, "nested writes coalesce")
+        value.Destroy()
+    )
+
+    suite.Test("batch errors release batching and do not roll back writes", func():
+        local value = mState.New(0)
+        local failures = mState.Batch(func():
+            value.Set(1)
+            throw "work failed"
+        )
+        suite.Equal(failures.length, 1, "work error returned")
+        suite.Equal(value.Get(), 1, "write committed")
+        value.Set(2)
+        suite.Equal(value.Get(), 2, "later write still drains")
+        value.Destroy()
+    )
+
+    suite.Test("derived values compute immediately and reject direct sets", func():
+        local source = mState.New(3)
+        local derived = mState.Derived([source], expr(values): values[0] * 2)
+        suite.Equal(derived.Get(), 6, "initial computation")
+        suite.Throws(func(): derived.Set(8), "derived is read only")
+        suite.Equal(source.Get(), 3, "source unchanged")
+        source.Destroy()
+    )
+
+    suite.Test("derived values settle before source observers", func():
+        local source = mState.New(1)
+        local derived = mState.Derived([source], expr(values): values[0] * 2)
+        local seen = 0
+        source.Observe(func(value):
+            suite.Equal(derived.Get(), value * 2, "derived is already settled")
+            seen += 1
+        )
+        suite.Equal(source.Set(5).length, 0, "observer saw coherent result")
+        suite.Equal(seen, 1, "source observer ran")
+        source.Destroy()
+    )
+
+    suite.Test("unequal-depth dependencies settle without intermediate notifications", func():
+        local source = mState.New(1)
+        local doubled = mState.Derived([source], expr(values): values[0] * 2)
+        local plus_one = mState.Derived([doubled], expr(values): values[0] + 1)
+        local calls = 0
+        local combined = mState.Derived([source, plus_one], func(values):
+            calls += 1
+            return values[0] + values[1]
+        )
+        local changes = []
+        combined.Observe(func(value): changes.push(value))
+        source.Set(2)
+        suite.Equal(combined.Get(), 7, "all paths settled")
+        suite.Equal(calls, 2, "one initial and one changed computation")
+        suite.Equal(changes.length, 1, "no intermediate derived notification")
+        suite.Equal(changes[0], 7, "settled notification")
+        source.Destroy()
+    )
+
+    suite.Test("batched dependencies recompute once with final inputs", func():
+        local a = mState.New(1)
+        local b = mState.New(2)
+        local calls = 0
+        local sum = mState.Derived([a, b], func(values):
+            calls += 1
+            return values[0] + values[1]
+        )
+        mState.Batch(func():
+            a.Set(2)
+            b.Set(4)
+            a.Set(3)
+        )
+        suite.Equal(sum.Get(), 7, "final inputs")
+        suite.Equal(calls, 2, "one changed recomputation")
+        a.Destroy()
+        b.Destroy()
+    )
+
+    suite.Test("dependency arrays are copied at construction", func():
+        local a = mState.New(1)
+        local b = mState.New(8)
+        local dependencies = [a]
+        local derived = mState.Derived(dependencies, expr(values): values[0])
+        dependencies[0] = b
+        b.Set(9)
+        suite.Equal(derived.Get(), 1, "caller array no longer controls dependencies")
+        a.Set(2)
+        suite.Equal(derived.Get(), 2, "original dependency retained")
+        a.Destroy()
+        b.Destroy()
+    )
+
+    suite.Test("computation input containers are fresh", func():
+        local source = mState.New(1)
+        local inputs = []
+        local derived = mState.Derived([source], func(values):
+            inputs.push(values)
+            return values[0]
+        )
+        source.Set(2)
+        suite.Expect(inputs[0] != inputs[1], "fresh input array")
+        inputs[0][0] = 99
+        suite.Equal(source.Get(), 2, "old input edit cannot write source")
+        suite.Equal(derived.Get(), 2, "old input edit cannot write result")
+        source.Destroy()
+    )
+
+    suite.Test("invalid empty duplicate and destroyed dependencies reject", func():
+        local source = mState.New(1)
+        suite.Throws(func(): mState.Derived([], expr(values): 0), "empty dependencies")
+        suite.Throws(func(): mState.Derived([source, source], expr(values): 0), "duplicate dependency")
+        suite.Throws(func(): mState.Derived([{}], expr(values): 0), "foreign dependency")
+        suite.Throws(func(): mState.Derived({ A = source }, expr(values): 0), "table rather than array")
+        source.Destroy()
+        suite.Throws(func(): mState.Derived([source], expr(values): 0), "disposed dependency")
+    )
+
+    suite.Test("copied handles cannot become a new dependency identity", func():
+        local source = mState.New(1)
+        local copied = {}
+        for key in table.keys(source): copied[key] = source[key]
+        suite.Throws(func(): mState.Derived([copied], expr(values): 0), "identity must be original handle")
+        source.Destroy()
+    )
+
+    suite.Test("dependency count is bounded at 64", func():
+        local values = []
+        for index in range(65): values.push(mState.New(index))
+        suite.Throws(func(): mState.Derived(values, expr(inputs): 0), "65 dependencies reject")
+        values.pop().Destroy()
+        local derived = mState.Derived(values, expr(inputs): inputs.length)
+        suite.Equal(derived.Get(), 64, "64 dependencies accepted")
+        for value in values: value.Destroy()
+    )
+
+    suite.Test("fixed graph depth is bounded and source disposal cascades", func():
+        local source = mState.New(0)
+        local last = source
+        for index in range(64): last = mState.Derived([last], expr(values): values[0] + 1)
+        suite.Equal(last.Get(), 64, "64 derived levels accepted")
+        suite.Throws(func(): mState.Derived([last], expr(values): 0), "65th level rejects")
+        source.Destroy()
+        suite.Expect(last.IsDestroyed(), "transitive disposal")
+    )
+
+    suite.Test("initial compute failure releases construction ownership", func():
+        local source = mState.New(1)
+        suite.Throws(func(): mState.Derived([source], func(values): throw "initial failed"), "initial failure throws")
+        local derived = mState.Derived([source], expr(values): values[0] + 1)
+        source.Set(3)
+        suite.Equal(derived.Get(), 4, "construction gate recovered")
+        source.Destroy()
+    )
+
+    suite.Test("later compute failures retain the last result and recover", func():
+        local source = mState.New(1)
+        local derived = mState.Derived([source], func(values):
+            if values[0] == 2: throw "compute failed"
+            return values[0] * 2
+        )
+        local seen = 0
+        source.Observe(func(value): seen = value)
+        local failures = source.Set(2)
+        suite.Equal(failures.length, 1, "compute error collected")
+        suite.Equal(failures[0], "compute failed", "error preserved")
+        suite.Equal(derived.Get(), 2, "last successful result retained")
+        suite.Equal(seen, 2, "source observers still run")
+        suite.Equal(source.Set(3).length, 0, "later valid compute recovers")
+        suite.Equal(derived.Get(), 6, "new successful result")
+        source.Destroy()
+    )
+
+    suite.Test("computation cannot enqueue state mutations", func():
+        local source = mState.New(1)
+        local other = mState.New(0)
+        local mutate = false
+        local derived = mState.Derived([source], func(values):
+            if mutate: other.Set(9)
+            return values[0]
+        )
+        mutate = true
+        local failures = source.Set(2)
+        suite.Equal(failures.length, 1, "impure compute rejected")
+        suite.Equal(other.Get(), 0, "unrelated value unchanged")
+        suite.Equal(derived.Get(), 1, "last derived result retained")
+        source.Destroy()
+        other.Destroy()
+    )
+
+    suite.Test("cleanup owns a subscription without owning the value", func():
+        local value = mState.New(0)
+        local owner = mCleanup.New()
+        local calls = 0
+        local connection = value.Observe(func(next_value): calls += 1, owner)
+        value.Set(1)
+        owner.Destroy()
+        value.Set(2)
+        suite.Equal(calls, 1, "owned binding disconnected")
+        suite.Expect(not connection.IsConnected(), "connection disposed")
+        suite.Expect(not value.IsDestroyed(), "value remains independently owned")
+        value.Destroy()
+    )
+
+    suite.Test("adoption failure disconnects the newly acquired observer", func():
+        local value = mState.New(0)
+        local captured = nil
+        local calls = 0
+        local owner = { AddConnection = func(connection):
+            captured = connection
+            throw "adoption failed"
+        }
+        suite.Throws(func(): value.Observe(func(next_value): calls += 1, owner), "owner rejected binding")
+        suite.Expect(not captured.IsConnected(), "failed adoption disconnects")
+        value.Set(1)
+        suite.Equal(calls, 0, "failed observer is absent")
+        value.Destroy()
+    )
+
+    suite.Test("a destroyed cleanup owner cannot retain a new binding", func():
+        local value = mState.New(0)
+        local owner = mCleanup.New()
+        owner.Destroy()
+        local calls = 0
+        suite.Throws(func(): value.Observe(func(next_value): calls += 1, owner), "destroyed owner rejects")
+        value.Set(1)
+        suite.Equal(calls, 0, "rolled-back subscription")
+        value.Destroy()
+    )
+
+    suite.Test("reentrant destruction skips later observers and cascades", func():
+        local value = mState.New(0)
+        local derived = mState.Derived([value], expr(values): values[0] + 1)
+        local later = 0
+        value.Observe(func(next_value): value.Destroy())
+        local connection = value.Observe(func(next_value): later += 1)
+        suite.Equal(value.Set(1).length, 0, "destroying observer is supported")
+        suite.Equal(later, 0, "later observer skipped")
+        suite.Expect(derived.IsDestroyed(), "dependent disposed")
+        suite.Expect(not connection.IsConnected(), "subscription released")
+    )
+
+    suite.Test("destroying a derived value unlinks it from its parents", func():
+        local source = mState.New(1)
+        local calls = 0
+        local derived = mState.Derived([source], func(values):
+            calls += 1
+            return values[0]
+        )
+        derived.Destroy()
+        source.Set(2)
+        suite.Equal(calls, 1, "no disposed recomputation")
+        suite.Expect(not source.IsDestroyed(), "parent remains")
+        source.Destroy()
+    )
+
+    suite.Test("source destruction cascades without destroying other parents", func():
+        local a = mState.New(1)
+        local b = mState.New(2)
+        local sum = mState.Derived([a, b], expr(values): values[0] + values[1])
+        local final = mState.Derived([sum], expr(values): values[0] * 2)
+        a.Destroy()
+        suite.Expect(sum.IsDestroyed() and final.IsDestroyed(), "dependent graph disposed")
+        suite.Expect(not b.IsDestroyed(), "independent parent retained")
+        suite.Equal(b.Set(4).length, 0, "remaining parent has no stale link")
+        b.Destroy()
+    )
+
+    suite.Test("disposed values reject reads writes and subscriptions", func():
+        local value = mState.New(0)
+        value.Destroy()
+        suite.Throws(value.Get, "read after destruction")
+        suite.Throws(func(): value.Set(1), "write after destruction")
+        suite.Throws(func(): value.Observe(func(next_value): pass), "observe after destruction")
+        suite.Equal(value.Destroy().length, 0, "repeated destruction is harmless")
+    )
+
+    suite.Test("disconnect before batch completion suppresses delivery", func():
+        local value = mState.New(0)
+        local calls = 0
+        local connection = value.Observe(func(next_value): calls += 1)
+        mState.Batch(func():
+            value.Set(1)
+            connection.Disconnect()
+        )
+        suite.Equal(value.Get(), 1, "write still committed")
+        suite.Equal(calls, 0, "disconnected observer not called")
+        value.Destroy()
+    )
+
+    suite.Test("construction during dispatch fails without poisoning the pump", func():
+        local value = mState.New(0)
+        local connection = value.Observe(func(next_value):
+            mState.Derived([value], expr(values): values[0])
+        )
+        suite.Equal(value.Set(1).length, 1, "busy construction reported as listener failure")
+        connection.Disconnect()
+        suite.Equal(value.Set(2).length, 0, "pump still usable")
+        value.Destroy()
+    )
+
+    suite.Test("destroy inside a batch cancels queued writes immediately", func():
+        local value = mState.New(0)
+        local calls = 0
+        value.Observe(func(next_value): calls += 1)
+        mState.Batch(func():
+            value.Set(1)
+            value.Destroy()
+            suite.Expect(value.IsDestroyed(), "disposal visible immediately")
+            suite.Throws(value.Get, "disposed read rejects before cleanup drain")
+            suite.Throws(func(): value.Set(2), "later write rejects")
+        )
+        suite.Equal(calls, 0, "no pending notifications survive destruction")
+    )
+
+    suite.Test("an observer may dispose the owner of later bindings", func():
+        local value = mState.New(0)
+        local owner = mCleanup.New()
+        local later = 0
+        value.Observe(func(next_value): owner.Destroy())
+        value.Observe(func(next_value): later += 1, owner)
+        value.Set(1)
+        suite.Equal(later, 0, "later owned binding disconnected before its turn")
+        value.Destroy()
+    )
+
+    suite.Test("missing work and observer callbacks reject", func():
+        local value = mState.New(0)
+        suite.Throws(func(): value.Observe(nil), "missing observer")
+        suite.Throws(func(): mState.Batch(nil), "missing batch work")
+        suite.Throws(func(): mState.Derived([value], nil), "missing computation")
+        value.Destroy()
+    )
+
+    return suite.Report()
+
+# Native tasks are separate from the pure Run entry point.
+local RunConcurrent = func():
+    local suite = mTestKit.New("mStateConcurrent")
+    local source = mState.New(0)
+    local derived = mState.Derived([source], expr(values): values[0] * 2)
+    local failures = []
+    local done = 0
+    local accepted = 0
+    local observed = 0
+    local stop = false
+    source.Observe(func(value):
+        if derived.Get() != value * 2: throw "derived graph was not settled before notification"
+        observed++
+    )
+    for worker in range(4):
+        spawn(func():
+            try:
+                for index in range(64):
+                    if stop: return
+                    try:
+                        local errors = source.Set((worker + 1) * 1000 + index)
+                        for error in errors: failures.push(error)
+                        accepted++
+                    catch failure:
+                        if tostring(failure) != "mState: computation is in progress": failures.push(failure)
+                    if index % 8 == 0: wait()
+            catch failure:
+                failures.push(failure)
+            finally:
+                done++
+        )
+    local turns = 0
+    while done < 4 and turns < 600:
+        turns++
+        wait()
+    stop = true
+    for failure in mState.Batch(func(): pass): failures.push(failure)
+    suite.Test("concurrent writes settle dependencies before public delivery", func():
+        suite.Equal(done, 4, "all write workers finished")
+        suite.Equal(failures.length, 0, "no unexpected write or observer failures")
+        suite.Expect(accepted > 0 and observed > 0, "work was accepted and observed")
+        suite.Equal(derived.Get(), source.Get() * 2, "final derived result is settled")
+    )
+    source.Destroy()
+    if done < 4: return suite.Report()
+
+    source = mState.New(0)
+    derived = mState.Derived([source], expr(values): values[0] + 1)
+    local owner = mCleanup.New()
+    local calls = 0
+    local handler = func(value): calls++
+    local connection = source.Observe(handler, owner)
+    failures = []
+    done = 0
+    stop = false
+    spawn(func():
+        try:
+            for index in range(128):
+                if stop: return
+                try:
+                    for failure in source.Set(index + 1): failures.push(failure)
+                catch failure:
+                    local message = tostring(failure)
+                    if message != "mState: computation is in progress" and message != "mState: value is destroyed":
+                        failures.push(failure)
+                if index % 8 == 0: wait()
+        catch failure:
+            failures.push(failure)
+        finally:
+            done++
+    )
+    spawn(func():
+        try:
+            wait()
+            for attempt in range(256):
+                if stop or source.IsDestroyed(): break
+                try:
+                    for failure in source.Destroy(): failures.push(failure)
+                catch failure:
+                    if tostring(failure) != "mState: computation is in progress": failures.push(failure)
+                if not source.IsDestroyed(): wait()
+            owner.Destroy()
+        catch failure:
+            failures.push(failure)
+        finally:
+            done++
+    )
+    turns = 0
+    while done < 2 and turns < 600:
+        turns++
+        wait()
+    stop = true
+    suite.Test("concurrent disposal releases dependent values and owned observers", func():
+        suite.Equal(done, 2, "both disposal workers finished")
+        suite.Equal(failures.length, 0, "no unexpected disposal failures")
+        suite.Expect(source.IsDestroyed() and derived.IsDestroyed(), "dependency cascade finished")
+        suite.Expect(not connection.IsConnected(), "owned observer disconnected")
+        local previous = calls
+        suite.Throws(func(): source.Set(999), "disposed value rejects later writes")
+        suite.Equal(calls, previous, "no later delivery")
+    )
+    owner.Destroy()
+    source.Destroy()
+    return suite.Report()
+
+return { Run = Run, RunConcurrent = RunConcurrent }

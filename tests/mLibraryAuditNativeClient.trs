@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Local audit regressions. Leave detached outside Creator checks.
+if game.ServerId != "": throw "mLibrary audit requires Creator."
+local collector = world.WaitForChild("mLibraryAuditReports", 20)
+if collector == nil: throw "mLibrary audit collector is unavailable."
+local remote = collector.WaitForChild("Report", 10)
+local suite = import("/mLibraries/mTestKit").New("mLibraryAuditClient")
+local controls = import("/mLibraries/mControls")
+local topbar = import("/mLibraries/mTopbar")
+local Exact = expr(first, second): not (first < second or first > second)
+local screen = new ScreenUI() { Name = "mLibraryAudit", Parent = game.UICanvas }
+local kit = controls.New({ Parent = screen, AutoStep = false })
+try:
+    suite.Test("range setters preserve small finite changes", func():
+        local slider = kit.Slider({ Min = 0, Max = 1e-12, Step = 0, Value = 0 })
+        slider.SetValue(1e-12)
+        suite.Expect(Exact(slider.GetValue(), 1e-12), "entire small range remains reachable")
+        slider.SetValue(0)
+        suite.Expect(Exact(slider.GetValue(), 0), "zero change retained")
+        slider.Destroy()
+    )
+    suite.Test("tiny finite increments do not overflow quantization", func():
+        local slider = kit.Slider({ Min = 0, Max = 1, Step = 1e-320, Value = 0.5 })
+        suite.Expect(Exact(slider.GetValue(), 0.5), "sub-resolution step preserves the value")
+        slider.Destroy()
+    )
+    suite.Test("concurrent controls retain every active animation", func():
+        local toggles = []
+        for index in range(128): toggles.push(kit.Toggle({ Value = false }))
+        local next_index = 0
+        local done = 0
+        local deadline = host.time() + 20
+        for worker in range(6):
+            spawn(func():
+                try:
+                    while true:
+                        local index = next_index++
+                        if index >= toggles.length: return
+                        toggles[index].SetValue(true)
+                finally: done++
+            )
+        while done < 6 and host.time() < deadline: wait()
+        suite.Equal(done, 6, "all control workers completed")
+        suite.Equal(kit.GetActiveCount(), 128, "every animation is reachable")
+        kit.Step(1)
+        suite.Equal(kit.GetActiveCount(), 0, "all animations retire")
+        for toggle in toggles:
+            local thumb = toggle.Root.FindFirstChild("Track").FindFirstChild("Thumb")
+            suite.Expect(math.abs(thumb.Position.X - 21) < 0.001, "each toggle reaches its endpoint")
+            toggle.Destroy()
+    )
+finally:
+    kit.Destroy()
+    screen.Destroy()
+
+local failures = []
+local rounds = 16
+for round in range(rounds):
+    local bar = topbar.New({ Name = "mTopbarAudit", AutoDestroy = false })
+    local icons = []
+    for index in range(16): icons.push(bar.Add({ Name = "Icon" + index, Label = "T" }))
+    local done = 0
+    local deadline = host.time() + 20
+    for worker in range(6):
+        spawn(func():
+            try:
+                for icon in icons:
+                    try: icon.Destroy()
+                    catch failure: failures.push(tostring(failure))
+            finally: done++
+        )
+    while done < 6 and host.time() < deadline: wait()
+    if done < 6: failures.push("Icon workers exceeded deadline.")
+    if bar.GetCount() > 0: failures.push("Icon registrations survived destruction.")
+    bar.Destroy()
+    if done < 6: break
+suite.Test("concurrent icon destruction is idempotent", func():
+    suite.Equal(failures.length, 0, "no errors or retained icons")
+)
+for index in range(math.min(failures.length, 4)): print("mTopbar destruction audit: " + failures[index])
+
+local PopupAudit = func():
+    suite.Test("replacing another icon menu preserves the current popup", func():
+        local bar = topbar.New({ Name = "mTopbarMenuAudit" })
+        try:
+            local first = bar.Add({ Name = "First" })
+            local second = bar.Add({ Name = "Second" })
+            first.SetMenu([{ Text = "First", Run = func(): pass }])
+            second.SetMenu([{ Text = "Second", Run = func(): pass }])
+            second.SetSelected(true)
+            local popup = game.UICanvas.FindFirstChild("mTopbarMenuAudit").FindFirstChild("Menu")
+            suite.Expect(popup.Visible, "second menu starts open")
+            first.SetMenu([{ Text = "Replacement", Run = func(): pass }])
+            suite.Expect(second.IsSelected() and popup.Visible, "unrelated menu remains selected and open")
+        finally: bar.Destroy()
+    )
+local skipped = 0
+local viewport = game.UICanvas.ViewportSize
+if viewport.X >= 300 and viewport.Y >= 200: PopupAudit()
+else:
+    skipped = 1
+    print("mLibraryAuditClient skipped popup geometry: inactive client viewport.")
+suite.Test("numeric icon setters retain finite changes", func():
+    local bar = topbar.New({ Name = "mTopbarNumberAudit" })
+    try:
+        local icon = bar.Add({ Name = "First", Order = 0 })
+        icon.SetOrder(1e-10)
+        suite.Expect(Exact(icon.GetState().Order, 1e-10), "small order is retained")
+        icon.SetImageSize(28 + 1e-10)
+        suite.Expect(Exact(icon.GetState().ImageSize, 28 + 1e-10), "small image size is retained")
+    finally: bar.Destroy()
+)
+suite.Test("concurrent selection preserves one member per group", func():
+    local bar = topbar.New({ Name = "mTopbarGroupAudit" })
+    try:
+        local icons = []
+        for index in range(32): icons.push(bar.Add({ Name = "Group" + index, Group = "one" }))
+        for round in range(16):
+            for icon in icons: icon.SetSelected(false)
+            local next_index = 0
+            local done = 0
+            local deadline = host.time() + 20
+            for worker in range(6):
+                spawn(func():
+                    try:
+                        local index = next_index++
+                        icons[index].SetSelected(true)
+                    finally: done++
+                )
+            while done < 6 and host.time() < deadline: wait()
+            suite.Equal(done, 6, "selection workers completed")
+            local selected = 0
+            for icon in icons:
+                if icon.IsSelected(): selected += 1
+            suite.Expect(selected <= 1, "group has at most one selected member")
+    finally: bar.Destroy()
+)
+
+local report = suite.Report()
+remote.Fire(game.HttpSystem.JsonEncode({ Public = report, Skipped = skipped }))
+for failure in report.Failures: print("mLibraryAuditClient: " + failure)
+print("mLibraryAuditClient complete: " + report.Passed + " passed, " + report.Failed + " failed, " + skipped + " skipped")

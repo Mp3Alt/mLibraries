@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Local test receipts only. Leave unattached outside Creator checks.
+if game.ServerId != "": throw "mUi fixtures require a Creator playtest."
+local folder = new Folder() { Name = "mUiNativeReports" }
+local remote = new RemoteEvent() { Name = "Report", Parent = folder }
+local received = {}
+remote.Connect(func(player, text):
+    if received[player] != nil: return
+    try:
+        if string.length(text) > 48000: return
+        local report = new Folder() { Name = player.Name }
+        local offset = 0
+        while offset < string.length(text):
+            new StringValue() { Name = tostring(offset), Value = string.substring(text, offset, math.min(900, string.length(text) - offset)), Parent = report }
+            offset += 900
+        report.Parent = folder
+        received[player] = report
+    catch invalid:
+        print("mUi fixture ignored an invalid local receipt")
+)
+folder.Parent = world
+print("mUi native receipt collector ready")

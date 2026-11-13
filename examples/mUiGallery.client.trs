@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Optional client gallery. Attach this script only while reviewing the UI kit.
+# The window, state and keyed rows share one owner and perform no remote actions.
+
+local mReactive = import("/mLibraries/mReactive")
+local mWidgets = import("/mLibraries/mWidgets")
+local owner = mReactive.Scope({ AutoStep = false })
+local screen = owner.New("ScreenUI", { Name = "mUiGallery", Parent = game.UICanvas })
+owner.On(screen, "Destroyed", func(): owner.Destroy())
+
+local palette = owner.Value("Dark")
+local theme = owner.Computed([palette], func(values):
+    if values[0] == "Slate":
+        return { Background = new Color4(0.08, 0.10, 0.14), Surface = new Color4(0.12, 0.15, 0.20), Accent = new Color4(0.34, 0.67, 0.86) }
+    if values[0] == "Warm":
+        return { Background = new Color4(0.12, 0.09, 0.08), Surface = new Color4(0.18, 0.14, 0.12), Accent = new Color4(0.85, 0.56, 0.30) }
+    return {}
+)
+local ui = mWidgets.New({ Parent = screen, Theme = theme })
+owner.Add(ui.Destroy)
+local title = ui.Scope.Value("New item")
+local enabled = ui.Scope.Value(true)
+local checked = ui.Scope.Value(false)
+local amount = ui.Scope.Value(0.4)
+local clicks = ui.Scope.Value(0)
+local items = ui.Scope.Value([{ Id = 1, Text = "Native controls" }, { Id = 2, Text = "Explicit reactive state" }, { Id = 3, Text = "Owned keyed rows" }])
+local next_id = 4
+
+local window = ui.Window({
+    Name = "mUiGalleryWindow", Text = "mLibraries UI gallery",
+    Size = new Vector2(900, 480), MinSize = new Vector2(0, 0),
+    AnchorLeft = 0.5, AnchorRight = 0.5, AnchorTop = 0, AnchorBottom = 0,
+    Pivot = new Vector2(0.5, 0), Position = new Vector2(0, 120),
+    OnClosed = func():
+        print("mUiGallery:closed")
+        owner.Destroy()
+})
+local scroll = ui.Scroll({ Parent = window.Content, AnchorRight = 1, AnchorBottom = 1, Size = new Vector2(), MinSize = new Vector2(), ScrollY = true })
+local column = ui.Column({ Parent = scroll.Content, Position = new Vector2(16, 12), AnchorRight = 1, Size = new Vector2(-32, 0), MinSize = new Vector2(), FitContents = UIContentFit.Y, Spacing = 10 })
+
+ui.Text({ Parent = column.Content, Text = "One owner. Native controls. Explicit state changes.", MinSize = new Vector2(0, 28) })
+local input_row = ui.Row({ Parent = column.Content, MinSize = new Vector2(0, 40), Spacing = 8 })
+ui.Input({ Parent = input_row.Content, Value = title, Placeholder = "Item name", MaxLength = 40, MinSize = new Vector2(270, 36), OnChanged = title.Set, OnSubmitted = func(value): print("mUiGallery:input " + value) })
+ui.Button({ Parent = input_row.Content, Text = "Add item", MinSize = new Vector2(120, 36), OnPressed = func():
+    local text = title.Get()
+    if text == "": text = "Item " + next_id
+    local next_items = []
+    for item in items.Get(): next_items.push(item)
+    next_items.push({ Id = next_id, Text = text })
+    next_id += 1
+    items.Set(next_items)
+    clicks.Set(clicks.Get() + 1)
+    print("mUiGallery:add " + text)
+})
+local add_summary = ui.Scope.Computed([clicks], expr(values): "Added: " + values[0])
+ui.Text({ Parent = input_row.Content, Text = add_summary, MinSize = new Vector2(100, 36), FlexRatio = 1 })
+
+local state_row = ui.Row({ Parent = column.Content, MinSize = new Vector2(0, 40), Spacing = 8 })
+ui.Toggle({ Parent = state_row.Content, Text = "Enabled", Value = enabled, MinSize = new Vector2(200, 36), OnChanged = func(value):
+    enabled.Set(value)
+    print("mUiGallery:toggle " + value)
+})
+ui.Checkbox({ Parent = state_row.Content, Text = "Checked", Value = checked, MinSize = new Vector2(200, 36), OnChanged = func(value):
+    checked.Set(value)
+    print("mUiGallery:checkbox " + value)
+})
+local disabled = ui.Scope.Computed([enabled], expr(values): not values[0])
+ui.Button({ Parent = state_row.Content, Text = "Try button", Disabled = disabled, MinSize = new Vector2(130, 36), OnPressed = func(): print("mUiGallery:button") })
+ui.Dropdown({ Parent = state_row.Content, Options = ["Dark", "Slate", "Warm"], Value = palette, MinSize = new Vector2(180, 36), OnChanged = func(value):
+    palette.Set(value)
+    print("mUiGallery:theme " + value)
+})
+
+local range_row = ui.Row({ Parent = column.Content, MinSize = new Vector2(0, 40), Spacing = 8 })
+local amount_text = ui.Scope.Computed([amount], expr(values): "Amount: " + math.round_digits(values[0], 2))
+ui.Text({ Parent = range_row.Content, Text = amount_text, MinSize = new Vector2(140, 36) })
+ui.Slider({ Parent = range_row.Content, Min = 0, Max = 1, Step = 0.01, Value = amount, MinSize = new Vector2(320, 36), FlexRatio = 1, OnChanged = func(value):
+    amount.Set(value)
+    print("mUiGallery:slider " + math.round_digits(value, 2))
+})
+ui.Progress({ Parent = range_row.Content, Value = amount, MinSize = new Vector2(220, 36) })
+ui.Separator({ Parent = column.Content, MinSize = new Vector2(0, 1) })
+
+local list_header = ui.Row({ Parent = column.Content, MinSize = new Vector2(0, 36), Spacing = 8 })
+local list_text = ui.Scope.Computed([items], expr(values): "Keyed items: " + values[0].length)
+ui.Text({ Parent = list_header.Content, Text = list_text, MinSize = new Vector2(280, 36), FlexRatio = 1 })
+ui.Button({ Parent = list_header.Content, Text = "Clear items", MinSize = new Vector2(120, 36), OnPressed = func():
+    items.Set([])
+    print("mUiGallery:clear")
+})
+local list = ui.Column({ Parent = column.Content, MinSize = new Vector2(), Size = new Vector2(), FitContents = UIContentFit.Y, Spacing = 6 })
+ui.Scope.For(list.Content, items, expr(item, index): item.Id, func(row_scope, item, index, key):
+    local row = row_scope.New("UIHorizontalLayout", { MinSize = new Vector2(0, 36), Spacing = 8 })
+    row_scope.New("UITextPanel", {
+        Text = mReactive.Bind(item, expr(value): value.Text),
+        Color = new Color4(0, 0, 0, 0), TextColor = new Color4(0.92, 0.93, 0.95),
+        FontName = FontName.OpenSans, TextSize = 15, TextVerticalAlignment = UITextVerticalAlignment.Center,
+        MinSize = new Vector2(280, 36), FlexRatio = 1, BlocksPointer = false, Parent = row
+    })
+    row_scope.New("UIButton", {
+        Text = "Remove", MinSize = new Vector2(120, 36),
+        Color = new Color4(0.18, 0.185, 0.20), TextColor = new Color4(0.94, 0.945, 0.96),
+        FontName = FontName.OpenSans, TextSize = 15, Roundness = 7, Parent = row,
+        Events = { Pressed = func():
+            local remaining = []
+            for value in items.Get():
+                if value.Id != key: remaining.push(value)
+            items.Set(remaining)
+            print("mUiGallery:remove " + key)
+        }
+    })
+    return row
+)
+print("mUiGallery:ready")

@@ -1,0 +1,212 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Local two-client transport load. Verify Creator live data is disabled first.
+local Phase = "remote-before"
+if game.ServerId != "": throw "mNet load requires a Creator playtest."
+if Phase != "remote-before" and Phase != "remote-after": throw "Invalid mNet load phase."
+if world.FindFirstChild("mNetLoadReports") != nil: throw "mNet load already exists."
+local mNet = import("/mLibraries/mNet")
+local mPacket = import("/mLibraries/mPacket")
+local folder = new Folder() { Name = "mNetLoadReports" }
+local control = new RemoteEvent() { Name = "Control", Parent = folder }
+local data = new RemoteEvent() { Name = "Data", Parent = folder }
+local limited = new RemoteEvent() { Name = "Limited", Parent = folder }
+local status = new StringValue() { Name = "Status", Value = "waiting", Parent = folder }
+local codec = mPacket.New({ Id = 91, Fields = [
+    { Name = "Id", Type = "integer", Min = 0, Max = 65535 },
+    { Name = "Quantity", Type = "integer", Min = 0, Max = 65535 },
+    { Name = "Flags", Type = "integer", Min = 0, Max = 255 }
+] })
+local server = mNet.NewServer({ Remote = data, Burst = 64, Rate = 100, MaxPeers = 2, MaxInFlight = 32, PerPeerInFlight = 8 })
+local throttle = mNet.NewServer({ Remote = limited, Burst = 4, Rate = 0, MaxPeers = 2, MaxInFlight = 8, PerPeerInFlight = 8 })
+local peers = {}
+local order = []
+local receipts = []
+local starts = []
+local failures = []
+local authorized = 0
+local executed = 0
+local denied = 0
+local invalid = 0
+local denied_validation = 0
+local denied_run = 0
+local throttle_run = 0
+local phase = 0
+local arrived = {}
+local arrival_count = 0
+local complete = false
+local before_runs = {}
+local NewPeer = func():
+    local runs = 0
+    local burst = 0
+    return {
+        RecordRun = func(): runs++,
+        RecordThrottle = func(): burst++,
+        GetRuns = expr(): runs,
+        GetThrottle = expr(): burst
+    }
+local started = host.time()
+local deadline = started + 150
+local plan = [{ Name = "warmup", Mode = "echo", Rows = 16, Senders = 2, Requests = 8, Trial = 0 }]
+local shapes = [ { Rows = 16, Senders = 1 }, { Rows = 64, Senders = 1 }, { Rows = 16, Senders = 2 }, { Rows = 64, Senders = 2 } ]
+for trial in range(3):
+    for position in range(shapes.length):
+        local shape = shapes[(position + trial) % shapes.length]
+        plan.push({ Name = "echo" + shape.Rows + "-senders" + shape.Senders, Mode = "echo", Rows = shape.Rows, Senders = shape.Senders, Requests = 64, Trial = trial + 1 })
+plan.push({ Name = "denied", Mode = "denied", Rows = 16, Senders = 2, Requests = 16, Trial = 0 })
+plan.push({ Name = "invalid-tail", Mode = "invalid", Rows = 64, Senders = 2, Requests = 16, Trial = 0 })
+plan.push({ Name = "personal-burst", Mode = "throttle", Rows = 0, Senders = 2, Requests = 8, Trial = 0 })
+plan.push({ Name = "malformed-peer-isolation", Mode = "malformed", Rows = 16, Senders = 2, Requests = 8, Trial = 0 })
+
+local Active = func(context):
+    local peer = peers[context.Sender]
+    return not complete and host.time() < deadline and peer != nil and context.IsActive() and context.Sender.IsConnected
+server.Register({ Name = "echo", Kind = "Request", Authorize = func(context):
+    authorized += 1
+    return Active(context)
+, Validate = codec.Decode, Run = func(context, value):
+    local peer = peers[context.Sender]
+    if peer == nil: throw "Unregistered fixture peer."
+    peer.RecordRun()
+    executed += 1
+    return { Rows = value.length, UserId = context.Sender.UserId }
+})
+server.Register({ Name = "denied", Kind = "Request", Authorize = func(context):
+    denied += 1
+    return false
+, Validate = func(value):
+    denied_validation += 1
+    return codec.Decode(value)
+, Run = func(context, value):
+    denied_run += 1
+    return false
+})
+server.Register({ Name = "invalid", Kind = "Request", Authorize = Active, Validate = func(value):
+    invalid += 1
+    return codec.Decode(value)
+, Run = func(context, value):
+    throw "Invalid packet reached a handler."
+})
+throttle.Register({ Name = "ping", Kind = "Request", Authorize = Active, Validate = mNet.NoPayload, Run = func(context, value):
+    local peer = peers[context.Sender]
+    peer.RecordThrottle()
+    throttle_run += 1
+    return context.Sender.UserId
+})
+
+local Finish = func():
+    if complete: return
+    status.Value = "exporting"
+    if denied_validation != 0 or denied_run != 0: failures.push("Denied route reached validation or handler.")
+    local counters = []
+    for player in order:
+        local peer = peers[player]
+        if peer.GetThrottle() > 4: failures.push("Personal burst exceeded four admissions.")
+        counters.push({ UserId = player.UserId, Runs = peer.GetRuns(), Throttle = peer.GetThrottle() })
+    local report = {
+        Kind = "mNet native two-client load",
+        Phase = Phase,
+        StartedAt = started,
+        FinishedAt = host.time(),
+        Plan = plan,
+        PhaseStarts = starts,
+        Samples = receipts,
+        Counters = counters,
+        Authorized = authorized,
+        Executed = executed,
+        Denied = denied,
+        InvalidDecodes = invalid,
+        DeniedValidation = denied_validation,
+        DeniedRun = denied_run,
+        ThrottleRun = throttle_run,
+        Failures = failures,
+        ServerId = game.ServerId,
+        Scope = "one Creator server, two real local clients; paced load, not maximum throughput"
+    }
+    try:
+        game.DataSystem.GetStore("mPerformance20261112").SetAsync(Phase, report)
+        if failures.length == 0: status.Value = "complete"
+        else: status.Value = "failed"
+    catch unavailable:
+        status.Value = "export-failed"
+        print("mNetLoad export failed: " + tostring(unavailable))
+    complete = true
+    for player in order: control.FireTo(player, "finished", status.Value)
+    print("mNetLoad: " + status.Value + "; samples=" + receipts.length + "; failures=" + failures.length)
+
+local Advance = func():
+    phase += 1
+    arrived = {}
+    arrival_count = 0
+    if phase > plan.length:
+        Finish()
+        return
+    status.Value = "phase:" + phase
+    starts.push({ Phase = phase, At = host.time(), Executed = executed, Denied = denied, InvalidDecodes = invalid, ThrottleRun = throttle_run })
+    before_runs = {}
+    for index in range(order.length):
+        local player = order[index]
+        before_runs[player] = peers[player].GetRuns()
+        control.FireTo(player, "go", phase, index + 1, plan[phase - 1])
+
+local CheckPhase = func():
+    local entry = plan[phase - 1]
+    for index in range(order.length):
+        local player = order[index]
+        local expected = 0
+        if entry.Mode == "echo" and index < entry.Senders: expected = entry.Requests
+        elif entry.Mode == "malformed" and index == 1: expected = entry.Requests
+        if peers[player].GetRuns() - before_runs[player] != expected: failures.push("Server handler count disagreed with phase " + phase + " for " + player.UserId)
+
+local Process = func(player, action, requested, text):
+    if complete or host.time() >= deadline or not player.IsConnected or (player.UserId != -1 and player.UserId != -2): return
+    try:
+        if action == "ready":
+            if phase != 0 or peers[player] != nil or order.length >= 2: return
+            peers[player] = NewPeer()
+            order.push(player)
+            if order.length == 2:
+                if order[0].UserId != -1:
+                    local first = order[0]
+                    order[0] = order[1]
+                    order[1] = first
+                Advance()
+            return
+        if action != "done" or peers[player] == nil or requested != phase or arrived[player] == true: return
+        if string.length(text) > 16000: return
+        local value = game.HttpSystem.JsonDecode(text)
+        local expected = plan[phase - 1]
+        if table.count(value) != 15 or value.Name != expected.Name or value.Phase != phase or value.Player != player.UserId: return
+        if value.Sent < 0 or value.Sent > 96 or value.PendingMaximum < 0 or value.PendingMaximum > 8: return
+        if value.Latencies.length > 64 or value.Errors.length > 16: return
+        if value.Status != "complete": failures.push("Client " + player.UserId + " failed phase " + phase)
+        if expected.Mode == "malformed" and player.UserId == -1 and value.Ok != 0: failures.push("Malformed sender reported a successful handler.")
+        receipts.push(value)
+        arrived[player] = true
+        arrival_count += 1
+        if arrival_count == 2:
+            CheckPhase()
+            Advance()
+    catch bad_receipt:
+        failures.push("Invalid local fixture receipt.")
+local pending = []
+local connection = control.Connect(func(player, action, requested, text):
+    try:
+        if complete or host.time() >= deadline or not player.IsConnected or (player.UserId != -1 and player.UserId != -2): return
+        if action != "ready" and action != "done": return
+        if pending.length >= 8 or string.length(text) > 16000: return
+        pending.push({ Player = player, Action = action, Requested = requested, Text = text })
+    catch invalid_receipt: pass
+)
+folder.Parent = world
+while not complete and host.time() >= started and host.time() < deadline:
+    while pending.length > 0:
+        local message = pending.pop()
+        Process(message.Player, message.Action, message.Requested, message.Text)
+    wait(0.01)
+if not complete:
+    failures.push("Native remote workload reached its deadline or a backwards clock.")
+    Finish()
+connection.Disconnect()
+server.Destroy()
+throttle.Destroy()

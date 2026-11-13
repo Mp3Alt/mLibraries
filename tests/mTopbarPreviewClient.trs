@@ -1,0 +1,233 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Optional visual fixture. Leave unattached outside a local UI test.
+local mTopbar = import("/mLibraries/mTopbar")
+local mCleanup = import("/mLibraries/mCleanup")
+local owner = mCleanup.New()
+local bar = mTopbar.New({ Name = "mTopbarPreview", LeftInset = 224 })
+owner.Add(bar.Destroy)
+owner.AddConnection(this.Removed.Connect(owner.Destroy))
+local first = bar.Add({ Name = "First", Label = "1", Tooltip = "First docked button", Group = "preview" })
+local second = bar.Add({ Name = "Second", Label = "2", Tooltip = "Second docked button", Group = "preview", Badge = 3 })
+bar.Dock(first, second)
+local actions = bar.Add({ Name = "Actions", Label = "+", Tooltip = "Actions" })
+local right = bar.Add({ Name = "Right", Label = "R", Tooltip = "Right side", Side = "Right" })
+local extra = []
+for index in range(16):
+    extra.push(bar.Add({ Name = "Extra" + index, Label = tostring(index), Tooltip = "Extra " + index, Visible = false }))
+
+local screen = game.UICanvas.FindFirstChild("mTopbarPreview")
+local frame = screen.FindFirstChild("Dock")
+local highlight = frame.FindFirstChild("Highlight")
+local observed = []
+local viewport = screen.SafeAreaSize
+local state = {
+    Epoch = 0,
+    IgnoreUntil = 0,
+    DockHovered = nil,
+    PendingDock = nil,
+    Width = viewport.X,
+    Height = viewport.Y
+}
+local Near = expr(value, expected): value >= expected - 0.003 and value <= expected + 0.003
+local Matches = func(target, scale, alpha):
+    local size = target.Scale
+    return Near(size.X, scale) and Near(size.Y, scale) and Near(target.Transparency, alpha)
+
+local DockCount = func():
+    local count = 0
+    if first.GetState().Visible: count += 1
+    if second.GetState().Visible: count += 1
+    return count
+
+# Layout can move a hit target under the pointer without a new intentional hover.
+local ResetObservation = func(reason):
+    state.Epoch += 1
+    state.IgnoreUntil = host.time() + 0.35
+    state.DockHovered = nil
+    state.PendingDock = nil
+    for entry in observed:
+        entry.Pending = nil
+        entry.Hovered = false
+        entry.Pressed = false
+        entry.Known = false
+    print("mTopbarPointer INFO layout " + reason + "; pending samples cancelled")
+
+local Mode = func(entry):
+    if not entry.Docked: return "standalone"
+    if DockCount() >= 2: return "pair"
+    return "single"
+
+local QueueVisual = func(entry, event):
+    local mode = Mode(entry)
+    print("mTopbarPointer EVENT " + entry.Name + " " + event + " " + mode)
+    if host.time() < state.IgnoreUntil: return
+    if event == "enter" or event == "exit": entry.Known = true
+    if not entry.Known: return
+    local enabled = entry.Icon.GetState().Enabled
+    local over = entry.Hovered and enabled
+    local held = entry.Pressed and over
+    local scale = 1
+    local alpha = 0
+    if not enabled:
+        alpha = 0.5
+    elif held:
+        scale = 0.92
+        if mode == "pair":
+            scale = 0.9
+            alpha = 0.25
+    elif over:
+        scale = 1.12
+        if mode == "pair": scale = 1.15
+    local now = host.time()
+    # Replacing the record cancels checks for earlier events, including short presses.
+    entry.Pending = {
+        Event = event,
+        Mode = mode,
+        Epoch = state.Epoch,
+        Due = now + 0.23,
+        Deadline = now + 0.8,
+        Scale = scale,
+        Alpha = alpha,
+        Stable = 0
+    }
+
+local QueueHighlight = func(event):
+    if DockCount() != 2 or host.time() < state.IgnoreUntil: return
+    local now = host.time()
+    state.PendingDock = {
+        Event = event,
+        Epoch = state.Epoch,
+        Target = state.DockHovered,
+        Due = now + 0.38,
+        Deadline = now + 0.9,
+        Stable = 0
+    }
+
+local Observe = func(icon, name, docked, center):
+    local button = screen.FindFirstChild(name)
+    local entry = {
+        Icon = icon,
+        Name = name,
+        Button = button,
+        Visual = button.FindFirstChild("Visual"),
+        Docked = docked,
+        Center = center,
+        Hovered = false,
+        Pressed = false,
+        Known = false,
+        Pending = nil
+    }
+    observed.push(entry)
+    owner.AddConnection(button.PointerEnter.Connect(func():
+        entry.Hovered = true
+        if entry.Docked: state.DockHovered = entry
+        QueueVisual(entry, "enter")
+        if entry.Docked: QueueHighlight(name + " enter")
+    ))
+    owner.AddConnection(button.PointerExit.Connect(func():
+        entry.Hovered = false
+        # The native button retains its press when the pointer leaves.
+        if state.DockHovered == entry: state.DockHovered = nil
+        QueueVisual(entry, "exit")
+        if entry.Docked: QueueHighlight(name + " exit")
+    ))
+    owner.AddConnection(button.MouseDown.Connect(func(mouse):
+        if mouse != MouseButton.Left: return
+        entry.Pressed = true
+        QueueVisual(entry, "down")
+    ))
+    local Release = func(event):
+        return func(mouse):
+            if mouse != MouseButton.Left: return
+            entry.Pressed = false
+            QueueVisual(entry, event)
+    owner.AddConnection(button.MouseUp.Connect(Release("up")))
+    owner.AddConnection(button.MouseCancelled.Connect(Release("cancel")))
+
+Observe(first, "First", true, 26)
+Observe(second, "Second", true, 70)
+Observe(actions, "Actions", false, 0)
+Observe(right, "Right", false, 0)
+
+local ReportVisual = func(entry, pending, passed):
+    if entry.Pending != pending or pending.Epoch != state.Epoch: return
+    entry.Pending = nil
+    local result = "FAIL"
+    if passed: result = "PASS"
+    local size = entry.Visual.Scale
+    local surface = ""
+    if entry.Docked:
+        local scale = frame.Scale
+        surface = " frame=" + scale.X + "," + scale.Y + "/" + frame.Transparency + " highlight=" + tostring(highlight.Visible)
+    print("mTopbarPointer " + result + " " + entry.Name + " " + pending.Event + " " + pending.Mode + " scale=" + size.X + "," + size.Y + " alpha=" + entry.Visual.Transparency + " expected=" + pending.Scale + "/" + pending.Alpha + surface)
+
+owner.AddConnection(game.TimeSystem.FrameStepped.Connect(func(delta):
+    local size = screen.SafeAreaSize
+    if size.X != state.Width or size.Y != state.Height:
+        state.Width = size.X
+        state.Height = size.Y
+        ResetObservation("viewport")
+    local now = host.time()
+    for entry in observed:
+        local pending = entry.Pending
+        if pending == nil: continue
+        if pending.Epoch != state.Epoch or pending.Mode != Mode(entry) or not entry.Button.Visible:
+            entry.Pending = nil
+            continue
+        if now < pending.Due: continue
+        local matches = Matches(entry.Visual, pending.Scale, pending.Alpha)
+        if pending.Mode == "single": matches = matches and Matches(frame, pending.Scale, pending.Alpha) and not highlight.Visible and Matches(highlight, 0.7, 1)
+        elif pending.Mode == "pair": matches = matches and Matches(frame, 1, 0)
+        if matches: pending.Stable += 1
+        else: pending.Stable = 0
+        if pending.Stable >= 3: ReportVisual(entry, pending, true)
+        elif now >= pending.Deadline: ReportVisual(entry, pending, false)
+    local pending = state.PendingDock
+    if pending == nil or now < pending.Due: return
+    if pending.Epoch != state.Epoch or DockCount() != 2:
+        state.PendingDock = nil
+        return
+    local matches = false
+    if pending.Target == nil:
+        matches = not highlight.Visible and Matches(highlight, 0.7, 1)
+    else:
+        local position = highlight.Position
+        matches = highlight.Visible and Matches(highlight, 1, 0) and Near(position.X, pending.Target.Center) and Near(position.Y, 24)
+    if matches: pending.Stable += 1
+    else: pending.Stable = 0
+    if pending.Stable < 3 and now < pending.Deadline: return
+    if state.PendingDock != pending or pending.Epoch != state.Epoch: return
+    state.PendingDock = nil
+    local result = "FAIL"
+    if pending.Stable >= 3: result = "PASS"
+    local position = highlight.Position
+    local scale = highlight.Scale
+    print("mTopbarPointer " + result + " Highlight " + pending.Event + " visible=" + tostring(highlight.Visible) + " position=" + position.X + "," + position.Y + " scale=" + scale.X + "," + scale.Y + " alpha=" + highlight.Transparency)
+))
+owner.AddConnection(screen.Removed.Connect(owner.Destroy))
+
+actions.SetMenu([
+    { Text = "Check menu action", Run = func(icon): print("mTopbarPreview: menu action passed") },
+    { Text = "Disabled action", Disabled = true, Run = func(icon): throw "disabled action ran" },
+    { Text = "Collapse dock", Run = func(icon):
+        ResetObservation("collapse")
+        first.SetVisible(false)
+    },
+    { Text = "Restore dock", Run = func(icon):
+        ResetObservation("restore")
+        first.SetVisible(true)
+    },
+    { Text = "Show overflow", Run = func(icon):
+        ResetObservation("show overflow")
+        for item in extra: item.SetVisible(true)
+    },
+    { Text = "Hide overflow", Run = func(icon):
+        ResetObservation("hide overflow")
+        for item in extra: item.SetVisible(false)
+    }
+])
+owner.AddConnection(first.Selected.Connect(expr(icon): print("mTopbarPreview: first selected")))
+owner.AddConnection(first.Deselected.Connect(expr(icon): print("mTopbarPreview: first deselected")))
+owner.AddConnection(second.Selected.Connect(expr(icon): print("mTopbarPreview: second selected")))
+print("mTopbarPointer READY: hover, leave, click, and hold for at least 0.3s; short presses cancel their held-state sample")

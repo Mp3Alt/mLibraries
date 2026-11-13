@@ -1,0 +1,449 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Server profiles with checked session ownership. Drive autosaves with Step.
+# local data = import("/mLibraries/mData").New({ Name = "Progress", Defaults = { Coins = 0 } }, nil)
+# local loaded = data.Load("player-1")
+# if loaded.Ok: loaded.Profile.Update(func(value): value.Coins += 1)
+
+local mSignal = import("/mLibraries/mSignal")
+local sequence = 0
+local FORMAT = "mData/1"
+local Ok = expr(value): { Ok = true, Value = value }
+local Fail = expr(code, message): { Ok = false, Code = code, Message = message }
+
+local Finite = func(value):
+    try:
+        return (value < 0 or value >= 0) and not math.is_infinite(value)
+    catch invalid:
+        return false
+
+local Whole = func(value, low, high):
+    if not Finite(value) or value < low or value > high: return false
+    local integer = math.floor(value)
+    return not (value < integer or value > integer)
+
+local Same = expr(a, b): not (a < b or a > b)
+local IsRecord = func(value):
+    try:
+        table.keys(value)
+        return true
+    catch invalid:
+        return false
+
+local IsText = func(value, maximum):
+    try:
+        return string.length(value) <= maximum
+    catch invalid:
+        return false
+
+local Key = func(value):
+    return IsText(value, 50) and string.length(value) > 0 and not string.match(value, "[\\x00-\\x1f\\x7f]")
+
+local CopyValue = func(value, budget, ancestors, depth):
+    budget.Nodes += 1
+    if budget.Nodes > 4096 or depth > 16: throw "mData: data exceeds the structural limit"
+    if value == nil or value == true or value == false: return value
+    if Finite(value): return value
+    if IsText(value, 65536):
+        budget.Text += string.length(value)
+        if budget.Text > 65536: throw "mData: data exceeds the text limit"
+        return value
+    if ancestors.contains(value): throw "mData: cyclic data is not supported"
+    local record = IsRecord(value)
+    local count = table.count(value)
+    if count > 4096: throw "mData: data exceeds the structural limit"
+    ancestors.push(value)
+    local result = nil
+    if record:
+        result = {}
+        for key in table.keys(value):
+            if not IsText(key, 256): throw "mData: data requires string keys"
+            budget.Text += string.length(key)
+            if budget.Text > 65536: throw "mData: data exceeds the text limit"
+            result[key] = CopyValue(value[key], budget, ancestors, depth + 1)
+    else:
+        result = []
+        for index in range(value.length): result.push(CopyValue(value[index], budget, ancestors, depth + 1))
+    ancestors.pop()
+    return result
+
+local Copy = func(value):
+    return CopyValue(value, { Nodes = 0, Text = 0 }, [], 0)
+
+local DataCopy = func(value):
+    if not IsRecord(value): throw "mData: profile data must be a record"
+    return Copy(value)
+
+local Reconcile = func(data, defaults):
+    for key in table.keys(defaults):
+        if data[key] == nil:
+            data[key] = Copy(defaults[key])
+        elif IsRecord(data[key]) and IsRecord(defaults[key]):
+            Reconcile(data[key], defaults[key])
+
+local Gate = func():
+    local claims = 0
+    return { Take = expr(): claims++ == 0, Reset = func(): claims = 0 }
+
+local Once = func():
+    local claims = 0
+    return expr(): claims++ == 0
+
+local Metadata = func(value):
+    try:
+        if not IsRecord(value) or table.count(value) > 6 or value.Format != FORMAT: return false
+        for key in table.keys(value):
+            if key != "Format" and key != "Schema" and key != "Fence" and key != "Data" and key != "Lock" and key != "Commit": return false
+        if not Whole(value.Schema, 1, 1000) or not Whole(value.Fence, 0, 1000000000): return false
+        if not IsText(value.Commit, 256) or not IsRecord(value.Data): return false
+        if value.Lock != nil:
+            if not IsRecord(value.Lock) or table.count(value.Lock) != 2: return false
+            if not IsText(value.Lock.Token, 192) or string.length(value.Lock.Token) == 0: return false
+            if not Finite(value.Lock.ExpiresAt) or value.Lock.ExpiresAt < 0 or value.Lock.ExpiresAt > 1e15: return false
+        return true
+    catch invalid:
+        return false
+
+local Envelope = func(schema, fence, data, token, expires, commit):
+    local lock = nil
+    if token != nil: lock = { Token = token, ExpiresAt = expires }
+    return { Format = FORMAT, Schema = schema, Fence = fence, Data = data, Lock = lock, Commit = commit }
+
+local Clock = func(state):
+    local now = state.Clock()
+    if not Finite(now) or now < 0 or now > 1e15 - state.Lease: throw "mData: invalid wall clock"
+    return now
+
+local StoreUpdate = func(state, key, transform):
+    for attempt in range(state.Retries):
+        try:
+            return Ok(state.Backend.UpdateAsync(key, transform))
+        catch failure:
+            if attempt + 1 >= state.Retries: return Fail("StoreError", "The data operation failed.")
+            state.Wait(0.25 * (attempt + 1))
+    return Fail("StoreError", "The data operation failed.")
+
+local Retire = func(entry, reason):
+    if not entry.Retire(): return
+    local state = entry.Service
+    entry.Phase = reason
+    if state.Entries[entry.Key] == entry:
+        table.remove(state.Entries, entry.Key)
+        state.Order.remove(entry)
+        state.Count -= 1
+    entry.Current = nil
+    entry.Service = nil
+    entry.Closed.Fire(reason)
+    entry.Closed.Destroy()
+
+local Active = func(entry):
+    local state = entry.Service
+    if state == nil or entry.Phase != "Active" or state.Closing: return false
+    local now = Clock(state)
+    if entry.Service != state or entry.Phase != "Active" or state.Closing: return false
+    if now >= entry.ExpiresAt:
+        Retire(entry, "Expired")
+        return false
+    return true
+
+local Owned = func(value, entry):
+    return Metadata(value) and value.Lock != nil and value.Lock.Token == entry.Token and Same(value.Fence, entry.Fence)
+
+local DropLease = func(state, entry):
+    return StoreUpdate(state, entry.Key, func(current):
+        if not Owned(current, entry): return nil
+        return Envelope(current.Schema, current.Fence, current.Data, nil, 0, current.Commit)
+    )
+
+local Save = func(entry, release):
+    local state = entry.Service
+    if state == nil: return Fail("Inactive", "The profile is closed.")
+    if entry.Phase != "Active": return Fail("Busy", "The profile is not ready.")
+    if state.Closing and not release: return Fail("Closed", "The store is closing.")
+    if not entry.IO.Take(): return Fail("Busy", "A profile operation is already running.")
+    try:
+        if not entry.Edit.Take(): return Fail("Busy", "A profile update is running.")
+        local snapshot = nil
+        try:
+            snapshot = entry.Current
+            local now = Clock(state)
+            if entry.Service != state or entry.Phase != "Active" or snapshot == nil: return Fail("Inactive", "The profile was closed.")
+            if now >= entry.ExpiresAt:
+                Retire(entry, "Expired")
+                return Fail("Expired", "The profile lease expired.")
+            if release: entry.Phase = "Releasing"
+        finally:
+            entry.Edit.Reset()
+        local operation = entry.Token + ":" + sequence++
+        local fault = { Code = "Lost" }
+        local result = StoreUpdate(state, entry.Key, func(current):
+            fault.Code = "Lost"
+            if not Metadata(current):
+                fault.Code = "Corrupt"
+                return nil
+            if release and current.Commit == operation and current.Lock == nil: return current
+            if not Owned(current, entry) or current.Lock.ExpiresAt <= Clock(state): return nil
+            if entry.Service == nil: return nil
+            if release:
+                return Envelope(state.Version, entry.Fence, Copy(snapshot.Data), nil, 0, operation)
+            return Envelope(state.Version, entry.Fence, Copy(snapshot.Data), entry.Token, Clock(state) + state.Lease, operation)
+        )
+        if not result.Ok:
+            if release and entry.Service != nil: entry.Phase = "Active"
+            return result
+        local saved = result.Value
+        if saved == nil:
+            Retire(entry, "Lost")
+            return Fail(fault.Code, "The profile no longer owns its saved session.")
+        if entry.Service == nil:
+            DropLease(state, entry)
+            return Fail("Inactive", "The profile was closed during the save.")
+        entry.SavedRevision = snapshot.Revision
+        if release:
+            Retire(entry, "Released")
+        else:
+            entry.ExpiresAt = saved.Lock.ExpiresAt
+            entry.NextSave = Clock(state) + state.Autosave
+        return Ok(nil)
+    finally:
+        entry.IO.Reset()
+
+local Update = func(entry, transform):
+    if not Active(entry): throw "mData: profile is not active"
+    if transform == nil: throw "mData: Update requires a function"
+    if not entry.Edit.Take(): throw "mData: another profile update is running"
+    local state = entry.Service
+    local editing = false
+    try:
+        if state == nil or entry.Phase != "Active": throw "mData: profile was closed"
+        state.Editing += 1
+        editing = true
+        local current = entry.Current
+        if current == nil: throw "mData: profile was closed"
+        local draft = DataCopy(current.Data)
+        local returned = transform(draft)
+        if returned != nil: draft = returned
+        local data = DataCopy(draft)
+        if not Active(entry) or entry.Current != current: throw "mData: profile changed during Update"
+        entry.Current = { Data = data, Revision = current.Revision + 1 }
+    finally:
+        if editing: state.Editing -= 1
+        entry.Edit.Reset()
+
+local Handle = func(entry):
+    return {
+        Closed = entry.Closed,
+        Get = func():
+            if not Active(entry): throw "mData: profile is not active"
+            local current = entry.Current
+            if current == nil: throw "mData: profile was closed"
+            return DataCopy(current.Data)
+        ,
+        Update = expr(transform): Update(entry, transform),
+        Save = expr(): Save(entry, false),
+        Release = expr(): Save(entry, true),
+        IsActive = expr(): Active(entry),
+        GetStatus = func():
+            local dirty = false
+            local current = entry.Current
+            if current != nil: dirty = not Same(current.Revision, entry.SavedRevision)
+            return { Key = entry.Key, State = entry.Phase, ExpiresAt = entry.ExpiresAt, Dirty = dirty }
+    }
+
+local Load = func(state, key):
+    if not Key(key): return Fail("InvalidKey", "Use a nonempty key of at most 50 characters.")
+    if state.Closing: return Fail("Closed", "The store is closing.")
+    if not state.Register.Take(): return Fail("Busy", "Another load registration is running.")
+    local entry = nil
+    try:
+        if state.Closing: return Fail("Closed", "The store is closing.")
+        if state.Entries[key] != nil: return Fail("AlreadyLoaded", "This store already tracks that key.")
+        if state.Count >= state.Maximum: return Fail("Capacity", "The store has reached its profile limit.")
+        entry = {
+            Service = state, Key = key, Phase = "Loading", Token = state.Session + ":" + sequence++,
+            Fence = 0, Current = nil, SavedRevision = 0, ExpiresAt = 0, NextSave = 0,
+            IO = Gate(), Edit = Gate(), Retire = Once(), Closed = mSignal.New()
+        }
+        state.Entries[key] = entry
+        state.Order.push(entry)
+        state.Count += 1
+    finally:
+        state.Register.Reset()
+    local fault = { Code = "Locked" }
+    local result = StoreUpdate(state, key, func(current):
+        fault.Code = "Locked"
+        if state.Closing or entry.Service == nil:
+            fault.Code = "Closed"
+            return nil
+        local now = Clock(state)
+        if current == nil: return Envelope(state.Version, 1, DataCopy(state.Defaults), entry.Token, now + state.Lease, "")
+        if not Metadata(current):
+            fault.Code = "Corrupt"
+            return nil
+        if current.Schema > state.Version:
+            fault.Code = "NewerSchema"
+            return nil
+        if current.Fence >= 1000000000:
+            fault.Code = "Corrupt"
+            return nil
+        if current.Lock != nil and current.Lock.ExpiresAt > now:
+            if current.Lock.Token == entry.Token: return current
+            return nil
+        local data = nil
+        try:
+            data = DataCopy(current.Data)
+        catch invalid:
+            fault.Code = "Corrupt"
+            return nil
+        return Envelope(current.Schema, current.Fence + 1, data, entry.Token, now + state.Lease, current.Commit)
+    )
+    if not result.Ok:
+        Retire(entry, "LoadFailed")
+        return result
+    local saved = result.Value
+    if saved == nil:
+        Retire(entry, "LoadFailed")
+        return Fail(fault.Code, "The profile could not be acquired.")
+    entry.Fence = saved.Fence
+    entry.ExpiresAt = saved.Lock.ExpiresAt
+    if state.Closing:
+        DropLease(state, entry)
+        Retire(entry, "Closed")
+        return Fail("Closed", "The store closed during the load.")
+    try:
+        local data = DataCopy(saved.Data)
+        if saved.Schema < state.Version:
+            if state.Migrate == nil: throw "missing migration"
+            state.Editing += 1
+            try:
+                local migrated = state.Migrate(data, saved.Schema, state.Version)
+                if migrated != nil: data = migrated
+            finally:
+                state.Editing -= 1
+        Reconcile(data, state.Defaults)
+        data = DataCopy(data)
+        local now = Clock(state)
+        if state.Closing or entry.Service != state or entry.Phase != "Loading" or now >= entry.ExpiresAt:
+            throw "closed or expired during migration"
+        entry.Current = { Data = data, Revision = 1 }
+        entry.SavedRevision = 0
+        entry.NextSave = now + state.Autosave + (sequence % 5)
+        entry.Phase = "Active"
+    catch failure:
+        DropLease(state, entry)
+        Retire(entry, "MigrationFailed")
+        return Fail("Migration", "Profile preparation failed; existing data was not replaced.")
+    return { Ok = true, Profile = Handle(entry) }
+
+local Step = func(state, maximum):
+    if state.Closing: return Fail("Closed", "The store is closing.")
+    if maximum == nil: maximum = 4
+    if not Whole(maximum, 1, 16): throw "mData: Step limit must be an integer from 1 to 16"
+    if not state.Stepping.Take(): return Fail("Busy", "An autosave step is running.")
+    local results = []
+    try:
+        local entries = []
+        for entry in state.Order: entries.push(entry)
+        local start = state.Cursor
+        for offset in range(entries.length):
+            if results.length >= maximum: break
+            local index = (start + offset) % entries.length
+            local entry = entries[index]
+            state.Cursor = (index + 1) % entries.length
+            if entry.Phase != "Active": continue
+            if Clock(state) < entry.NextSave: continue
+            local result = Save(entry, false)
+            results.push({ Key = entry.Key, Result = result })
+            if not result.Ok and entry.Service != nil: entry.NextSave = Clock(state) + 5
+    finally:
+        state.Stepping.Reset()
+    return Ok(results)
+
+local CloseReport = func(state):
+    return { Ok = state.Pending == 0 and state.Failures.length == 0, Pending = state.Pending, Released = state.Released, Failed = state.Failures.length }
+
+local Close = func(state, timeout):
+    if timeout == nil: timeout = 25
+    if not Finite(timeout) or timeout < 0 or timeout > 25: throw "mData: Close timeout must be from 0 to 25 seconds"
+    if state.Closing: return CloseReport(state)
+    if state.Editing > 0: return Fail("Busy", "A profile callback is running.")
+    state.Closing = true
+    local entries = []
+    for entry in state.Order: entries.push(entry)
+    state.Pending = entries.length
+    local next = 0
+    local deadline = Clock(state) + timeout
+    local worker = func():
+        while true:
+            local index = next++
+            if index >= entries.length: return
+            local entry = entries[index]
+            local result = Ok(nil)
+            while entry.Service != nil:
+                try:
+                    result = Save(entry, true)
+                catch failure:
+                    result = Fail("StoreError", "The close operation failed.")
+                if result.Ok or result.Code != "Busy" or Clock(state) >= deadline: break
+                state.Wait(0.05)
+            if entry.Service == nil and entry.Phase == "Released": result = Ok(nil)
+            if result.Ok:
+                state.Released += 1
+            else:
+                state.Failures.push({ Key = entry.Key, Code = result.Code })
+            state.Pending -= 1
+    local started = 0
+    for index in range(math.min(4, entries.length)):
+        try:
+            state.Spawn(worker)
+            started += 1
+        catch failure:
+            state.Failures.push({ Key = "", Code = "Scheduler" })
+    if started == 0 and entries.length > 0:
+        for entry in entries: Retire(entry, "Abandoned")
+        state.Pending = 0
+    while state.Pending > 0 and Clock(state) < deadline: state.Wait(0.05)
+    return CloseReport(state)
+
+local ServiceHandle = func(state):
+    return {
+        Load = expr(key): Load(state, key),
+        Step = expr(maximum): Step(state, maximum),
+        Close = expr(timeout): Close(state, timeout),
+        GetCount = expr(): state.Count,
+        IsClosed = expr(): state.Closing
+    }
+
+local New = func(config, runtime):
+    if config == nil or not Key(config.Name): throw "mData: Name must be a valid store name"
+    local defaults = DataCopy(config.Defaults)
+    local version = config.Version
+    local lease = config.LeaseSeconds
+    local autosave = config.AutosaveSeconds
+    local retries = config.Retries
+    local maximum = config.MaxProfiles
+    if version == nil: version = 1
+    if lease == nil: lease = 120
+    if autosave == nil: autosave = 30
+    if retries == nil: retries = 3
+    if maximum == nil: maximum = 128
+    if not Whole(version, 1, 1000) or not Whole(retries, 1, 5) or not Whole(maximum, 1, 1024): throw "mData: invalid integer configuration"
+    if not Finite(lease) or lease < 30 or lease > 600: throw "mData: lease must be from 30 to 600 seconds"
+    if not Finite(autosave) or autosave < 5 or autosave + 5 >= lease / 2: throw "mData: autosave must leave room to renew the lease"
+    if runtime == nil:
+        local session = game.ServerId
+        if session == "": session = "Creator-" + host.time()
+        runtime = { Store = game.DataSystem.GetStore(config.Name), Clock = host.time, Wait = wait, Spawn = spawn, SessionId = session }
+    if runtime.Store == nil or runtime.Clock == nil or runtime.Wait == nil or runtime.Spawn == nil: throw "mData: incomplete runtime adapter"
+    if not IsText(runtime.SessionId, 128) or string.length(runtime.SessionId) == 0: throw "mData: SessionId must be nonempty text of at most 128 characters"
+    local state = {
+        Backend = runtime.Store, Clock = runtime.Clock, Wait = runtime.Wait, Spawn = runtime.Spawn,
+        Session = runtime.SessionId, Defaults = defaults, Version = version, Migrate = config.Migrate,
+        Lease = lease, Autosave = autosave, Retries = retries, Maximum = maximum,
+        Entries = {}, Order = [], Cursor = 0, Count = 0, Register = Gate(), Stepping = Gate(), Editing = 0,
+        Closing = false, Pending = 0, Released = 0, Failures = []
+    }
+    Clock(state)
+    return ServiceHandle(state)
+
+return { New = New }

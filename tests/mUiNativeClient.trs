@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Optional native client suite. Run alone, then detach before saving.
+if game.ServerId != "": throw "mUi fixtures require a Creator playtest."
+local collector = world.WaitForChild("mUiNativeReports", 20)
+if collector == nil: throw "mUi receipt collector did not start."
+local remote = collector.WaitForChild("Report", 10)
+local reports = []
+local Run = func(name, callback):
+    try:
+        local report = callback()
+        reports.push(report)
+        print(report.Name + ": " + report.Passed + " passed, " + report.Failed + " failed")
+        for failure in report.Failures: print(report.Name + ": " + failure)
+    catch failure:
+        reports.push({ Name = name, Passed = 0, Failed = 1, Failures = [tostring(failure)] })
+        print(name + ": " + tostring(failure))
+
+local bind = import("/mLibraries/tests/mBindSpec")
+local reactive = import("/mLibraries/tests/mReactiveSpec")
+local controls = import("/mLibraries/tests/mControlsSpec")
+local widgets = import("/mLibraries/tests/mWidgetsSpec")
+Run("mBind", bind.Run)
+Run("mBind native", bind.RunNative)
+Run("mBind concurrent", import("/mLibraries/tests/mBindConcurrentSpec").Run)
+Run("mState concurrent", import("/mLibraries/tests/mStateSpec").RunConcurrent)
+Run("mReactive", reactive.Run)
+Run("mReactive native", reactive.RunNative)
+Run("mReactive concurrent", reactive.RunConcurrent)
+Run("mControls", controls.Run)
+Run("mControls native", controls.RunNative)
+Run("mWidgets", widgets.Run)
+Run("mWidgets native", widgets.RunNative)
+local passed = 0
+local failed = 0
+for report in reports:
+    passed += report.Passed
+    failed += report.Failed
+remote.Fire(game.HttpSystem.JsonEncode({ Version = "2026.43.7", Player = game.Players.LocalPlayer.Name, Passed = passed, Failed = failed, Suites = reports }))
+print("mUi native complete: " + passed + " passed, " + failed + " failed")

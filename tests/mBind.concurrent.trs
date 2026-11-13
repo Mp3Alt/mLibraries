@@ -1,0 +1,181 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Native-script scheduler checks. Run() yields and must not run in an editor command.
+# local report = import("/mLibraries/tests/mBindConcurrentSpec").Run()
+# print(report.Passed, report.Failed)
+
+local mBind = import("/mLibraries/mBind")
+local mState = import("/mLibraries/mState")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local Race = func(workers, work):
+    local start = false
+    local completed = 0
+    local failures = []
+    local deadline = host.time() + 8
+    for index in range(workers):
+        spawn(func(worker):
+            try:
+                while not start and host.time() < deadline: wait(0)
+                if not start: throw "worker start timed out"
+                work(worker, deadline)
+            catch failure:
+                failures.push(failure)
+            finally:
+                completed++
+        , index)
+    start = true
+    while completed < workers and host.time() < deadline: wait(0)
+    local join_deadline = host.time() + 2
+    while completed < workers and host.time() < join_deadline: wait(0)
+    return {
+        Completed = completed,
+        Expected = workers,
+        Failures = failures
+    }
+
+local CheckRace = func(suite, result):
+    suite.Equal(result.Completed, result.Expected, "all workers joined")
+    if result.Failures.length > 0: throw "worker failed: " + tostring(result.Failures[0])
+
+local ExpectedWriterFailure = func(failure, property):
+    return failure == "mBind: writer registration is busy" or failure == "mBind: property already has a writer: " + property
+
+local Run = func():
+    local suite = mTestKit.New("mBind concurrent")
+    suite.Test("competing handle disposal calls each cleanup once", func():
+        local scope = mBind.Scope()
+        local entries = []
+        try:
+            for index in range(32):
+                local calls = 0
+                local handle = scope.Add(func(): calls += 1)
+                entries.push({ Handle = handle, Calls = expr(): calls })
+            local result = Race(12, func(worker, deadline):
+                for iteration in range(8):
+                    if host.time() >= deadline: throw "dispose workload timed out"
+                    for entry in entries:
+                        if worker % 2 == 0: entry.Handle.Destroy()
+                        else: entry.Handle.Disconnect()
+                    wait(0)
+            )
+            CheckRace(suite, result)
+            for entry in entries:
+                suite.Equal(entry.Calls(), 1, "cleanup ran exactly once")
+                suite.Expect(entry.Handle.IsDestroyed(), "retired handle is closed")
+            suite.Equal(scope.GetCount(), 0, "retired resources released registrations")
+            suite.Equal(scope.Destroy().length, 0, "owner cleanup has no failures")
+        finally:
+            scope.Destroy()
+    )
+    suite.Test("resource admission and owner destruction leave no registrations", func():
+        local scopes = []
+        local seeds = []
+        local attempts = []
+        try:
+            for index in range(64):
+                local scope = mBind.Scope()
+                local calls = 0
+                scope.Add(func(): calls += 1)
+                scopes.push(scope)
+                seeds.push(expr(): calls)
+            local result = Race(8, func(worker, deadline):
+                for index in range(scopes.length):
+                    if host.time() >= deadline: throw "admission workload timed out"
+                    if (index + worker) % 4 == 0: wait(0)
+                    local scope = scopes[index]
+                    if worker == 0:
+                        local failures = scope.Destroy()
+                        if failures.length > 0: throw failures[0]
+                    else:
+                        local calls = 0
+                        local attempt = { Accepted = false, Calls = expr(): calls }
+                        attempts.push(attempt)
+                        try:
+                            local handle = scope.Add(func(): calls += 1)
+                            attempt.Accepted = true
+                            if index % 3 == 0: handle.Destroy()
+                        catch failure:
+                            if failure != "mBind: scope is destroyed": throw failure
+            )
+            CheckRace(suite, result)
+            for scope in scopes:
+                suite.Equal(scope.Destroy().length, 0, "repeat closing is safe")
+                suite.Expect(scope.IsDestroyed(), "owner is closed")
+                suite.Equal(scope.GetCount(), 0, "closed owner retains no registrations")
+            for seed in seeds: suite.Equal(seed(), 1, "seed cleanup ran once")
+            for attempt in attempts:
+                local calls = attempt.Calls()
+                if attempt.Accepted: suite.Equal(calls, 1, "accepted resource was cleaned")
+                else: suite.Expect(calls == 0 or calls == 1, "failed admission cleans at most once")
+        finally:
+            for scope in scopes: scope.Destroy()
+    )
+    suite.Test("parallel claims admit one writer and allow replacement", func():
+        local scope = mBind.Scope()
+        local source = mState.New("initial")
+        try:
+            for round in range(12):
+                local panel = scope.New("UIPanel")
+                local before = scope.GetCount()
+                local admitted = []
+                local result = Race(8, func(worker, deadline):
+                    try:
+                        admitted.push(scope.Bind(panel, "Name", source))
+                    catch failure:
+                        if not ExpectedWriterFailure(failure, "Name"): throw failure
+                )
+                CheckRace(suite, result)
+                suite.Equal(admitted.length, 1, "one fresh property claim succeeded")
+                suite.Equal(scope.GetCount(), before + 1, "losing claims retain no resources")
+                source.Set("retained" + round)
+                suite.Equal(panel.Name, "retained" + round, "admitted writer remains active")
+                suite.Throws(expr(): scope.Bind(panel, "Name", source), "live property remains protected")
+                admitted[0].Destroy()
+                local replacement = scope.Bind(panel, "Name", source)
+                source.Set("replacement" + round)
+                suite.Equal(panel.Name, "replacement" + round, "released claim permits replacement")
+                replacement.Destroy()
+                suite.Equal(scope.GetCount(), before, "both writer registrations released")
+            suite.Equal(scope.Destroy().length, 0, "all native rows clean up")
+        finally:
+            scope.Destroy()
+            source.Destroy()
+    )
+    suite.Test("last writer release cannot remove another property claim", func():
+        local scope = mBind.Scope()
+        local name = mState.New("held")
+        local visible = mState.New(false)
+        try:
+            for round in range(16):
+                local panel = scope.New("UIPanel")
+                local before = scope.GetCount()
+                local previous = scope.Bind(panel, "Name", name)
+                local admitted = []
+                local result = Race(8, func(worker, deadline):
+                    if worker == 0:
+                        previous.Destroy()
+                        previous.Disconnect()
+                    else:
+                        try:
+                            admitted.push(scope.Bind(panel, "Visible", visible))
+                        catch failure:
+                            if not ExpectedWriterFailure(failure, "Visible"): throw failure
+                )
+                CheckRace(suite, result)
+                suite.Equal(admitted.length, 1, "one second property writer was admitted")
+                suite.Throws(expr(): scope.Bind(panel, "Visible", visible), "second property remains protected")
+                local replacement = scope.Bind(panel, "Name", name)
+                suite.Throws(expr(): scope.Bind(panel, "Visible", visible), "replacement does not erase the other claim")
+                replacement.Destroy()
+                admitted[0].Destroy()
+                suite.Equal(scope.GetCount(), before, "concurrent release registrations drained")
+            suite.Equal(scope.Destroy().length, 0, "native fixture cleanup has no failures")
+        finally:
+            scope.Destroy()
+            name.Destroy()
+            visible.Destroy()
+    )
+    return suite.Report()
+
+return { Run = Run }

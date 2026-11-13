@@ -31,8 +31,7 @@ mAsync.New = func(runtime):
         if work == nil:
             throw new Error("mAsync requires a work function")
 
-        # Publish each outcome as one record: automatic yielding can occur
-        # between statements, so Status and its result must change together.
+        # Keep result fields together and capture each published record once.
         local outcome = {
             Status = "Pending",
             Value = nil,
@@ -64,20 +63,20 @@ mAsync.New = func(runtime):
             } or outcome
 
         token.IsCancellationRequested = func():
-            return outcome.CancellationRequested or ((outcome.Status == "Pending" or outcome.Status == "Running") and cancel_gate > 0)
+            local current = outcome
+            return current.CancellationRequested
 
         token.Checkpoint = func():
             if token.IsCancellationRequested():
                 throw cancellation
 
         job.GetOutcome = func():
-            # Keep this one statement. Reading the record, yielding, then
-            # reading the gate could combine observations from different times.
+            local current = outcome
             return {
-                Status = outcome.Status,
-                Value = outcome.Value,
-                Error = outcome.Error,
-                CancellationRequested = outcome.CancellationRequested or ((outcome.Status == "Pending" or outcome.Status == "Running") and cancel_gate > 0)
+                Status = current.Status,
+                Value = current.Value,
+                Error = current.Error,
+                CancellationRequested = current.CancellationRequested
             }
 
         job.Cancel = func():
@@ -95,6 +94,11 @@ mAsync.New = func(runtime):
                 Value = nil,
                 Error = nil,
                 CancellationRequested = true
+            } or outcome.Status == "Running" and {
+                Status = "Running",
+                Value = nil,
+                Error = nil,
+                CancellationRequested = true
             } or outcome
             if outcome.Status == "Cancelled":
                 release()
@@ -107,6 +111,7 @@ mAsync.New = func(runtime):
 
             local task = nil
             local data = nil
+            local captured = nil
             try:
                 if should_wait:
                     pause(seconds)
@@ -126,9 +131,11 @@ mAsync.New = func(runtime):
                     release()
                     return
 
-                task = execution.Work
-                data = execution.Payload
+                captured = execution
                 release()
+                task = captured.Work
+                data = captured.Payload
+                captured = nil
                 local value = task(token, data)
                 task = nil
                 data = nil
@@ -136,6 +143,7 @@ mAsync.New = func(runtime):
             catch problem:
                 task = nil
                 data = nil
+                captured = nil
                 # Pending cancellation has already settled the job. A sleeping
                 # adapter may still wake or fail; neither may settle it again.
                 if outcome.Status == "Cancelled":

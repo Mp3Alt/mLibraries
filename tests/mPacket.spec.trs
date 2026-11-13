@@ -1,0 +1,549 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mPacket = import("/mLibraries/mPacket")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local Config = func():
+    return { Id = 7, Fields = [
+        { Name = "Count", Type = "integer", Min = -100, Max = 100 },
+        { Name = "Price", Type = "number", Min = -10, Max = 10 },
+        { Name = "Enabled", Type = "boolean" },
+        { Name = "Label", Type = "string", MaxLength = 16 }
+    ] }
+local Row = expr(): { Count = 0, Price = 0, Enabled = false, Label = "" }
+local Repeat = func(text, count):
+    local result = ""
+    for index in range(count):
+        result += text
+    return result
+
+local Run = func():
+    local suite = mTestKit.New("mPacket")
+    local RejectSchema = func(config):
+        local raised = false
+        local failure = nil
+        try:
+            mPacket.New(config)
+        catch problem:
+            raised = true
+            failure = problem
+        suite.Expect(raised, "invalid schema throws")
+        suite.Equal(failure, "Invalid mPacket schema.", "static schema failure")
+
+    suite.Test("constructor fills defaults and Describe returns a direct config", func():
+        local description = mPacket.New(Config()).Describe()
+        suite.Equal(description.Id, 7, "schema Id")
+        suite.Equal(description.Version, 1, "default version")
+        suite.Equal(description.MaxRecords, 64, "default record limit")
+        suite.Equal(description.MaxTextLength, 1024, "default text limit")
+        suite.Equal(description.Fields.length, 4, "field definitions")
+        suite.Equal(description.Ok, nil, "Describe is not a result envelope")
+    )
+
+    suite.Test("malformed config shapes and missing required fields throw privately", func():
+        for value in [nil, false, 7, "schema", [], {}, { Id = 7 }, { Fields = [{ Name = "Flag", Type = "boolean" }] }]:
+            RejectSchema(value)
+    )
+
+    suite.Test("unknown config keys and wrong capitalization are rejected", func():
+        local config = Config()
+        config.Extra = true
+        RejectSchema(config)
+        RejectSchema({ ID = 7, Fields = [{ Name = "Flag", Type = "boolean" }] })
+    )
+
+    suite.Test("schema Id must be an exact bounded positive integer", func():
+        for value in [0, -1, 65536, 0.5, 1 + 1e-12, "7", false, 0 / 0]:
+            local config = Config()
+            config.Id = value
+            RejectSchema(config)
+        local config = Config()
+        config.Id = 65535
+        suite.Equal(mPacket.New(config).Describe().Id, 65535, "maximum Id accepted")
+    )
+
+    suite.Test("version accepts its maximum and rejects invalid values", func():
+        for value in [0, 256, 0.5, 1 + 1e-12, "1", false]:
+            local config = Config()
+            config.Version = value
+            RejectSchema(config)
+        local config = Config()
+        config.Version = 255
+        suite.Equal(mPacket.New(config).Describe().Version, 255, "maximum version")
+    )
+
+    suite.Test("record limit must be an exact integer from one to sixty-four", func():
+        for value in [0, 65, 0.5, 1 + 1e-12, "1", false]:
+            local config = Config()
+            config.MaxRecords = value
+            RejectSchema(config)
+        local config = Config()
+        config.MaxRecords = 1
+        suite.Equal(mPacket.New(config).Describe().MaxRecords, 1, "minimum record limit")
+    )
+
+    suite.Test("total text limit accepts zero and 4096 without coercion", func():
+        for value in [-1, 4097, 0.5, 1 + 1e-12, "1", false]:
+            local config = Config()
+            config.MaxTextLength = value
+            RejectSchema(config)
+        for value in [0, 4096]:
+            local config = Config()
+            config.MaxTextLength = value
+            suite.Equal(mPacket.New(config).Describe().MaxTextLength, value, "text limit retained")
+    )
+
+    suite.Test("Fields requires a real nonempty array without invoking fake methods", func():
+        local called = false
+        local forged = { length = 1, index_of = func(value): called = true }
+        for fields in [nil, false, "fields", {}, [], forged]:
+            RejectSchema({ Id = 7, Fields = fields })
+        suite.Equal(called, false, "shape checks do not call supplied functions")
+    )
+
+    suite.Test("field count is bounded at eight", func():
+        local fields = []
+        for index in range(8):
+            fields.push({ Name = "Field" + index, Type = "boolean" })
+        suite.Equal(mPacket.New({ Id = 7, Fields = fields }).Describe().Fields.length, 8, "eight fields accepted")
+        fields.push({ Name = "Extra", Type = "boolean" })
+        RejectSchema({ Id = 7, Fields = fields })
+    )
+
+    suite.Test("field names use bounded ASCII letters digits and underscores", func():
+        for name in [nil, false, 1, "", "1Name", "A-B", "A.B", "two words", "café", Repeat("A", 33)]:
+            RejectSchema({ Id = 7, Fields = [{ Name = name, Type = "boolean" }] })
+        local name = "A" + Repeat("_", 30) + "1"
+        suite.Equal(mPacket.New({ Id = 7, Fields = [{ Name = name, Type = "boolean" }] }).Describe().Fields[0].Name, name, "32-character name")
+    )
+
+    suite.Test("field uniqueness and row matching are case sensitive", func():
+        RejectSchema({ Id = 7, Fields = [{ Name = "Flag", Type = "boolean" }, { Name = "Flag", Type = "boolean" }] })
+        local codec = mPacket.New({ Id = 7, Fields = [{ Name = "Flag", Type = "boolean" }, { Name = "flag", Type = "boolean" }] })
+        local result = codec.Encode([{ Flag = true, flag = false }])
+        suite.Expect(result.Ok, "distinct case-sensitive names")
+        suite.Equal(result.Value[3], true, "first field")
+        suite.Equal(result.Value[4], false, "second field")
+    )
+
+    suite.Test("unknown or miscapitalized field types are rejected", func():
+        for kind in [nil, false, 1, "Integer", "bool", "vector", "table"]:
+            RejectSchema({ Id = 7, Fields = [{ Name = "Value", Type = kind }] })
+    )
+
+    suite.Test("field definitions reject unrelated or extra keys", func():
+        local bad = [
+            { Name = "Flag", Type = "boolean", Min = 0 },
+            { Name = "Text", Type = "string", MaxLength = 4, Max = 4 },
+            { Name = "Count", Type = "integer", Min = 0, Max = 4, MaxLength = 4 },
+            { Name = "Flag", Type = "boolean", Extra = true }
+        ]
+        for field in bad:
+            RejectSchema({ Id = 7, Fields = [field] })
+    )
+
+    suite.Test("numeric bounds are required finite numbers in ascending order", func():
+        local infinity = 1e308 * 1e308
+        for kind in ["integer", "number"]:
+            for limits in [{}, { Min = 0 }, { Max = 1 }, { Min = 2, Max = 1 }, { Min = "0", Max = 1 }, { Min = false, Max = 1 }, { Min = 0 / 0, Max = 1 }, { Min = 0, Max = infinity }]:
+                RejectSchema({ Id = 7, Fields = [{ Name = "Value", Type = kind, Min = limits.Min, Max = limits.Max }] })
+            suite.Expect(mPacket.New({ Id = 7, Fields = [{ Name = "Value", Type = kind, Min = 0, Max = 0 }] }).Encode([{ Value = 0 }]).Ok, "equal numeric bounds allowed")
+    )
+
+    suite.Test("integer schema bounds cannot be fractional or near integers", func():
+        for limits in [{ Min = 0.5, Max = 2 }, { Min = 0, Max = 1.5 }, { Min = 1 + 1e-12, Max = 2 }, { Min = 0, Max = 1 + 1e-12 }]:
+            RejectSchema({ Id = 7, Fields = [{ Name = "Value", Type = "integer", Min = limits.Min, Max = limits.Max }] })
+        local codec = mPacket.New({ Id = 7, Fields = [{ Name = "Value", Type = "number", Min = -0.5, Max = 0.5 }] })
+        suite.Expect(codec.Encode([{ Value = 0.25 }]).Ok, "number fields allow fractional ranges")
+    )
+
+    suite.Test("string definitions require an exact maximum from one to 256", func():
+        for value in [nil, false, "1", 0, 257, 0.5, 1 + 1e-12]:
+            RejectSchema({ Id = 7, Fields = [{ Name = "Text", Type = "string", MaxLength = value }] })
+        suite.Equal(mPacket.New({ Id = 7, Fields = [{ Name = "Text", Type = "string", MaxLength = 256 }] }).Describe().Fields[0].MaxLength, 256, "maximum text field limit")
+    )
+
+    suite.Test("constructor copies schema metadata before returning", func():
+        local config = Config()
+        local codec = mPacket.New(config)
+        config.Id = 99
+        config.Version = 9
+        config.MaxRecords = 1
+        config.MaxTextLength = 0
+        config.Fields[0].Name = "Changed"
+        config.Fields[0].Min = 99
+        config.Fields.push({ Name = "Extra", Type = "boolean" })
+        local result = codec.Encode([Row()])
+        suite.Expect(result.Ok, "original field definitions remain usable")
+        suite.Equal(result.Value[0], 7, "original Id")
+        suite.Equal(result.Value[1], 1, "original version")
+        suite.Equal(result.Value.length, 7, "original field count")
+    )
+
+    suite.Test("Describe copies nested fields and reconstructs the same schema", func():
+        local codec = mPacket.New(Config())
+        local first = codec.Describe()
+        local copy = codec.Describe()
+        suite.Expect(first != copy and first.Fields != copy.Fields and first.Fields[0] != copy.Fields[0], "fresh metadata containers")
+        first.Id = 99
+        first.Fields[0].Min = 99
+        first.Fields[0].Name = "Changed"
+        suite.Equal(codec.Describe().Id, 7, "private Id unchanged")
+        suite.Equal(codec.Describe().Fields[0].Name, "Count", "private field unchanged")
+        suite.Expect(mPacket.New(copy).Encode([Row()]).Ok, "described config has only supported keys")
+        suite.Equal(copy.Fields[2].Min, nil, "boolean has no numeric metadata")
+        suite.Equal(copy.Fields[0].MaxLength, nil, "integer has no text metadata")
+    )
+
+    suite.Test("empty batches encode only their three header values", func():
+        local codec = mPacket.New(Config())
+        local encoded = codec.Encode([])
+        suite.Expect(encoded.Ok, "empty batch succeeds")
+        suite.Equal(encoded.Value.length, 3, "header length")
+        suite.Equal(encoded.Value[0], 7, "Id")
+        suite.Equal(encoded.Value[1], 1, "version")
+        suite.Equal(encoded.Value[2], 0, "record count")
+        suite.Equal(codec.Decode(encoded.Value).Value.length, 0, "empty canonical output")
+    )
+
+    suite.Test("configured record limits apply to both directions", func():
+        local config = Config()
+        config.MaxRecords = 1
+        local codec = mPacket.New(config)
+        suite.Expect(codec.Encode([Row()]).Ok, "one record accepted")
+        suite.Equal(codec.Encode([Row(), Row()]).Code, "InvalidRecords", "extra record rejected")
+        suite.Equal(codec.Decode([7, 1, 2]).Code, "InvalidPacket", "count beyond configuration rejected")
+    )
+
+    suite.Test("all four scalar types roundtrip in configured field order", func():
+        local codec = mPacket.New(Config())
+        local row = { Count = -2, Price = 0.125, Enabled = false, Label = "hello" }
+        local encoded = codec.Encode([row])
+        suite.Expect(encoded.Ok, "row accepted")
+        suite.Equal(encoded.Value.length, 7, "flat scalar layout")
+        suite.Equal(encoded.Value[3], -2, "integer position")
+        suite.Equal(encoded.Value[4], 0.125, "number position")
+        suite.Equal(encoded.Value[5], false, "boolean position")
+        suite.Equal(encoded.Value[6], "hello", "string position")
+        local decoded = codec.Decode(encoded.Value)
+        suite.Expect(decoded.Ok, "frame accepted")
+        suite.Equal(decoded.Value[0].Count, -2, "integer roundtrip")
+        suite.Equal(decoded.Value[0].Price, 0.125, "fractional roundtrip")
+        suite.Equal(decoded.Value[0].Enabled, false, "boolean roundtrip")
+        suite.Equal(decoded.Value[0].Label, "hello", "string roundtrip")
+    )
+
+    suite.Test("zero false and empty strings are values rather than missing fields", func():
+        local codec = mPacket.New(Config())
+        local encoded = codec.Encode([Row()])
+        suite.Expect(encoded.Ok, "falsy fields accepted")
+        local decoded = codec.Decode(encoded.Value)
+        suite.Expect(decoded.Ok, "falsy fields decode")
+        suite.Equal(decoded.Value[0].Count, 0, "zero integer")
+        suite.Equal(decoded.Value[0].Price, 0, "zero number")
+        suite.Equal(decoded.Value[0].Enabled, false, "false boolean")
+        suite.Equal(decoded.Value[0].Label, "", "empty text")
+    )
+
+    suite.Test("header Id and version retain their configured maximum values", func():
+        local codec = mPacket.New({ Id = 65535, Version = 255, Fields = [{ Name = "Flag", Type = "boolean" }] })
+        local encoded = codec.Encode([{ Flag = true }])
+        suite.Equal(encoded.Value[0], 65535, "maximum Id")
+        suite.Equal(encoded.Value[1], 255, "maximum version")
+        suite.Expect(codec.Decode(encoded.Value).Ok, "maximum header roundtrip")
+    )
+
+    suite.Test("nested values and nil are rejected for every scalar type", func():
+        local codec = mPacket.New(Config())
+        for name in ["Count", "Price", "Enabled", "Label"]:
+            for value in [nil, [], {}]:
+                local row = Row()
+                row[name] = value
+                suite.Equal(codec.Encode([row]).Ok, false, "nonscalar field rejected")
+    )
+
+    suite.Test("integer values enforce exact integrality and their signed range", func():
+        local codec = mPacket.New(Config())
+        for value in [-101, 101, 0.5, 1 + 1e-12, 1 - 1e-12, "1", false]:
+            local row = Row()
+            row.Count = value
+            suite.Equal(codec.Encode([row]).Code, "InvalidValue", "invalid integer rejected")
+        for value in [-100, 100]:
+            local row = Row()
+            row.Count = value
+            suite.Expect(codec.Encode([row]).Ok, "range endpoint accepted")
+    )
+
+    suite.Test("number values reject nonfinite coercible and out-of-range input", func():
+        local codec = mPacket.New(Config())
+        local infinity = 1e308 * 1e308
+        for value in [-11, 11, "1", false, 0 / 0, infinity, -infinity]:
+            local row = Row()
+            row.Price = value
+            suite.Equal(codec.Encode([row]).Code, "InvalidValue", "invalid number rejected")
+        for value in [-10, -0.125, 10]:
+            local row = Row()
+            row.Price = value
+            suite.Expect(codec.Encode([row]).Ok, "finite number accepted")
+    )
+
+    suite.Test("boolean values accept only literal true or false", func():
+        local codec = mPacket.New(Config())
+        for value in [0, 1, "true", "false"]:
+            local row = Row()
+            row.Enabled = value
+            suite.Equal(codec.Encode([row]).Code, "InvalidValue", "no boolean coercion")
+        for value in [true, false]:
+            local row = Row()
+            row.Enabled = value
+            suite.Expect(codec.Encode([row]).Ok, "literal boolean accepted")
+    )
+
+    suite.Test("per-field strings enforce native character length and strict type", func():
+        local codec = mPacket.New({ Id = 7, Fields = [{ Name = "Text", Type = "string", MaxLength = 3 }] })
+        suite.Expect(codec.Encode([{ Text = "abc" }]).Ok, "text boundary accepted")
+        suite.Equal(codec.Encode([{ Text = "abcd" }]).Code, "InvalidValue", "text boundary enforced")
+        for value in [0, false, [], {}]:
+            suite.Equal(codec.Encode([{ Text = value }]).Code, "InvalidValue", "string type required")
+        suite.Equal(codec.Decode([7, 1, 1, "abcd"]).Code, "InvalidValue", "receiver field length enforced")
+    )
+
+    suite.Test("Encode requires exactly the configured case-sensitive row keys", func():
+        local codec = mPacket.New(Config())
+        local extra = Row()
+        extra.Extra = true
+        suite.Equal(codec.Encode([extra]).Code, "InvalidRecord", "extra key")
+        suite.Equal(codec.Encode([{ Count = 0, Price = 0, Enabled = false }]).Code, "InvalidRecord", "missing key")
+        suite.Equal(codec.Encode([{ count = 0, Price = 0, Enabled = false, Label = "" }]).Code, "InvalidRecord", "wrong case")
+        suite.Equal(codec.Encode([[0, 0, false, ""]]).Code, "InvalidRecord", "positional row is not a record")
+    )
+
+    suite.Test("Encode rejects nonarrays and forged array dictionaries without invoking methods", func():
+        local codec = mPacket.New(Config())
+        local called = false
+        local forged = { length = 0, index_of = func(value): called = true }
+        for value in [nil, false, 0, "records", {}, forged]:
+            suite.Equal(codec.Encode(value).Code, "InvalidRecords", "real record array required")
+        suite.Equal(called, false, "forged method not invoked")
+    )
+
+    suite.Test("Encode produces a fresh scalar array without retaining record containers", func():
+        local codec = mPacket.New(Config())
+        local records = [Row()]
+        local first = codec.Encode(records).Value
+        local second = codec.Encode(records).Value
+        suite.Expect(first != second, "fresh flat arrays")
+        records[0].Count = 9
+        suite.Equal(first[3], 0, "record mutation does not change flat values")
+        first[3] = 8
+        suite.Equal(records[0].Count, 9, "flat mutation does not change source row")
+        suite.Equal(second[3], 0, "flat results independent")
+    )
+
+    suite.Test("Decode returns fresh canonical arrays and rows", func():
+        local codec = mPacket.New(Config())
+        local flat = codec.Encode([Row()]).Value
+        local first = codec.Decode(flat).Value
+        local second = codec.Decode(flat).Value
+        suite.Expect(first != second and first[0] != second[0], "new receiver containers")
+        flat[3] = 9
+        suite.Equal(first[0].Count, 0, "input mutation does not change decoded row")
+        first[0].Price = 1
+        suite.Equal(second[0].Price, 0, "decoded rows independent")
+        suite.Equal(flat[4], 0, "row mutation does not change flat input")
+    )
+
+    suite.Test("eight fields and sixty-four records produce at most 515 entries", func():
+        local fields = []
+        local record = {}
+        for index in range(8):
+            local name = "Flag" + index
+            fields.push({ Name = name, Type = "boolean" })
+            record[name] = false
+        local codec = mPacket.New({ Id = 7, Fields = fields })
+        local rows = []
+        for index in range(64):
+            rows.push(record)
+        local result = codec.Encode(rows)
+        suite.Expect(result.Ok, "maximum dimensions accepted")
+        suite.Equal(result.Value.length, 515, "absolute entry bound")
+        suite.Equal(codec.Decode(result.Value).Value.length, 64, "maximum frame decodes")
+        result.Value.push(false)
+        suite.Equal(codec.Decode(result.Value).Code, "InvalidPacket", "516 entries rejected")
+        rows.push(record)
+        suite.Equal(codec.Encode(rows).Code, "InvalidRecords", "65 records rejected")
+    )
+
+    suite.Test("Decode rejects huge malformed and nonarray containers before row construction", func():
+        local codec = mPacket.New(Config())
+        local called = false
+        local forged = { length = 3, index_of = func(value): called = true }
+        for value in [nil, false, 0, "packet", {}, [], [7], [7, 1], forged]:
+            suite.Equal(codec.Decode(value).Code, "InvalidPacket", "invalid frame container")
+        local huge = []
+        for index in range(8192):
+            huge.push(0)
+        suite.Equal(codec.Decode(huge).Code, "InvalidPacket", "oversized frame rejected")
+        suite.Equal(called, false, "no supplied method invoked")
+    )
+
+    suite.Test("headers require exact finite numeric integers before matching", func():
+        local codec = mPacket.New(Config())
+        local bad = [[7 + 1e-12, 1, 0], [7, 1 + 1e-12, 0], [7, 1, 1e-12], ["7", 1, 0], [7, true, 0], [7, 1, -1], [7, 1, 65], [7, 1, 0 / 0], [0, 1, 0], [7, 0, 0]]
+        for flat in bad:
+            suite.Equal(codec.Decode(flat).Code, "InvalidPacket", "invalid header rejected")
+    )
+
+    suite.Test("a valid different schema or version never selects another policy", func():
+        local codec = mPacket.New(Config())
+        suite.Equal(codec.Decode([8, 1, 0]).Code, "SchemaMismatch", "different schema Id")
+        suite.Equal(codec.Decode([7, 2, 0]).Code, "SchemaMismatch", "different schema version")
+        suite.Equal(codec.Describe().Id, 7, "expected schema remains local")
+    )
+
+    suite.Test("frame count and exact length must agree", func():
+        local codec = mPacket.New(Config())
+        local bad = [[7, 1, 1], [7, 1, 0, 0], [7, 1, 2, 0, 0, false, ""], [7, 1, 1, 0, 0, false, "", 0]]
+        for flat in bad:
+            suite.Equal(codec.Decode(flat).Code, "InvalidPacket", "truncated or trailing values rejected")
+    )
+
+    suite.Test("receiver validates scalar fields and never returns a partial batch", func():
+        local codec = mPacket.New(Config())
+        for flat in [[7, 1, 1, "0", 0, false, ""], [7, 1, 1, 0, {}, false, ""], [7, 1, 1, 0, 0, 0, ""], [7, 1, 1, 0, 0, false, []], [7, 1, 2, 0, 0, false, "", 0, 0, "false", ""]]:
+            local result = codec.Decode(flat)
+            suite.Equal(result.Code, "InvalidValue", "invalid scalar rejected")
+            suite.Equal(result.Value, nil, "no partial rows")
+            suite.Equal(result.Error, nil, "no raw exception")
+    )
+
+    suite.Test("aggregate text budget includes all rows and all string fields", func():
+        local codec = mPacket.New({ Id = 7, MaxTextLength = 6, Fields = [{ Name = "A", Type = "string", MaxLength = 4 }, { Name = "B", Type = "string", MaxLength = 4 }] })
+        local rows = [{ A = "ab", B = "c" }, { A = "d", B = "ef" }]
+        suite.Expect(codec.Encode(rows).Ok, "exact aggregate budget accepted")
+        rows[1].B = "efx"
+        suite.Equal(codec.Encode(rows).Code, "TextLimit", "sender aggregate budget")
+        local result = codec.Decode([7, 1, 2, "ab", "c", "d", "efx"])
+        suite.Equal(result.Code, "TextLimit", "receiver aggregate budget")
+        suite.Equal(result.Value, nil, "no partial text results")
+    )
+
+    suite.Test("zero text budget allows empty text and numerical data only", func():
+        local config = Config()
+        config.MaxTextLength = 0
+        local codec = mPacket.New(config)
+        suite.Expect(codec.Encode([Row()]).Ok, "empty strings consume zero budget")
+        local row = Row()
+        row.Label = "x"
+        suite.Equal(codec.Encode([row]).Code, "TextLimit", "nonempty text exceeds zero")
+        suite.Equal(codec.Decode([7, 1, 1, 0, 0, false, "x"]).Code, "TextLimit", "receiver zero budget")
+    )
+
+    suite.Test("text budget uses native character units without altering Unicode", func():
+        local text = "café"
+        local length = string.length(text)
+        local codec = mPacket.New({ Id = 7, MaxTextLength = length, Fields = [{ Name = "Text", Type = "string", MaxLength = length }] })
+        local encoded = codec.Encode([{ Text = text }])
+        suite.Expect(encoded.Ok, "native character budget accepted")
+        suite.Equal(codec.Decode(encoded.Value).Value[0].Text, text, "Unicode preserved without encoding conversion")
+    )
+
+    return suite.Report()
+
+local WaitAll = func(done):
+    for turn in range(600):
+        local finished = true
+        for value in done:
+            if not value:
+                finished = false
+                break
+        if finished:
+            return true
+        wait(0)
+    return false
+
+# Native scripts only: these cases yield and cannot run in atomic editor commands.
+local RunConcurrent = func():
+    local suite = mTestKit.New("mPacketConcurrent")
+
+    suite.Test("shared codecs keep their schema private during concurrent Describe mutation", func():
+        local codec = mPacket.New(Config())
+        local done = [false, false, false, false]
+        local errors = []
+        local control = { Stop = false }
+        for worker in range(4):
+            spawn(func():
+                try:
+                    for turn in range(64):
+                        if control.Stop: return
+                        local copy = codec.Describe()
+                        copy.Id = 999
+                        copy.Fields[0].Min = 999
+                        copy.Fields[0].Name = "Changed"
+                        copy.Fields[1] = { Name = "Changed", Type = "boolean" }
+                        local encoded = codec.Encode([{ Count = worker, Price = 0.25, Enabled = false, Label = "native" }])
+                        if not encoded.Ok:
+                            throw "Describe mutation altered an encode"
+                        if turn % 4 == 0: wait(0)
+                        local decoded = codec.Decode(encoded.Value)
+                        if not decoded.Ok or decoded.Value[0].Count != worker or decoded.Value[0].Price != 0.25 or decoded.Value[0].Enabled != false or decoded.Value[0].Label != "native":
+                            throw "shared codec returned a different schema or value"
+                catch failure:
+                    errors.push(failure)
+                finally:
+                    done[worker] = true
+            )
+        local finished = WaitAll(done)
+        control.Stop = true
+        suite.Expect(finished, "all native schema workers completed")
+        suite.Equal(errors.length, 0, "schema workers had no failures")
+        local final = codec.Describe()
+        suite.Equal(final.Id, 7, "private Id retained")
+        suite.Equal(final.Fields[0].Name, "Count", "private field retained")
+        suite.Equal(final.Fields[0].Min, -100, "private bounds retained")
+    )
+
+    suite.Test("concurrent stable-input reads return independent flat and record containers", func():
+        local codec = mPacket.New(Config())
+        local rows = []
+        for index in range(8):
+            rows.push({ Count = index, Price = 0.5, Enabled = false, Label = "shared" })
+        local packet = codec.Encode(rows).Value
+        local done = [false, false, false, false]
+        local errors = []
+        local control = { Stop = false }
+        for worker in range(4):
+            spawn(func():
+                try:
+                    for turn in range(64):
+                        if control.Stop: return
+                        local encoded = codec.Encode(rows)
+                        local decoded = codec.Decode(packet)
+                        if not encoded.Ok or not decoded.Ok or encoded.Value.length != 35 or decoded.Value.length != 8:
+                            throw "concurrent stable input failed"
+                        encoded.Value[3] = -999
+                        decoded.Value[0].Count = -999
+                        decoded.Value[1].Label = "changed"
+                        if turn % 4 == 0: wait(0)
+                        local fresh = codec.Decode(packet)
+                        if not fresh.Ok or fresh.Value[0].Count != 0 or fresh.Value[1].Label != "shared" or rows[0].Count != 0 or packet[3] != 0:
+                            throw "returned containers retained a shared mutable container"
+                        fresh.Value[0].Enabled = true
+                catch failure:
+                    errors.push(failure)
+                finally:
+                    done[worker] = true
+            )
+        local finished = WaitAll(done)
+        control.Stop = true
+        suite.Expect(finished, "all native copy workers completed")
+        suite.Equal(errors.length, 0, "copy workers had no failures")
+        suite.Equal(rows[0].Count, 0, "shared source row stayed stable")
+        suite.Equal(rows[0].Enabled, false, "returned record mutation did not affect source")
+        suite.Equal(packet[3], 0, "shared input packet stayed stable")
+    )
+
+    return suite.Report()
+
+return { Run = Run, RunConcurrent = RunConcurrent }

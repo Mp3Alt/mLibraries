@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Attach with the server fixture in a fresh two-player Creator Play session.
+if game.ServerId != "":
+    return
+local player = game.Players.LocalPlayer
+local player_deadline = host.time() + 5
+while player == nil and host.time() < player_deadline:
+    wait(0)
+    player = game.Players.LocalPlayer
+if player == nil or (player.UserId != -1 and player.UserId != -2):
+    return
+local suite = import("/mLibraries/mTestKit").New("mPacketWire")
+local codec = import("/mLibraries/mPacket").New({
+    Id = 73, Version = 2, MaxRecords = 4, MaxTextLength = 16,
+    Fields = [
+        { Name = "Id", Type = "integer", Min = 0, Max = 65535 },
+        { Name = "Amount", Type = "number", Min = -10, Max = 10 },
+        { Name = "Ready", Type = "boolean" },
+        { Name = "Label", Type = "string", MaxLength = 8 }
+    ]
+})
+local connections = []
+local stopped = false
+local response = nil
+local sequence = 0
+local unexpected = 0
+local Stop = func():
+    if stopped: return
+    stopped = true
+    for connection in connections: connection.Disconnect()
+    connections.clear()
+try:
+    connections.push(this.Removed.Connect(Stop))
+    local channel = world.WaitForChild("mPacketNativeTest", 10)
+    if channel == nil: throw "mPacket wire channel unavailable."
+    local request = channel.WaitForChild("Request", 5)
+    local reply = channel.WaitForChild("Reply", 5)
+    local ready = channel.WaitForChild("Ready", 5)
+    if request == nil or reply == nil or ready == nil or not ready.Value:
+        throw "mPacket wire channel is not ready."
+    connections.push(channel.Destroyed.Connect(Stop))
+    connections.push(reply.Connect(func(actor, correlation, ok, code, frame):
+        if stopped: return
+        if actor != player.UserId or correlation != sequence or response != nil:
+            unexpected += 1
+            return
+        response = { Actor = actor, Sequence = correlation, Ok = ok, Code = code, Frame = frame }
+    ))
+    local Exchange = func(frame):
+        sequence += 1
+        response = nil
+        if stopped: throw "mPacket wire fixture stopped."
+        request.Fire(sequence, frame)
+        local deadline = host.time() + 5
+        while not stopped and response == nil and host.time() < deadline:
+            wait(0)
+        local received = response
+        if received == nil: throw "mPacket wire acknowledgment timed out."
+        suite.Equal(unexpected, 0, "no other actor, correlation or duplicate reply")
+        suite.Equal(received.Actor, player.UserId, "engine-derived actor echoed privately")
+        suite.Equal(received.Sequence, sequence, "matching correlation")
+        return received
+    local Roundtrip = func(records):
+        local encoded = codec.Encode(records)
+        suite.Expect(encoded.Ok, "local encoding accepted")
+        local result = Exchange(encoded.Value)
+        suite.Equal(result.Ok, true, "server accepted canonical records")
+        suite.Equal(result.Code, "Ok", "success code")
+        local decoded = codec.Decode(result.Frame)
+        suite.Expect(decoded.Ok, "server echo decodes")
+        suite.Equal(decoded.Value.length, records.length, "row count")
+        for index in range(records.length):
+            for name in ["Id", "Amount", "Ready", "Label"]:
+                suite.Equal(decoded.Value[index][name], records[index][name], "private canonical field")
+    local Reject = func(frame, expected_code):
+        local result = Exchange(frame)
+        suite.Equal(result.Ok, false, "invalid frame rejected")
+        suite.Equal(result.Code, expected_code, "bounded failure code")
+        suite.Equal(result.Frame, nil, "raw invalid input is not forwarded")
+    local base = 100 - player.UserId
+    suite.Test("false zero and empty text survive both directions", func():
+        Roundtrip([{ Id = base, Amount = 0, Ready = false, Label = "" }])
+    )
+    suite.Test("distinct Unicode rows echo only to their actual sender", func():
+        Roundtrip([{ Id = base + 10, Amount = -10, Ready = true, Label = "星" }, { Id = base + 20, Amount = 10, Ready = false, Label = "é" }])
+    )
+    suite.Test("wrong schema and version are rejected", func():
+        Reject([74, 2, 0], "SchemaMismatch")
+        Reject([73, 3, 0], "SchemaMismatch")
+    )
+    suite.Test("malformed flat length is rejected", func():
+        Reject([73, 2, 1, base, 0, false], "InvalidPacket")
+    )
+    suite.Test("nested field values are rejected", func():
+        Reject([73, 2, 1, { Nested = true }, 0, false, ""], "InvalidValue")
+    )
+    suite.Test("field and total text bounds are enforced", func():
+        Reject([73, 2, 1, base, 0, false, "123456789"], "InvalidValue")
+        Reject([73, 2, 3, base, 0, false, "123456", base + 1, 0, true, "123456", base + 2, 0, false, "123456"], "TextLimit")
+    )
+    suite.Test("oversized native arrays fail before record decoding", func():
+        local frame = [73, 2, 0]
+        for index in range(513): frame.push(0)
+        Reject(frame, "InvalidPacket")
+        wait(0.1)
+        suite.Equal(unexpected, 0, "no cross-client replies during the final observation")
+    )
+catch failure:
+    suite.Test("native fixture setup", func(): throw failure)
+finally:
+    Stop()
+local report = suite.Report()
+print(report.Name + ": " + report.Passed + " passed, " + report.Failed + " failed; account #" + player.UserId)
+for failure in report.Failures: warn(failure)

@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Isolated Creator-only wire fixture; keep detached outside verification.
+if game.ServerId != "":
+    return
+if world.FindFirstChild("mPacketNativeTest") != nil:
+    throw "Restart Play before repeating mPacket wire checks."
+local codec = import("/mLibraries/mPacket").New({
+    Id = 73, Version = 2, MaxRecords = 4, MaxTextLength = 16,
+    Fields = [
+        { Name = "Id", Type = "integer", Min = 0, Max = 65535 },
+        { Name = "Amount", Type = "number", Min = -10, Max = 10 },
+        { Name = "Ready", Type = "boolean" },
+        { Name = "Label", Type = "string", MaxLength = 8 }
+    ]
+})
+local MakeGate = func():
+    local attempts = 0
+    local claims = 0
+    local gate = {}
+    gate.Take = func():
+        local attempt = attempts++
+        if attempt >= 32: return false
+        return claims++ == 0
+    gate.Release = func(): claims = 0
+    return gate
+local IsSequence = func(value):
+    try:
+        if value < 1 or value > 16 or math.is_nan(value) or math.is_infinite(value):
+            return false
+        local whole = math.floor(value)
+        return not (value < whole or value > whole)
+    catch invalid:
+        return false
+local gates = {}
+gates[-1] = MakeGate()
+gates[-2] = MakeGate()
+local stopped = false
+local connections = []
+local channel = new Folder() { Name = "mPacketNativeTest" }
+local request = new RemoteEvent() { Name = "Request", Parent = channel }
+local reply = new RemoteEvent() { Name = "Reply", Parent = channel }
+local Stop = func():
+    if stopped: return
+    stopped = true
+    for connection in connections: connection.Disconnect()
+    connections.clear()
+    channel.Destroy()
+connections.push(request.Connect(func(player, sequence, frame):
+    if stopped: return
+    local actor = player.UserId
+    if actor != -1 and actor != -2: return
+    local gate = gates[actor]
+    if not gate.Take(): return
+    local response = nil
+    try:
+        if not IsSequence(sequence): return
+        local result = codec.Decode(frame)
+        if result.Ok:
+            result = codec.Encode(result.Value)
+        if result.Ok:
+            response = { Ok = true, Code = "Ok", Frame = result.Value }
+        else:
+            response = { Ok = false, Code = result.Code, Frame = nil }
+    catch failure:
+        response = { Ok = false, Code = "InternalError", Frame = nil }
+    finally:
+        gate.Release()
+    if not stopped and response != nil:
+        try:
+            reply.FireTo(player, actor, sequence, response.Ok, response.Code, response.Frame)
+        catch disconnected:
+            pass
+))
+connections.push(this.Removed.Connect(Stop))
+connections.push(game.ShuttingDown.Connect(Stop))
+connections.push(channel.Destroyed.Connect(Stop))
+local ready = new BoolValue() { Name = "Ready", Value = true, Parent = channel }
+channel.Parent = world

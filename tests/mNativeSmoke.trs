@@ -8,6 +8,9 @@ local mRunAll = import("/mLibraries/tests/mRunAll")
 local mTestKit = import("/mLibraries/mTestKit")
 local mSignalSpec = import("/mLibraries/tests/mSignalSpec")
 local mCleanupSpec = import("/mLibraries/tests/mCleanupSpec")
+local mAsyncSpec = import("/mLibraries/tests/mAsyncSpec")
+local mPacketSpec = import("/mLibraries/tests/mPacketSpec")
+local mStateSpec = import("/mLibraries/tests/mStateSpec")
 
 local Await = func(job):
     for turn in range(300):
@@ -210,6 +213,9 @@ local Run = func(side):
     local concurrent = []
     concurrent.push(mSignalSpec.RunConcurrent())
     concurrent.push(mCleanupSpec.RunConcurrent())
+    concurrent.push(mAsyncSpec.RunConcurrent())
+    concurrent.push(mPacketSpec.RunConcurrent())
+    concurrent.push(mStateSpec.RunConcurrent())
     for report in concurrent:
         print("mLibraries concurrent " + side + " " + report.Name + ": " + report.Passed + " passed, " + report.Failed + " failed")
         for failure in report.Failures:

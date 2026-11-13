@@ -1,0 +1,184 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Atomic shared records. Use mData for profiles that need a session lease.
+# local store = import("/mLibraries/mStore").New({ Name = "World", Key = "Settings", Defaults = { Open = true } }, nil)
+# local saved = store.Update(expr(data, revision): { Ok = true, Value = { Open = false } })
+
+local FORMAT = "mStore/1"
+local MAX_REVISION = 9007199254740991
+local Fail = expr(code, message): { Ok = false, Code = code, Message = message }
+local Finite = func(value):
+    try: return (value < 0 or value >= 0) and not math.is_infinite(value)
+    catch invalid: return false
+local Whole = func(value, low, high):
+    if not Finite(value) or value < low or value > high: return false
+    local integer = math.floor(value)
+    return not (value < integer or value > integer)
+local Text = func(value, maximum):
+    try: return string.length(value) <= maximum
+    catch invalid: return false
+local Key = expr(value): Text(value, 50) and string.length(value) > 0 and not string.match(value, "[\\x00-\\x1f\\x7f]")
+local Record = func(value):
+    try:
+        table.keys(value)
+        return true
+    catch invalid: return false
+local Fields = func(value, allowed, maximum):
+    if not Record(value) or table.count(value) > maximum: return false
+    for key in table.keys(value):
+        if allowed[key] != true: return false
+    return true
+
+local CopyValue = func(value, budget, ancestors, depth):
+    budget.Nodes += 1
+    if budget.Nodes > 4096 or depth > 16: throw "mStore: data exceeds the structural limit"
+    if value == nil or value == true or value == false: return value
+    if Finite(value): return value
+    if Text(value, 65536):
+        budget.Text += string.length(value)
+        if budget.Text > 65536: throw "mStore: data exceeds the text limit"
+        return value
+    if ancestors.contains(value): throw "mStore: cyclic data is not supported"
+    local count = table.count(value)
+    if count > 4096: throw "mStore: data exceeds the structural limit"
+    local record = Record(value)
+    ancestors.push(value)
+    local result = nil
+    if record:
+        result = {}
+        for key in table.keys(value):
+            if not Text(key, 256): throw "mStore: data requires string keys"
+            budget.Text += string.length(key)
+            if budget.Text > 65536: throw "mStore: data exceeds the text limit"
+            result[key] = CopyValue(value[key], budget, ancestors, depth + 1)
+    else:
+        result = []
+        for index in range(value.length): result.push(CopyValue(value[index], budget, ancestors, depth + 1))
+    ancestors.pop()
+    return result
+local Copy = expr(value): CopyValue(value, { Nodes = 0, Text = 0 }, [], 0)
+local DataCopy = func(value):
+    if not Record(value): throw "mStore: data must be a root record"
+    return Copy(value)
+
+local New = func(config, runtime):
+    if not Fields(config, { Name = true, Key = true, Defaults = true, Version = true, Validate = true }, 5): throw "mStore: invalid configuration"
+    if not Key(config.Name) or not Key(config.Key): throw "mStore: Name and Key must be nonempty text of at most 50 characters"
+    local schema = config.Version
+    if schema == nil: schema = 1
+    if not Whole(schema, 1, 1000): throw "mStore: Version must be an integer from 1 to 1000"
+    local validate = config.Validate
+    local CheckedCopy = func(value):
+        local copy = DataCopy(value)
+        if validate != nil and validate(Copy(copy)) == false: throw "mStore: data failed validation"
+        return copy
+    local defaults = CheckedCopy(config.Defaults)
+    local key = config.Key
+    if runtime == nil: runtime = { Store = game.DataSystem.GetStore(config.Name) }
+    if runtime.Store == nil or runtime.Store.GetAsync == nil or runtime.Store.UpdateAsync == nil: throw "mStore: incomplete runtime adapter"
+    local backend = runtime.Store
+    local closed = false
+    local claims = 0
+
+    local Decode = func(value):
+        if value == nil: return { Ok = true, Value = Copy(defaults), Revision = 0 }
+        if not Fields(value, { Format = true, Schema = true, Revision = true, Data = true }, 4): return Fail("Corrupt", "The shared record is malformed.")
+        if value.Format != FORMAT or not Whole(value.Schema, 1, 1000) or not Whole(value.Revision, 0, MAX_REVISION): return Fail("Corrupt", "The shared record is malformed.")
+        if value.Schema > schema: return Fail("NewerSchema", "The shared record uses a newer schema.")
+        if value.Schema < schema: return Fail("SchemaMismatch", "The shared record requires an explicit migration.")
+        try: return { Ok = true, Value = CheckedCopy(value.Data), Revision = value.Revision }
+        catch invalid: return Fail("Corrupt", "The shared record contains invalid data.")
+    local Claim = func():
+        if closed: return Fail("Closed", "The shared record is closed.")
+        local ticket = claims++
+        if ticket != 0: return Fail("Busy", "Wait for the current shared-record operation.")
+        return nil
+    local Read = func(fresh):
+        if fresh != nil and fresh != true and fresh != false: return Fail("InvalidInput", "Fresh must be a boolean.")
+        local refused = Claim()
+        if refused != nil: return refused
+        try:
+            local result = nil
+            if fresh == true:
+                backend.UpdateAsync(key, func(current):
+                    result = Decode(current)
+                    return nil
+                )
+            else: result = Decode(backend.GetAsync(key))
+            if closed: return Fail("Closed", "The shared record closed before the operation was confirmed.")
+            if result == nil: return Fail("StoreError", "The shared record could not be confirmed.")
+            return result
+        catch unavailable:
+            return Fail("StoreError", "The shared record could not be confirmed.")
+        finally: claims = 0
+    local Update = func(transform):
+        if transform == nil: return Fail("InvalidInput", "An update function is required.")
+        local refused = Claim()
+        if refused != nil: return refused
+        try:
+            local rejected = nil
+            local revision = nil
+            local saved = backend.UpdateAsync(key, func(current):
+                rejected = nil
+                revision = nil
+                if closed:
+                    rejected = Fail("Closed", "The shared record is closed.")
+                    return nil
+                local before = Decode(current)
+                if closed:
+                    rejected = Fail("Closed", "The shared record is closed.")
+                    return nil
+                if not before.Ok:
+                    rejected = before
+                    return nil
+                local proposal = nil
+                try: proposal = transform(before.Value, before.Revision)
+                catch invalid:
+                    rejected = Fail("Transform", "The shared-record update function failed.")
+                    return nil
+                if closed:
+                    rejected = Fail("Closed", "The shared record is closed.")
+                    return nil
+                if not Record(proposal):
+                    rejected = Fail("InvalidProposal", "Return a shared-record update result.")
+                    return nil
+                if proposal.Ok == false:
+                    if not Fields(proposal, { Ok = true, Code = true, Message = true }, 3) or not Text(proposal.Code, 32) or string.length(proposal.Code) == 0 or not Text(proposal.Message, 256):
+                        rejected = Fail("InvalidProposal", "Return a bounded rejection code and message.")
+                    else: rejected = Fail(proposal.Code, proposal.Message)
+                    return nil
+                if proposal.Ok != true or not Fields(proposal, { Ok = true, Value = true }, 2):
+                    rejected = Fail("InvalidProposal", "Return a shared-record update result.")
+                    return nil
+                local data = nil
+                try: data = CheckedCopy(proposal.Value)
+                catch invalid:
+                    rejected = Fail("InvalidData", "The proposed shared record is invalid.")
+                    return nil
+                if closed:
+                    rejected = Fail("Closed", "The shared record is closed.")
+                    return nil
+                if before.Revision >= MAX_REVISION:
+                    rejected = Fail("RevisionLimit", "The shared record reached its revision limit.")
+                    return nil
+                revision = before.Revision + 1
+                return { Format = FORMAT, Schema = schema, Revision = revision, Data = data }
+            )
+            if closed: return Fail("Closed", "The shared record closed before the operation was confirmed.")
+            if rejected != nil: return rejected
+            if saved == nil or revision == nil: return Fail("StoreError", "The shared record could not be confirmed.")
+            local result = Decode(saved)
+            if closed: return Fail("Closed", "The shared record closed before the operation was confirmed.")
+            if not result.Ok or result.Revision != revision: return Fail("StoreError", "The shared record could not be confirmed.")
+            return result
+        catch unavailable:
+            return Fail("StoreError", "The shared record could not be confirmed.")
+        finally: claims = 0
+    return {
+        Read = Read,
+        Update = Update,
+        Destroy = func(): closed = true,
+        IsDestroyed = expr(): closed
+    }
+
+return { New = New }

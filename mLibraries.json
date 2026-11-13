@@ -2,22 +2,342 @@
   "formatVersion": 1,
   "name": "mLibraries",
   "author": "Mp3",
-  "version": "0.1.0-dev",
+  "version": "0.12.2-dev",
   "license": "MIT",
   "description": "Original TruScript utility libraries for TruWorlds. This is the repository's source map, not a native engine configuration file.",
   "modules": [
-    { "name": "mSignal", "source": "packages/mSignal/src/mSignal.trs", "path": "mLibraries/mSignal", "type": "module" },
-    { "name": "mCleanup", "source": "packages/mCleanup/src/mCleanup.trs", "path": "mLibraries/mCleanup", "type": "module" },
-    { "name": "mAsync", "source": "packages/mAsync/src/mAsync.trs", "path": "mLibraries/mAsync", "type": "module" }
+    {
+      "name": "mSignal",
+      "source": "packages/mSignal/src/mSignal.trs",
+      "path": "mLibraries/mSignal",
+      "type": "module"
+    },
+    {
+      "name": "mCleanup",
+      "source": "packages/mCleanup/src/mCleanup.trs",
+      "path": "mLibraries/mCleanup",
+      "type": "module"
+    },
+    {
+      "name": "mAsync",
+      "source": "packages/mAsync/src/mAsync.trs",
+      "path": "mLibraries/mAsync",
+      "type": "module"
+    },
+    {
+      "name": "mCommand",
+      "source": "packages/mCommand/src/mCommand.trs",
+      "path": "mLibraries/mCommand",
+      "type": "module"
+    },
+    {
+      "name": "mPacket",
+      "source": "packages/mPacket/src/mPacket.trs",
+      "path": "mLibraries/mPacket",
+      "type": "module"
+    },
+    {
+      "name": "mTopbar",
+      "source": "packages/mTopbar/src/mTopbar.trs",
+      "path": "mLibraries/mTopbar",
+      "type": "module"
+    },
+    {
+      "name": "mNet",
+      "source": "packages/mNet/src/mNet.trs",
+      "path": "mLibraries/mNet",
+      "type": "module"
+    },
+    {
+      "name": "mState",
+      "source": "packages/mState/src/mState.trs",
+      "path": "mLibraries/mState",
+      "type": "module"
+    },
+    {
+      "name": "mPlayer",
+      "source": "packages/mPlayer/src/mPlayer.trs",
+      "path": "mLibraries/mPlayer",
+      "type": "module"
+    },
+    {
+      "name": "mData",
+      "source": "packages/mData/src/mData.trs",
+      "path": "mLibraries/mData",
+      "type": "module"
+    },
+    {
+      "name": "mSpring",
+      "source": "packages/mSpring/src/mSpring.trs",
+      "path": "mLibraries/mSpring",
+      "type": "module"
+    },
+    {
+      "name": "mBind",
+      "source": "packages/mBind/src/mBind.trs",
+      "path": "mLibraries/mBind",
+      "type": "module"
+    },
+    {
+      "name": "mReactive",
+      "source": "packages/mReactive/src/mReactive.trs",
+      "path": "mLibraries/mReactive",
+      "type": "module"
+    },
+    {
+      "name": "mControls",
+      "source": "packages/mControls/src/mControls.trs",
+      "path": "mLibraries/mControls",
+      "type": "module"
+    },
+    {
+      "name": "mWidgets",
+      "source": "packages/mWidgets/src/mWidgets.trs",
+      "path": "mLibraries/mWidgets",
+      "type": "module"
+    },
+    {
+      "name": "mStore",
+      "source": "packages/mStore/src/mStore.trs",
+      "path": "mLibraries/mStore",
+      "type": "module"
+    },
+    {
+      "name": "mBan",
+      "source": "packages/mBan/src/mBan.trs",
+      "path": "mLibraries/mBan",
+      "type": "module"
+    },
+    {
+      "name": "mMessaging",
+      "source": "packages/mMessaging/src/mMessaging.trs",
+      "path": "mLibraries/mMessaging",
+      "type": "module"
+    }
   ],
+  "runtime": [],
   "tests": [
-    { "source": "tests/mTestKit.trs", "path": "mLibraries/mTestKit", "type": "module" },
-    { "source": "tests/mSignal.spec.trs", "path": "mLibraries/tests/mSignalSpec", "type": "module" },
-    { "source": "tests/mCleanup.spec.trs", "path": "mLibraries/tests/mCleanupSpec", "type": "module" },
-    { "source": "tests/mAsync.spec.trs", "path": "mLibraries/tests/mAsyncSpec", "type": "module" },
-    { "source": "tests/mRunAll.trs", "path": "mLibraries/tests/mRunAll", "type": "module" },
-    { "source": "tests/mNativeSmoke.trs", "path": "mLibraries/tests/mNativeSmoke", "type": "module" },
-    { "source": "tests/mNativeSmokeServer.trs", "path": "mLibraries/tests/mNativeSmokeServer", "type": "server", "attach_to": ["ScriptSystem/mLibrariesTests"] },
-    { "source": "tests/mNativeSmokeClient.trs", "path": "mLibraries/tests/mNativeSmokeClient", "type": "client", "attach_to": ["ScriptSystem/mLibrariesTests"] }
+    {
+      "source": "tests/mTestKit.trs",
+      "path": "mLibraries/mTestKit",
+      "type": "module"
+    },
+    {
+      "source": "tests/mSignal.spec.trs",
+      "path": "mLibraries/tests/mSignalSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mCleanup.spec.trs",
+      "path": "mLibraries/tests/mCleanupSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mAsync.spec.trs",
+      "path": "mLibraries/tests/mAsyncSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mRunAll.trs",
+      "path": "mLibraries/tests/mRunAll",
+      "type": "module"
+    },
+    {
+      "source": "tests/mNativeSmoke.trs",
+      "path": "mLibraries/tests/mNativeSmoke",
+      "type": "module"
+    },
+    {
+      "source": "tests/mNativeSmokeServer.trs",
+      "path": "mLibraries/tests/mNativeSmokeServer",
+      "type": "server"
+    },
+    {
+      "source": "tests/mNativeSmokeClient.trs",
+      "path": "mLibraries/tests/mNativeSmokeClient",
+      "type": "client"
+    },
+    {
+      "source": "tests/mCommand.spec.trs",
+      "path": "mLibraries/tests/mCommandSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mPacket.spec.trs",
+      "path": "mLibraries/tests/mPacketSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mPacketNativeServer.trs",
+      "path": "mLibraries/tests/mPacketNativeServer",
+      "type": "server"
+    },
+    {
+      "source": "tests/mPacketNativeClient.trs",
+      "path": "mLibraries/tests/mPacketNativeClient",
+      "type": "client"
+    },
+    {
+      "source": "tests/mTopbarNativeClient.trs",
+      "path": "mLibraries/tests/mTopbarNativeClient",
+      "type": "client"
+    },
+    {
+      "source": "tests/mTopbarPreviewClient.trs",
+      "path": "mLibraries/tests/mTopbarPreviewClient",
+      "type": "client"
+    },
+    {
+      "source": "tests/mNet.spec.trs",
+      "path": "mLibraries/tests/mNetSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mState.spec.trs",
+      "path": "mLibraries/tests/mStateSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mPlayer.spec.trs",
+      "path": "mLibraries/tests/mPlayerSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mData.spec.trs",
+      "path": "mLibraries/tests/mDataSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mSpring.spec.trs",
+      "path": "mLibraries/tests/mSpringSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mNetNativeServer.trs",
+      "path": "mLibraries/tests/mNetNativeServer",
+      "type": "server"
+    },
+    {
+      "source": "tests/mNetNativeClient.trs",
+      "path": "mLibraries/tests/mNetNativeClient",
+      "type": "client"
+    },
+    {
+      "source": "tests/mPlayerNativeServer.trs",
+      "path": "mLibraries/tests/mPlayerNativeServer",
+      "type": "server"
+    },
+    {
+      "source": "tests/mPlayerNativeClient.trs",
+      "path": "mLibraries/tests/mPlayerNativeClient",
+      "type": "client"
+    },
+    {
+      "source": "tests/mDataNativeServer.trs",
+      "path": "mLibraries/tests/mDataNativeServer",
+      "type": "server"
+    },
+    {
+      "source": "tests/mStateNativeClient.trs",
+      "path": "mLibraries/tests/mStateNativeClient",
+      "type": "client"
+    },
+    {
+      "source": "tests/mBind.spec.trs",
+      "path": "mLibraries/tests/mBindSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mBind.concurrent.trs",
+      "path": "mLibraries/tests/mBindConcurrentSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mReactive.spec.trs",
+      "path": "mLibraries/tests/mReactiveSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mControls.spec.trs",
+      "path": "mLibraries/tests/mControlsSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mWidgets.spec.trs",
+      "path": "mLibraries/tests/mWidgetsSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mUiNativeServer.trs",
+      "path": "mLibraries/tests/mUiNativeServer",
+      "type": "server"
+    },
+    {
+      "source": "tests/mUiNativeClient.trs",
+      "path": "mLibraries/tests/mUiNativeClient",
+      "type": "client"
+    },
+    {
+      "source": "tests/mStore.spec.trs",
+      "path": "mLibraries/tests/mStoreSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mBan.spec.trs",
+      "path": "mLibraries/tests/mBanSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mMessaging.spec.trs",
+      "path": "mLibraries/tests/mMessagingSpec",
+      "type": "module"
+    },
+    {
+      "source": "tests/mSharedStoreNativeServer.trs",
+      "path": "mLibraries/tests/mSharedStoreNativeServer",
+      "type": "server"
+    },
+    {
+      "source": "tests/mLibraryAuditNativeServer.trs",
+      "path": "mLibraries/tests/mLibraryAuditNativeServer",
+      "type": "server"
+    },
+    {
+      "source": "tests/mLibraryAuditNativeClient.trs",
+      "path": "mLibraries/tests/mLibraryAuditNativeClient",
+      "type": "client"
+    },
+    {
+      "source": "tests/mLibraryLoadBench.trs",
+      "path": "mLibraries/tests/mLibraryLoadBench",
+      "type": "module"
+    },
+    {
+      "source": "tests/mLibraryLoadBenchServer.trs",
+      "path": "mLibraries/tests/mLibraryLoadBenchServer",
+      "type": "server"
+    },
+    {
+      "source": "tests/mNetLoadServer.trs",
+      "path": "mLibraries/tests/mNetLoadServer",
+      "type": "server"
+    },
+    {
+      "source": "tests/mNetLoadClient.trs",
+      "path": "mLibraries/tests/mNetLoadClient",
+      "type": "client"
+    },
+    {
+      "source": "tests/mTopbarLoadBench.trs",
+      "path": "mLibraries/tests/mTopbarLoadBench",
+      "type": "module"
+    }
+  ],
+  "examples": [
+    {
+      "source": "examples/mUiGallery.client.trs",
+      "path": "mLibraries/examples/mUiGallery",
+      "type": "client"
+    }
   ]
 }

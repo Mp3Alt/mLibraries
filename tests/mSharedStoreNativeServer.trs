@@ -1,0 +1,184 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Run alone in Creator with Live data in playtests visibly disabled.
+# Phase 1 seeds confirmed local policy; Phase 2 verifies it after Stop and restart.
+if game.ServerId != "": throw "Shared-store native checks require a Creator playtest."
+
+local mStore = import("/mLibraries/mStore")
+local mBan = import("/mLibraries/mBan")
+local mMessaging = import("/mLibraries/mMessaging")
+local suite = import("/mLibraries/mTestKit").New("mSharedStoreNative")
+local name = "mLibrariesSharedTest1"
+local policy_key = "fixture-policy"
+local marker_key = "fixture-restart"
+local topic = "fixture-channel"
+local backend = game.DataSystem.GetStore(name)
+local bans = mBan.New({ Limit = 8 })
+local marker = backend.GetAsync(marker_key)
+local phase = 1
+if marker != nil:
+    if marker.Format != "mSharedStoreNative/1" or (marker.Phase != 0 and marker.Phase != 1 and marker.Phase != 2): throw "The shared-store fixture marker is not recognized."
+    if marker.Phase == 1: phase = 2
+local Defaults = func():
+    return { Roles = {}, Bans = {}, Settings = { ServerLocked = false, LogCommands = true }, Zero = 0, Enabled = true, Count = 0 }
+local NewPolicy = func():
+    return mStore.New({ Name = name, Key = policy_key, Defaults = Defaults(), Validate = func(value): bans.Validate(value.Bans) }, nil)
+local policy_a = NewPolicy()
+local policy_b = NewPolicy()
+local policy_c = nil
+local channel_store = mStore.New({ Name = name, Key = "topic:" + topic, Defaults = { Sequence = 0, Messages = [] } }, nil)
+local writer = nil
+local reader = nil
+local connection = nil
+local offset = { Seconds = 0 }
+local Clock = expr(): host.time() + offset.Seconds
+local received = []
+local Config = expr(): { Name = name, Topic = topic, Capacity = 2, PollSeconds = 10, MaxAge = 20 }
+local issue_time = host.time()
+
+try:
+    if phase == 1:
+        suite.Test("native atomic policy save retains zero false roles and settings", func():
+            local seeded = policy_a.Update(func(data, revision):
+                data = Defaults()
+                data.Roles["-2"] = "Moderator"
+                data.Settings.ServerLocked = true
+                data.Settings.LogCommands = false
+                data.Enabled = false
+                data.Count = 7
+                local changed = bans.Set(data.Bans, {
+                    Id = "native-permanent-v1", UserId = -2, Name = "Fixture target",
+                    ActorId = -1, Actor = "Fixture owner", Reason = "Native storage fixture",
+                    IssuedAt = issue_time, ExpiresAt = 0
+                }, issue_time)
+                if not changed.Ok: return changed
+                data.Bans = changed.Value
+                return { Ok = true, Value = data }
+            )
+            suite.Expect(seeded.Ok, "native update confirmed")
+            local loaded = policy_b.Read(true)
+            suite.Expect(loaded.Ok, "fresh independent reader confirmed")
+            suite.Equal(loaded.Value.Zero, 0, "zero persisted")
+            suite.Equal(loaded.Value.Enabled, false, "false persisted")
+            suite.Equal(loaded.Value.Settings.ServerLocked, true, "true setting persisted")
+            suite.Equal(loaded.Value.Settings.LogCommands, false, "false setting persisted")
+            suite.Equal(loaded.Value.Roles["-2"], "Moderator", "role persisted")
+        )
+        suite.Test("independent native writer merges the latest stored policy", func():
+            local updated = policy_b.Update(func(data, revision):
+                data.Count += 1
+                return { Ok = true, Value = data }
+            )
+            suite.Expect(updated.Ok, "second writer confirmed")
+            local loaded = policy_a.Read(true)
+            suite.Expect(loaded.Ok, "first instance reads latest storage")
+            suite.Equal(loaded.Value.Count, 8, "merge retained original count")
+            suite.Equal(loaded.Value.Roles["-2"], "Moderator", "unrelated role retained")
+            suite.Equal(loaded.Value.Settings.LogCommands, false, "unrelated false setting retained")
+        )
+        suite.Test("permanent ban metadata survives a fresh native service", func():
+            policy_c = NewPolicy()
+            local loaded = policy_c.Read(true)
+            suite.Expect(loaded.Ok, "third service confirmed")
+            local record = bans.Get(loaded.Value.Bans, -2, host.time())
+            suite.Expect(record != nil, "permanent ban active")
+            suite.Equal(record.ExpiresAt, 0, "permanent expiry retained")
+            suite.Equal(record.ActorId, -1, "issuer identity retained")
+            suite.Equal(record.Reason, "Native storage fixture", "reason retained")
+            suite.Equal(bans.Remove(loaded.Value.Bans, -2, "stale-id", host.time()).Code, "Conflict", "stale removal cannot target current ban")
+        )
+        suite.Test("native messaging reads ordered history after a real cache interval", func():
+            suite.Expect(channel_store.Update(expr(data, revision): { Ok = true, Value = { Sequence = 0, Messages = [] } }).Ok, "owned test topic initialized")
+            writer = mMessaging.New(Config(), { Store = backend, Clock = Clock })
+            reader = mMessaging.New(Config(), { Store = backend, Clock = Clock })
+            connection = reader.Subscribe(func(message): received.push(message))
+            suite.Expect(writer.Step().Ok and reader.Step().Ok, "both independent cursors initialized")
+            suite.Expect(writer.Publish({ Kind = "evicted" }).Ok, "first native publication")
+            suite.Expect(writer.Publish({ Kind = "retained", Count = 0, Enabled = false }).Ok, "second native publication")
+            suite.Expect(writer.Publish({ Kind = "latest" }).Ok, "third native publication")
+            wait(10.1)
+            local result = reader.Step()
+            suite.Expect(result.Ok, "native poll confirmed")
+            suite.Equal(result.Value.Delivered, 2, "retained suffix delivered")
+            suite.Equal(result.Value.Missed, 1, "evicted sequence reported")
+            suite.Equal(received.length, 2, "two actual subscriber calls")
+            suite.Equal(received[0].Data.Count, 0, "zero crossed native storage")
+            suite.Equal(received[0].Data.Enabled, false, "false crossed native storage")
+            suite.Equal(received[1].Data.Kind, "latest", "sequence order retained")
+        )
+        suite.Test("native messaging consumes duplicates and expires retained entries", func():
+            suite.Expect(reader != nil and writer != nil, "messaging setup completed")
+            offset.Seconds += 10
+            local duplicate = reader.Step()
+            suite.Expect(duplicate.Ok, "repeat native read confirmed")
+            suite.Equal(duplicate.Value.Delivered, 0, "same sequence not dispatched twice")
+            suite.Expect(writer.Publish({ Kind = "expires" }).Ok, "expiry fixture published")
+            offset.Seconds += 21
+            local expired = reader.Step()
+            suite.Expect(expired.Ok, "expiry read confirmed")
+            suite.Equal(expired.Value.Delivered, 0, "expired message skipped")
+            suite.Equal(expired.Value.Expired, 1, "expiry reported once")
+            suite.Equal(received.length, 2, "expired entry did not invoke subscriber")
+        )
+        suite.Test("native messaging teardown disconnects its owned subscriber", func():
+            suite.Expect(reader != nil and writer != nil and connection != nil, "messaging setup completed")
+            reader.Destroy()
+            writer.Destroy()
+            suite.Equal(connection.IsConnected(), false, "subscriber disconnected")
+            suite.Equal(reader.Step().Code, "Closed", "closed channel does not read")
+            suite.Equal(writer.Publish({}).Code, "Closed", "closed channel does not write")
+        )
+    else:
+        suite.Test("roles and settings survive a real Creator playtest restart", func():
+            local loaded = policy_a.Read(true)
+            suite.Expect(loaded.Ok, "previous-playtest policy loaded fresh")
+            suite.Equal(loaded.Value.Count, 8, "previous native merge retained")
+            suite.Equal(loaded.Value.Zero, 0, "zero survived restart")
+            suite.Equal(loaded.Value.Enabled, false, "false survived restart")
+            suite.Equal(loaded.Value.Roles["-2"], "Moderator", "role survived restart")
+            suite.Equal(loaded.Value.Settings.ServerLocked, true, "true setting survived restart")
+            suite.Equal(loaded.Value.Settings.LogCommands, false, "false setting survived restart")
+        )
+        suite.Test("permanent ban survives the previous playtest", func():
+            local loaded = policy_b.Read(true)
+            suite.Expect(loaded.Ok, "ban record loaded")
+            local record = bans.Get(loaded.Value.Bans, -2, host.time())
+            suite.Expect(record != nil, "ban remains active")
+            suite.Equal(record.Id, "native-permanent-v1", "ban identity survived")
+            suite.Equal(record.ExpiresAt, 0, "permanent marker survived")
+            suite.Equal(record.ActorId, -1, "issuer identity survived")
+            suite.Equal(record.Reason, "Native storage fixture", "reason survived")
+        )
+
+finally:
+    if reader != nil: reader.Destroy()
+    if writer != nil: writer.Destroy()
+    suite.Test("the fixture clears only its owned temporary message topic", func():
+        local cleared = channel_store.Update(expr(data, revision): { Ok = true, Value = { Sequence = 0, Messages = [] } })
+        suite.Expect(cleared.Ok, "temporary topic cleanup confirmed")
+    )
+    channel_store.Destroy()
+    if policy_c != nil: policy_c.Destroy()
+
+if suite.Report().Failed == 0:
+    if phase == 1:
+        suite.Test("phase one marker is stored only after confirmed checks", func():
+            local stamp = host.time()
+            local saved = backend.UpdateAsync(marker_key, expr(current): { Format = "mSharedStoreNative/1", Phase = 1, SavedAt = stamp })
+            suite.Expect(saved != nil and saved.Phase == 1, "restart marker confirmed")
+        )
+    else:
+        suite.Test("phase two resets only the fixture policy and completion marker", func():
+            suite.Expect(policy_a.Update(expr(data, revision): { Ok = true, Value = Defaults() }).Ok, "owned policy cleanup confirmed")
+            local stamp = host.time()
+            local saved = backend.UpdateAsync(marker_key, expr(current): { Format = "mSharedStoreNative/1", Phase = 2, SavedAt = stamp })
+            suite.Expect(saved != nil and saved.Phase == 2, "completion marker confirmed")
+        )
+policy_a.Destroy()
+policy_b.Destroy()
+local report = suite.Report()
+print("mSharedStoreNative Phase " + phase + ": " + report.Passed + " passed, " + report.Failed + " failed")
+for failure in report.Failures: warn(failure)
+if report.Failed == 0:
+    print(phase == 1 and "mSharedStoreNative Phase1Passed: stop and restart Play to verify retained policy." or "mSharedStoreNative Phase2Passed: restart persistence verified; detach the fixture.")
+else: throw "mSharedStoreNative checks failed. The restart marker was not advanced."

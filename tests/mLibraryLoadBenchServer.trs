@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Temporary Creator-only Server runner. Attach to an independent benchmark host.
+# Read world/mLibraryLoadReports after Status becomes complete or failed.
+# The operator must verify that Creator live data is disabled before this run.
+
+local Phase = "server-before"
+
+if game.ServerId != "": throw "The library load runner requires a Creator playtest."
+if Phase != "server-before" and Phase != "server-after": throw "Invalid server benchmark phase."
+if world.FindFirstChild("mLibraryLoadReports") != nil: throw "A library load report already exists."
+
+local bench = import("/mLibraries/tests/mLibraryLoadBench")
+local folder = new Folder() { Name = "mLibraryLoadReports", Parent = world }
+local status = new StringValue() { Name = "Status", Value = "waiting", Parent = folder }
+local progress = new StringValue() { Name = "Progress", Value = "0", Parent = folder }
+local export_status = new StringValue() { Name = "Export", Value = "pending", Parent = folder }
+local export_store = game.DataSystem.GetStore("mLibrariesBench")
+
+local Save = func(name, value):
+    local encoded = game.HttpSystem.JsonEncode(value)
+    local stored = new Folder() { Name = name, Parent = folder }
+    local cursor = 0
+    while cursor < string.length(encoded):
+        new StringValue() { Name = tostring(cursor), Value = string.substring(encoded, cursor, math.min(900, string.length(encoded) - cursor)), Parent = stored }
+        cursor += 900
+
+local Export = func(key, value):
+    export_status.Value = "saving:" + key
+    try:
+        export_store.SetAsync(key, value)
+        export_status.Value = "saved:" + key
+        return true
+    catch failed:
+        export_status.Value = "failed:" + key
+        return false
+
+local RunServer = func():
+    try:
+        # Startup and reporting are outside the measured library operations.
+        wait(10)
+        status.Value = "smoke"
+        local smoke = []
+        for entry in bench.List():
+            smoke.push(bench.Measure(entry.Name, 1))
+            wait(0.01)
+        Save("Smoke", smoke)
+        status.Value = "running"
+        local completed = 0
+        local report = bench.Run({ TargetMs = 30, Trials = 5, MaxSeconds = 180 }, {
+            Yield = func(): wait(0.01),
+            Sample = func(sample):
+                completed += 1
+                progress.Value = completed + ":" + sample.Name + ":" + sample.Trial
+        })
+        Save("Server", report)
+        local saved = Export(Phase, { Kind = "mLibraries server CPU receipts", Phase = Phase, Smoke = smoke, Server = report, ExportedAt = host.time() })
+        if report.Truncated or report.Failures.length > 0:
+            status.Value = "failed"
+            print("mLibraryLoadBench: failed; samples=" + report.Samples.length + "; failures=" + report.Failures.length + "; truncated=" + report.Truncated)
+        else:
+            if saved: status.Value = "complete"
+            else: status.Value = "failed"
+            print("mLibraryLoadBench: complete; cases=" + bench.List().length + "; samples=" + report.Samples.length + "; exported=" + saved)
+    catch failure:
+        local receipt = { Error = tostring(failure), At = host.time() }
+        Save("Failure", receipt)
+        Export(Phase, { Kind = "mLibraries server CPU failure", Phase = Phase, Failure = receipt })
+        status.Value = "failed"
+        print("mLibraryLoadBench: failed; see the stored Failure receipt.")
+
+RunServer()

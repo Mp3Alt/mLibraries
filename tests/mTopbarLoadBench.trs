@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Creator-only dock characterization. Call Run from local Player -1 and export its returned report.
+local Topbar = import("/mLibraries/mTopbar")
+local NAME = "mTopbarPerformance"
+local Require = func(condition, message):
+    if not condition: throw "mTopbarLoad: " + message
+
+local Run = func():
+    Require(game.ServerId == "", "use a local Creator playtest")
+    local player = game.Players.LocalPlayer
+    Require(player != nil and player.UserId == -1, "only local Player -1 runs this workload")
+    Require(game.UICanvas.FindFirstChild(NAME) == nil, "fixture name is occupied")
+    local started = host.time()
+    local last_time = started
+    local CheckTime = func():
+        local now = host.time()
+        Require(now >= last_time and now < started + 30, "clock or thirty-second deadline")
+        last_time = now
+        return now
+    local Frames = func(count):
+        for index in range(count):
+            CheckTime()
+            wait(0)
+    local WaitSpan = func(seconds):
+        local end_at = CheckTime() + seconds
+        while CheckTime() < end_at: wait(0)
+    local OwnedCount = func():
+        local root = game.UICanvas.FindFirstChild(NAME)
+        if root == nil: return 0
+        return 1 + root.GetDescendants().length
+    local NewPair = func():
+        local bar = Topbar.New({ Name = NAME, LeftInset = 168, RightInset = 8, TopInset = 64, AutoDestroy = false })
+        try:
+            local first = bar.Add({ Name = "mLoadA", Label = "A" })
+            local second = bar.Add({ Name = "mLoadB", Label = "B" })
+            local dock = bar.Dock(first, second)
+            Require(bar.GetCount() == 2, "dock setup did not register two icons")
+            return { Bar = bar, First = first, Second = second, Dock = dock }
+        catch problem:
+            bar.Destroy()
+            throw problem
+    local pair = nil
+    local samples = []
+    local lifetimes = []
+    local initial_canvas = game.UICanvas.GetDescendants().length
+    local Observe = func(index, active):
+        pair.First.SetEnabled(true)
+        pair.Second.SetEnabled(true)
+        WaitSpan(0.25)
+        local count = 0
+        local invalid = 0
+        local total = 0
+        local maximum = 0
+        local setters = 0
+        local setter_ms = 0
+        local enabled = true
+        local observing = true
+        local begin = CheckTime()
+        local next_change = begin
+        local before = OwnedCount()
+        local connection = game.TimeSystem.FrameStepped.Connect(func(delta):
+            if not observing: return
+            if math.is_nan(delta) or math.is_infinite(delta) or delta < 0:
+                invalid += 1
+                return
+            count += 1
+            total += delta
+            if delta > maximum: maximum = delta
+        )
+        try:
+            while true:
+                local now = CheckTime()
+                if now - begin >= 1: break
+                if active and now >= next_change:
+                    enabled = not enabled
+                    local setter_start = CheckTime()
+                    pair.First.SetEnabled(enabled)
+                    pair.Second.SetEnabled(enabled)
+                    setter_ms += (CheckTime() - setter_start) * 1000
+                    setters += 2
+                    next_change = now + 0.23
+                wait(0)
+        finally:
+            observing = false
+            connection.Disconnect()
+        local finish = CheckTime()
+        Require(count > 0 and invalid == 0, "invalid native frame observation")
+        local kind = "idle"
+        if active: kind = "active_alpha_targets"
+        samples.push({
+            Pair = index,
+            Kind = kind,
+            StartedAt = begin,
+            FinishedAt = finish,
+            WallSeconds = finish - begin,
+            Frames = count,
+            MeanFrameMs = total * 1000 / count,
+            MaxFrameMs = maximum * 1000,
+            SetterCalls = setters,
+            SetterWallMs = setter_ms,
+            OwnedBefore = before,
+            OwnedAtEnd = OwnedCount()
+        })
+    try:
+        pair = NewPair()
+        WaitSpan(0.3)
+        for index in range(5):
+            if index % 2 == 0:
+                Observe(index, false)
+                Observe(index, true)
+            else:
+                Observe(index, true)
+                Observe(index, false)
+        pair.Bar.Destroy()
+        pair = nil
+        Frames(2)
+        Require(OwnedCount() == 0, "sample dock did not retire")
+        for index in range(3):
+            local before_canvas = game.UICanvas.GetDescendants().length
+            local build_start = CheckTime()
+            pair = NewPair()
+            local build_ms = (CheckTime() - build_start) * 1000
+            WaitSpan(0.25)
+            local built = OwnedCount()
+            local destroy_start = CheckTime()
+            pair.Bar.Destroy()
+            local destroy_ms = (CheckTime() - destroy_start) * 1000
+            pair = nil
+            Frames(2)
+            local retired = OwnedCount()
+            Require(retired == 0, "lifetime dock did not retire")
+            lifetimes.push({
+                Cycle = index,
+                BuildWallMs = build_ms,
+                DestroyWallMs = destroy_ms,
+                OwnedBuilt = built,
+                OwnedAfter = retired,
+                CanvasDelta = game.UICanvas.GetDescendants().length - before_canvas
+            })
+    finally:
+        if pair != nil: pair.Bar.Destroy()
+    return {
+        Name = "mTopbarLoad",
+        Version = 1,
+        Player = player.UserId,
+        StartedAt = started,
+        FinishedAt = host.time(),
+        Samples = samples,
+        Lifetimes = lifetimes,
+        CanvasBefore = initial_canvas,
+        CanvasAfter = game.UICanvas.GetDescendants().length,
+        OwnedAfter = OwnedCount(),
+        Scope = "Two docked fallback labels; automatic native frame driver; idle versus native alpha target changes. Frame intervals are not isolated callback CPU; hover, held and cross-cell motion are not exercised."
+    }
+
+return { Run = Run }

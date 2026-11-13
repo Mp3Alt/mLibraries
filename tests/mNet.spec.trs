@@ -1,0 +1,520 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mNet = import("/mLibraries/mNet")
+local mTestKit = import("/mLibraries/mTestKit")
+local Harness = func(options):
+    if options == nil: options = {}
+    local h = {
+        Now = 0, Peer = {}, Out = [], Replies = [], Auto = false, Allow = true, Valid = true,
+        Authorizations = 0, Validations = 0, Runs = 0, ServerClosed = 0, ClientClosed = 0, FailSend = false, BadClock = false
+    }
+    local clock = func():
+        if h.BadClock: throw "private clock failure"
+        return h.Now
+    local burst = options.Burst
+    if burst == nil: burst = 64
+    local rate = options.Rate
+    if rate == nil: rate = 0
+    h.Server = mNet.NewServer({ Clock = clock, Burst = burst, Rate = rate, MaxPeers = options.MaxPeers, MaxInFlight = options.MaxInFlight,
+        Connect = func(receive):
+            h.ServerReceive = receive
+            return { Disconnect = func(): h.ServerClosed += 1 }
+        , Send = func(peer, wire):
+            h.Replies.push({ Peer = peer, Wire = wire })
+            if h.Auto: h.ClientReceive(wire)
+    })
+    h.Client = mNet.NewClient({ Clock = clock, Timeout = options.Timeout, MaxPending = options.MaxPending,
+        Connect = func(receive):
+            h.ClientReceive = receive
+            return { Disconnect = func(): h.ClientClosed += 1 }
+        , Send = func(wire):
+            if h.FailSend: throw "private transport failure"
+            h.Out.push(wire)
+            if h.Auto: h.ServerReceive(h.Peer, wire)
+    })
+    h.Server.Register({ Name = "echo", Kind = "Request", Authorize = func(context):
+        h.Authorizations += 1
+        h.Context = context
+        return h.Allow
+    , Validate = func(value):
+        h.Validations += 1
+        return { Ok = h.Valid, Value = value }
+    , Run = func(context, value):
+        h.Runs += 1
+        return value
+    })
+    h.Deliver = func():
+        h.ServerReceive(h.Peer, h.Out[h.Out.length - 1])
+        h.ClientReceive(h.Replies[h.Replies.length - 1].Wire)
+    return h
+
+local With = func(options, work):
+    local h = Harness(options)
+    try: work(h)
+    finally:
+        h.Client.Destroy()
+        h.Server.Destroy()
+
+local Run = func():
+    local suite = mTestKit.New("mNet")
+    suite.Test("queued request roundtrip preserves the actual transport sender", func():
+        With(nil, func(h):
+            local call = h.Client.Request("echo", { UserId = "forged", Value = 7 })
+            suite.Equal(call.GetOutcome().Status, "Pending", "initial pending")
+            h.Deliver()
+            suite.Equal(call.GetOutcome().Status, "Succeeded", "completed")
+            suite.Equal(call.GetOutcome().Value.Value, 7, "payload preserved")
+            suite.Equal(h.Context.Sender, h.Peer, "actor supplied by transport")
+            suite.Equal(h.Replies[0].Peer, h.Peer, "reply targets the same sender")
+        )
+    )
+    suite.Test("nil false and zero survive successful replies", func():
+        With(nil, func(h):
+            for value in [nil, false, 0]:
+                local call = h.Client.Request("echo", value)
+                h.Deliver()
+                suite.Expect(call.GetOutcome().Ok, "explicit successful status")
+                suite.Equal(call.GetOutcome().Value, value, "falsy result")
+        )
+    )
+    suite.Test("immediate injected delivery is safe before Request returns", func():
+        With(nil, func(h):
+            h.Auto = true
+            local callbacks = 0
+            local call = h.Client.Request("echo", false, func(outcome): callbacks += 1)
+            suite.Equal(call.GetOutcome().Status, "Succeeded", "inline completion retained")
+            suite.Equal(callbacks, 1, "callback once")
+        )
+    )
+    suite.Test("authorization denies before validation and handler execution", func():
+        With(nil, func(h):
+            h.Allow = false
+            local call = h.Client.Request("echo", 1)
+            h.Deliver()
+            suite.Equal(call.GetOutcome().Code, "Denied", "fixed denial")
+            suite.Equal(h.Validations, 0, "validator not reached")
+            suite.Equal(h.Runs, 0, "handler not reached")
+        )
+    )
+    suite.Test("authorization requires literal true", func():
+        With(nil, func(h):
+            for value in [nil, 0, 1, "true", {}]:
+                h.Allow = value
+                local call = h.Client.Request("echo", 0)
+                h.Deliver()
+                suite.Equal(call.GetOutcome().Code, "Denied", "truthy values do not authorize")
+            suite.Equal(h.Runs, 0, "no execution")
+        )
+    )
+    suite.Test("validation failures do not expose private values", func():
+        With(nil, func(h):
+            h.Valid = false
+            local call = h.Client.Request("echo", 1)
+            h.Deliver()
+            suite.Equal(call.GetOutcome().Code, "ValidationError", "generic validation result")
+            suite.Equal(call.GetOutcome().Value, nil, "no partial data")
+            suite.Equal(h.Runs, 0, "no handler")
+        )
+    )
+    suite.Test("unknown routes and kind mismatches do not execute handlers", func():
+        With(nil, func(h):
+            local call = h.Client.Request("missing", 0)
+            h.Deliver()
+            suite.Equal(call.GetOutcome().Code, "UnknownRoute", "unknown request")
+            suite.Expect(h.Client.Send("echo", 0).Ok, "event transport accepted")
+            h.ServerReceive(h.Peer, h.Out[h.Out.length - 1])
+            suite.Equal(h.Runs, 0, "request route was not invoked as event")
+        )
+    )
+    suite.Test("events execute once and produce no reply", func():
+        With(nil, func(h):
+            local received = nil
+            h.Server.Register({ Name = "event", Kind = "Event", Authorize = expr(context): true, Validate = mNet.NoPayload, Run = func(context, value): received = context.Sender })
+            h.Client.Send("event", nil)
+            h.ServerReceive(h.Peer, h.Out[0])
+            suite.Equal(received, h.Peer, "event reached authorized handler")
+            suite.Equal(h.Replies.length, 0, "no event reply")
+        )
+    )
+    suite.Test("malformed envelopes never invoke supplied methods or hooks", func():
+        With(nil, func(h):
+            local called = false
+            local forged = { length = 5, index_of = func(value): called = true }
+            for wire in [nil, false, 0, "wire", {}, forged, [], [1, 1, 1, "echo"], [1, 1, 1, "echo", 0, 0]]:
+                h.ServerReceive(h.Peer, wire)
+            suite.Equal(called, false, "forged method not used")
+            suite.Equal(h.Authorizations, 0, "hooks untouched")
+            suite.Equal(h.Replies.length, 0, "no malformed reflection")
+        )
+    )
+    suite.Test("headers require strict bounded whole-number correlation values", func():
+        With(nil, func(h):
+            for wire in [[1 + 1e-12, 1, 1, "echo", 0], [1, 1 + 1e-12, 1, "echo", 0], [1, 1, 1 + 1e-12, "echo", 0], [1, 0, 1, "echo", 0], [1, 1, 0, "echo", 0], [0, 1, 0, "echo", 0], ["1", 1, 1, "echo", 0]]:
+                h.ServerReceive(h.Peer, wire)
+            suite.Equal(h.Authorizations, 0, "invalid headers rejected before hooks")
+        )
+    )
+    suite.Test("route names are bounded case-sensitive ASCII names", func():
+        With(nil, func(h):
+            for value in [nil, false, 0, "", "a; b", "two words", "a\n", string.repeat("a", 33)]:
+                suite.Equal(h.Client.Request(value, 0).GetOutcome().Code, "InvalidInput", "invalid route name")
+            local call = h.Client.Request("Echo", 0)
+            h.Deliver()
+            suite.Equal(call.GetOutcome().Code, "UnknownRoute", "case preserved")
+        )
+    )
+    suite.Test("data budget rejects functions nonfinite values and cycles", func():
+        With(nil, func(h):
+            local called = false
+            local cycle = {}
+            cycle.Self = cycle
+            for value in [func(): called = true, 0 / 0, 1e308 * 10, cycle]:
+                suite.Equal(h.Client.Request("echo", value).GetOutcome().Code, "InvalidPayload", "unsupported data rejected")
+            suite.Equal(called, false, "data function was never invoked")
+            suite.Equal(h.Out.length, 0, "invalid data was not sent")
+        )
+    )
+    suite.Test("text and visited-value budgets enforce their exact boundary", func():
+        With(nil, func(h):
+            suite.Equal(h.Client.Request("echo", string.repeat("x", 4097)).GetOutcome().Code, "InvalidPayload", "text overflow")
+            local call = h.Client.Request("echo", string.repeat("x", 4096))
+            h.Deliver()
+            suite.Expect(call.GetOutcome().Ok, "exact text boundary")
+            local values = []
+            for index in range(1023): values.push(0)
+            suite.Expect(h.Client.Send("event", values).Ok, "1024 visited values including container")
+            values.push(0)
+            suite.Equal(h.Client.Send("event", values).Code, "InvalidPayload", "visited-value overflow")
+        )
+    )
+    suite.Test("server independently checks data budget before expensive hooks", func():
+        With(nil, func(h):
+            h.ServerReceive(h.Peer, [1, 1, 1, "echo", string.repeat("x", 4097)])
+            suite.Equal(h.Authorizations, 0, "oversized payload did not reach authorization")
+            suite.Equal(h.Replies[0].Wire[4], "InvalidPayload", "bounded fixed failure")
+        )
+    )
+    suite.Test("malformed traffic spends personal admission capacity", func():
+        With({ Burst = 2, Rate = 2 }, func(h):
+            h.ServerReceive(h.Peer, [])
+            h.ServerReceive(h.Peer, [])
+            local call = h.Client.Request("echo", 1)
+            h.ServerReceive(h.Peer, h.Out[0])
+            suite.Equal(h.Runs, 0, "malformed traffic did not bypass charging")
+            h.Now = 0.5
+            h.ServerReceive(h.Peer, h.Out[0])
+            suite.Equal(h.Runs, 1, "half a second refilled one token")
+        )
+    )
+    suite.Test("peer capacity is bounded and RemovePeer releases capacity", func():
+        With({ MaxPeers = 1 }, func(h):
+            h.ServerReceive(h.Peer, [])
+            local other = {}
+            h.ServerReceive(other, [1, 1, 1, "echo", 0])
+            suite.Equal(h.Runs, 0, "new peer did not exceed capacity")
+            suite.Expect(h.Server.RemovePeer(h.Peer), "active peer invalidated")
+            h.ServerReceive(other, [1, 1, 1, "echo", 0])
+            suite.Equal(h.Runs, 1, "inactive slot reused")
+        )
+    )
+    suite.Test("retained contexts are invalidated by remove and fresh admission", func():
+        With(nil, func(h):
+            local call = h.Client.Request("echo", 0)
+            h.Deliver()
+            local old = h.Context
+            suite.Expect(old.IsActive(), "original context active")
+            h.Server.RemovePeer(h.Peer)
+            suite.Expect(not old.IsActive(), "removal invalidated context")
+            local next = h.Client.Request("echo", 0)
+            h.Deliver()
+            suite.Expect(not old.IsActive(), "new admission did not revive old context")
+            suite.Expect(h.Context.IsActive(), "new context active")
+        )
+    )
+    suite.Test("request timeout expires only when Step runs", func():
+        With({ Timeout = 1 }, func(h):
+            local call = h.Client.Request("echo", 0)
+            h.Now = 1
+            suite.Equal(call.GetOutcome().Status, "Pending", "no implicit timer")
+            suite.Equal(h.Client.Step(), 1, "one expiry")
+            suite.Equal(call.GetOutcome().Status, "TimedOut", "terminal timeout")
+            suite.Equal(h.Client.Step(), 0, "does not complete twice")
+        )
+    )
+    suite.Test("cancellation wins once and late replies are ignored", func():
+        With(nil, func(h):
+            local callbacks = 0
+            local call = h.Client.Request("echo", 3, func(outcome): callbacks += 1)
+            suite.Equal(call.Cancel(), true, "first cancel accepted")
+            suite.Equal(call.Cancel(), false, "second cancel rejected")
+            h.Deliver()
+            suite.Equal(call.GetOutcome().Status, "Cancelled", "late reply ignored")
+            suite.Equal(callbacks, 1, "one terminal callback")
+            suite.Equal(h.Runs, 1, "cancel did not cancel server work")
+        )
+    )
+    suite.Test("duplicate replies do not repeat completion", func():
+        With(nil, func(h):
+            local calls = 0
+            local call = h.Client.Request("echo", false, func(outcome): calls += 1)
+            h.Deliver()
+            h.ClientReceive(h.Replies[0].Wire)
+            suite.Equal(calls, 1, "one callback")
+            suite.Equal(call.Cancel(), false, "completed request rejects cancellation")
+        )
+    )
+    suite.Test("pending limit is released by cancellation and response", func():
+        With({ MaxPending = 1 }, func(h):
+            local first = h.Client.Request("echo", 0)
+            suite.Equal(h.Client.Request("echo", 1).GetOutcome().Code, "Limit", "capacity enforced")
+            first.Cancel()
+            local next = h.Client.Request("echo", 2)
+            h.Deliver()
+            suite.Equal(next.GetOutcome().Value, 2, "cancelled slot reused")
+        )
+    )
+    suite.Test("one hundred completed requests reuse bounded slots", func():
+        With({ MaxPending = 1, Rate = 64 }, func(h):
+            h.Auto = true
+            for index in range(100):
+                if index % 32 == 0: h.Now += 1
+                local call = h.Client.Request("echo", index)
+                suite.Expect(call.GetOutcome().Ok, "slot reused after completion")
+                suite.Equal(call.GetOutcome().Value, index, "correlated result")
+        )
+    )
+    suite.Test("outcome snapshots cannot replace internal completion metadata", func():
+        With(nil, func(h):
+            local call = h.Client.Request("echo", false, func(outcome): outcome.Status = "changed")
+            h.Deliver()
+            local first = call.GetOutcome()
+            first.Status = "changed"
+            first.Value = 9
+            suite.Equal(call.GetOutcome().Status, "Succeeded", "private terminal status")
+            suite.Equal(call.GetOutcome().Value, false, "private result field")
+        )
+    )
+    suite.Test("completion callbacks may submit another request with one pending slot", func():
+        With({ MaxPending = 1 }, func(h):
+            local nested = nil
+            local call = h.Client.Request("echo", 1, func(outcome): nested = h.Client.Request("echo", 2))
+            h.Deliver()
+            suite.Expect(call.GetOutcome().Ok, "first request completed")
+            suite.Equal(nested.GetOutcome().Status, "Pending", "slot freed before callback")
+            h.Deliver()
+            suite.Equal(nested.GetOutcome().Value, 2, "nested request completed")
+        )
+    )
+    suite.Test("callback and transport exceptions do not leak raw diagnostics", func():
+        With(nil, func(h):
+            h.FailSend = true
+            local call = h.Client.Request("echo", 1, func(outcome): throw "private callback failure")
+            suite.Equal(call.GetOutcome().Code, "TransportError", "fixed transport code")
+            suite.Equal(call.GetOutcome().Message, "Network transport failed.", "fixed public text")
+            h.FailSend = false
+            local next = h.Client.Request("echo", 2)
+            h.Deliver()
+            suite.Expect(next.GetOutcome().Ok, "failed send released slot")
+        )
+    )
+    suite.Test("bad and backwards clocks fail closed", func():
+        With(nil, func(h):
+            local call = h.Client.Request("echo", 0)
+            h.Now = 1
+            h.Client.Step()
+            h.Now = 0
+            suite.Equal(h.Client.Request("echo", 0).GetOutcome().Code, "ClockError", "backwards client clock")
+            h.BadClock = true
+            h.Client.Step()
+            suite.Equal(call.GetOutcome().Code, "ClockError", "pending call failed on broken clock")
+            h.ServerReceive(h.Peer, [1, 1, 1, "echo", 0])
+            suite.Equal(h.Runs, 0, "broken server clock never reaches handler")
+        )
+    )
+    suite.Test("destroy settles pending calls and disconnects each endpoint once", func():
+        With(nil, func(h):
+            local call = h.Client.Request("echo", 0)
+            h.Client.Destroy()
+            h.Client.Destroy()
+            h.Server.Destroy()
+            h.Server.Destroy()
+            suite.Equal(call.GetOutcome().Code, "Destroyed", "pending request settled")
+            suite.Equal(h.ClientClosed, 1, "one client disconnection")
+            suite.Equal(h.ServerClosed, 1, "one server disconnection")
+            suite.Equal(h.Client.Send("echo", nil).Code, "Destroyed", "closed endpoint cannot send")
+        )
+    )
+    suite.Test("registration snapshots callbacks and rejects duplicate names", func():
+        With(nil, func(h):
+            local definition = { Name = "copy", Kind = "Request", Authorize = expr(context): true, Validate = mNet.NoPayload, Run = expr(context, value): 7 }
+            h.Server.Register(definition)
+            definition.Run = expr(context, value): 9
+            definition.Authorize = expr(context): false
+            suite.Throws(func(): h.Server.Register(definition), "duplicate registration rejected")
+            local call = h.Client.Request("copy", nil)
+            h.Deliver()
+            suite.Equal(call.GetOutcome().Value, 7, "private definition retained")
+        )
+    )
+    suite.Test("required authorization and validation cannot be omitted", func():
+        With(nil, func(h):
+            for definition in [{ Name = "bad", Kind = "Request", Validate = mNet.NoPayload, Run = expr(context, value): true }, { Name = "bad", Kind = "Request", Authorize = expr(context): true, Run = expr(context, value): true }]:
+                suite.Throws(func(): h.Server.Register(definition), "missing policy rejected")
+        )
+    )
+    suite.Test("route registry is bounded to thirty-two entries", func():
+        With(nil, func(h):
+            for index in range(31):
+                h.Server.Register({ Name = "route" + index, Kind = "Event", Authorize = expr(context): true, Validate = mNet.NoPayload, Run = func(context, value): pass })
+            suite.Throws(func(): h.Server.Register({ Name = "overflow", Kind = "Event", Authorize = expr(context): true, Validate = mNet.NoPayload, Run = func(context, value): pass }), "registry capacity")
+        )
+    )
+    suite.Test("malformed replies and wrong epochs cannot settle a pending request", func():
+        With(nil, func(h):
+            local call = h.Client.Request("echo", 0)
+            local wire = h.Out[0]
+            for reply in [[2, wire[1] + 1, wire[2], true, 1], [2, wire[1], wire[2] + 1e-12, true, 1], [2, wire[1], wire[2], "true", 1], [2, wire[1], wire[2], false, "privateUnknownError"], { length = 5 }]: h.ClientReceive(reply)
+            suite.Equal(call.GetOutcome().Status, "Pending", "unmatched replies ignored")
+            h.Deliver()
+            suite.Expect(call.GetOutcome().Ok, "valid reply still completes")
+        )
+    )
+    suite.Test("global in-flight capacity rejects reentrant work without leaking a slot", func():
+        With({ MaxInFlight = 1 }, func(h):
+            h.Server.Register({ Name = "hold", Kind = "Request", Authorize = expr(context): true, Validate = mNet.NoPayload, Run = func(context, value):
+                h.ServerReceive(h.Peer, [1, 1, 99, "echo", 0])
+                return 7
+            })
+            local call = h.Client.Request("hold", nil)
+            h.ServerReceive(h.Peer, h.Out[0])
+            suite.Equal(h.Replies[0].Wire[4], "Busy", "nested capacity rejected")
+            h.ClientReceive(h.Replies[1].Wire)
+            suite.Equal(call.GetOutcome().Value, 7, "outer work completes")
+            local next = h.Client.Request("echo", 1)
+            h.Deliver()
+            suite.Expect(next.GetOutcome().Ok, "capacity released through finally")
+        )
+    )
+    suite.Test("replacing a client on one transport rejects the previous epoch reply", func():
+        With(nil, func(h):
+            local old = h.Client.Request("echo", 1)
+            h.ServerReceive(h.Peer, h.Out[0])
+            local stale = h.Replies[0].Wire
+            h.Client.Destroy()
+            h.Client = mNet.NewClient({ Clock = expr(): h.Now, Connect = func(receive):
+                h.ClientReceive = receive
+                return { Disconnect = func(): h.ClientClosed += 1 }
+            , Send = func(wire): h.Out.push(wire) })
+            local current = h.Client.Request("echo", 2)
+            h.ClientReceive(stale)
+            suite.Equal(current.GetOutcome().Status, "Pending", "old epoch did not settle new request id")
+            h.Deliver()
+            suite.Equal(current.GetOutcome().Value, 2, "current epoch reply accepted")
+            suite.Equal(old.GetOutcome().Code, "Destroyed", "old request stayed terminal")
+        )
+    )
+    suite.Test("handler exceptions and unsupported response values stay generic", func():
+        With(nil, func(h):
+            h.Server.Register({ Name = "throwing", Kind = "Request", Authorize = expr(context): true, Validate = mNet.NoPayload, Run = func(context, value): throw "private handler detail" })
+            h.Server.Register({ Name = "unsupported", Kind = "Request", Authorize = expr(context): true, Validate = mNet.NoPayload, Run = expr(context, value): func(): return 1 })
+            for name in ["throwing", "unsupported"]:
+                local call = h.Client.Request(name, nil)
+                h.Deliver()
+                suite.Expect(not call.GetOutcome().Ok, "invalid response failed")
+                suite.Equal(call.GetOutcome().Value, nil, "no executable value or raw exception")
+            suite.Equal(h.Client.Request("echo", 0).GetOutcome().Status, "Pending", "endpoint still usable")
+        )
+    )
+    suite.Test("server push preserves nil false and zero for subscribed clients", func():
+        With(nil, func(h):
+            h.Auto = true
+            local values = []
+            h.Client.On("notice", func(value): values.push(value))
+            for value in [nil, false, 0]: suite.Expect(h.Server.Send(h.Peer, "notice", value).Ok, "push accepted")
+            suite.Equal(values.length, 3, "all pushes dispatched")
+            suite.Equal(values[0], nil, "nil push")
+            suite.Equal(values[1], false, "false push")
+            suite.Equal(values[2], 0, "zero push")
+        )
+    )
+    suite.Test("unknown malformed and forged push messages cannot complete requests", func():
+        With(nil, func(h):
+            local calls = 0
+            h.Client.On("notice", func(value): calls += 1)
+            local call = h.Client.Request("echo", 0)
+            for wire in [[4, 0, 0, "missing", 0], [4, 1, 0, "notice", 0], [4, 0, 1, "notice", 0], [4 + 1e-12, 0, 0, "notice", 0], [4, 0, 0, "notice", func(): pass]]: h.ClientReceive(wire)
+            h.ServerReceive(h.Peer, [4, 0, 0, "notice", 0])
+            suite.Equal(calls, 0, "invalid and unknown pushes ignored")
+            suite.Equal(h.Authorizations, 0, "client cannot forge server push kind")
+            suite.Equal(call.GetOutcome().Status, "Pending", "push is separate from correlation space")
+            h.Deliver()
+            suite.Expect(call.GetOutcome().Ok, "matching reply still works")
+        )
+    )
+    suite.Test("event dispatch snapshots support unsubscribe subscribe and handler errors", func():
+        With(nil, func(h):
+            h.Auto = true
+            local calls = []
+            local second = nil
+            local later = nil
+            h.Client.On("notice", func(value):
+                calls.push("first")
+                second.Disconnect()
+                if later == nil: later = h.Client.On("notice", func(value): calls.push("later"))
+                throw "private event handler failure"
+            )
+            second = h.Client.On("notice", func(value): calls.push("second"))
+            h.Server.Send(h.Peer, "notice", 0)
+            suite.Equal(calls.length, 1, "removed listener skipped and new listener deferred")
+            h.Server.Send(h.Peer, "notice", 0)
+            suite.Equal(calls.length, 3, "later dispatch includes new listener despite first error")
+            suite.Equal(calls[2], "later", "snapshot ordering")
+        )
+    )
+    suite.Test("destroy inside an event listener prevents later callbacks", func():
+        With(nil, func(h):
+            h.Auto = true
+            local later = 0
+            h.Client.On("notice", func(value): h.Client.Destroy())
+            h.Client.On("notice", func(value): later += 1)
+            suite.Expect(h.Server.Send(h.Peer, "notice", 0).Ok, "send accepted")
+            h.ClientReceive([4, 0, 0, "notice", 0])
+            suite.Equal(later, 0, "remaining and future callbacks stopped")
+            suite.Equal(h.ClientClosed, 1, "one connection cleanup")
+            suite.Throws(func(): h.Client.On("notice", func(value): pass), "closed endpoint rejects subscription")
+        )
+    )
+    suite.Test("event route and listener caps reclaim unsubscribed slots", func():
+        With(nil, func(h):
+            local connections = []
+            for index in range(32): connections.push(h.Client.On("route" + index, func(value): pass))
+            suite.Throws(func(): h.Client.On("overflow", func(value): pass), "thirty-three names rejected")
+            for index in range(32): h.Client.On("route0", func(value): pass)
+            suite.Throws(func(): h.Client.On("route0", func(value): pass), "sixty-five listeners rejected")
+            connections[0].Disconnect()
+            connections[0].Disconnect()
+            h.Client.On("route0", func(value): pass)
+            connections[1].Disconnect()
+            h.Client.On("replacement", func(value): pass)
+            suite.Expect(true, "removed name and listener capacity reused")
+        )
+    )
+    suite.Test("server push validates before send and acceptance is not delivery", func():
+        With(nil, func(h):
+            local calls = 0
+            h.Client.On("notice", func(value): calls += 1)
+            suite.Equal(h.Server.Send(nil, "notice", 0).Code, "InvalidInput", "peer required")
+            suite.Equal(h.Server.Send(h.Peer, "notice", func(): pass).Code, "InvalidPayload", "data policy applies to pushes")
+            suite.Equal(h.Replies.length, 0, "invalid pushes were not sent")
+            suite.Expect(h.Server.Send(h.Peer, "notice", 0).Ok, "valid push accepted")
+            suite.Equal(calls, 0, "transport acceptance is not receipt")
+            h.ClientReceive(h.Replies[0].Wire)
+            suite.Equal(calls, 1, "explicit delivery dispatched")
+            h.Server.Destroy()
+            suite.Equal(h.Server.Send(h.Peer, "notice", 0).Code, "Destroyed", "closed server cannot push")
+        )
+    )
+    return suite.Report()
+
+return { Run = Run }

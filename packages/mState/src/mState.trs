@@ -1,0 +1,266 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Local values with explicit derived dependencies and synchronous batches.
+# local mState = import("/mLibraries/mState")
+# local count = mState.New(0)
+# local doubled = mState.Derived([count], expr(values): values[0] * 2)
+# count.Observe(expr(value): print(value))
+# count.Set(1)
+# count.Destroy()
+
+local mSignal = import("/mLibraries/mSignal")
+local mCleanup = import("/mLibraries/mCleanup")
+local identity = {}
+local requests = []
+local notifications = []
+local dirty = []
+local batch_depth = 0
+local computing = false
+
+local MakeGate = func():
+    local claims = 0
+    return {
+        Take = expr(): claims++ == 0,
+        Reset = func():
+            claims = 0
+    }
+
+local pump_gate = MakeGate()
+local Drain = nil
+local Dispose = nil
+
+local RequireAlive = func(node):
+    if node.Disposed: throw "mState: value is destroyed"
+
+local RequireWritablePhase = func():
+    if computing: throw "mState: computation is in progress"
+
+local MarkDirty = func(node):
+    if node.Disposed or node.Dirty: return
+    node.Dirty = true
+    local index = 0
+    while index < dirty.length and dirty[index].Rank <= node.Rank: index += 1
+    dirty.insert(index, node)
+
+local Commit = func(node, value):
+    if node.Disposed or node.Value == value: return
+    node.Value = value
+    if not node.Pending:
+        node.Pending = true
+        notifications.push(node)
+    for dependent in node.Dependents: MarkDirty(dependent)
+
+local Unlink = func(parent, child):
+    return func():
+        if parent.Dependents.contains(child): parent.Dependents.remove(child)
+
+Dispose = func(node):
+    if node.Cleaned: return
+    node.Disposed = true
+    node.Cleaned = true
+    local children = node.Dependents
+    node.Dependents = []
+    for child in children: Dispose(child)
+    node.Changed.Destroy()
+    node.Life.Destroy()
+    node.Dependencies = []
+    node.Compute = nil
+    node.Value = nil
+    node.Emitted = nil
+    node.Handle = nil
+
+local Recompute = func(node, failures):
+    if node.Disposed: return
+    local values = []
+    for dependency in node.Dependencies:
+        if dependency.Disposed:
+            Dispose(node)
+            return
+        values.push(dependency.Value)
+    local work = node.Compute
+    computing = true
+    try:
+        local value = work(values)
+        if not node.Disposed: Commit(node, value)
+    catch failure:
+        failures.push(failure)
+    finally:
+        computing = false
+
+Drain = func():
+    local failures = []
+    while batch_depth == 0:
+        if not pump_gate.Take(): break
+        try:
+            while batch_depth == 0:
+                # Commit queued writes before settling the fixed dependency graph.
+                while requests.length > 0:
+                    local request = requests.remove_at(0)
+                    if request.Kind == "Set":
+                        Commit(request.Node, request.Value)
+                    elif request.Kind == "Destroy":
+                        Dispose(request.Node)
+                    else:
+                        failures.push(request.Failure)
+                if batch_depth != 0: break
+                if dirty.length > 0:
+                    local node = dirty.remove_at(0)
+                    node.Dirty = false
+                    Recompute(node, failures)
+                    continue
+                if notifications.length > 0:
+                    local node = notifications.remove_at(0)
+                    node.Pending = false
+                    if not node.Disposed and node.Value != node.Emitted:
+                        local value = node.Value
+                        node.Emitted = value
+                        for failure in node.Changed.Fire(value): failures.push(failure)
+                    continue
+                break
+        finally:
+            pump_gate.Reset()
+        # Recheck after release so a contending producer cannot lose its wakeup.
+        if requests.length == 0 and dirty.length == 0 and notifications.length == 0: break
+    return failures
+
+local Set = func(node, value):
+    RequireWritablePhase()
+    RequireAlive(node)
+    if node.ReadOnly: throw "mState: derived values are read only"
+    requests.push({ Kind = "Set", Node = node, Value = value })
+    return Drain()
+
+local RequestDestroy = func(node):
+    if node.Disposed: return []
+    node.Disposed = true
+    requests.push({ Kind = "Destroy", Node = node })
+    if computing: return []
+    return Drain()
+
+local Destroy = func(node):
+    RequireWritablePhase()
+    return RequestDestroy(node)
+
+local Observe = func(node, handler, owner):
+    RequireWritablePhase()
+    RequireAlive(node)
+    if handler == nil: throw "mState: observer is required"
+    local connection = node.Changed.Connect(func(value):
+        if not node.Disposed: handler(value)
+    )
+    if node.Disposed:
+        connection.Disconnect()
+        throw "mState: value is destroyed"
+    if owner != nil:
+        try:
+            owner.AddConnection(connection)
+        catch failure:
+            connection.Disconnect()
+            throw failure
+    return connection
+
+local NewNode = func(value, read_only, rank, work, dependencies):
+    local node = {
+        Value = value, Emitted = value, ReadOnly = read_only, Rank = rank,
+        Compute = work, Dependencies = dependencies, Dependents = [],
+        Changed = mSignal.New(), Life = mCleanup.New(),
+        Disposed = false, Cleaned = false, Dirty = false, Pending = false, Handle = nil
+    }
+    value = nil
+    work = nil
+    dependencies = nil
+    local handle = {
+        Get = func():
+            local current = node.Value
+            RequireAlive(node)
+            return current
+        ,
+        Set = expr(next_value): Set(node, next_value),
+        Observe = expr(handler, owner): Observe(node, handler, owner),
+        Destroy = expr(): Destroy(node),
+        RequestDestroy = expr(): RequestDestroy(node),
+        IsDestroyed = expr(): node.Disposed
+    }
+    handle[identity] = node
+    node.Handle = handle
+    return node
+
+local CopyDependencies = func(dependencies):
+    try:
+        local record = false
+        try:
+            table.keys(dependencies)
+            record = true
+        catch not_record:
+            pass
+        local count = table.count(dependencies)
+        if record or count < 1 or count > 64: throw "invalid"
+        local copy = []
+        for handle in dependencies:
+            local node = handle[identity]
+            if node == nil or node.Handle != handle or node.Disposed: throw "invalid"
+            if copy.contains(node): throw "invalid"
+            copy.push(node)
+        return copy
+    catch invalid:
+        throw "mState: expected 1 to 64 distinct live mState dependencies"
+
+local New = func(value):
+    RequireWritablePhase()
+    return NewNode(value, false, 0, nil, []).Handle
+
+local Derived = func(dependencies, work):
+    RequireWritablePhase()
+    if work == nil: throw "mState: computation is required"
+    if not pump_gate.Take(): throw "mState: graph construction is busy"
+    local node = nil
+    local failed = false
+    local problem = nil
+    try:
+        local copy = CopyDependencies(dependencies)
+        local rank = 1
+        local values = []
+        for dependency in copy:
+            rank = math.max(rank, dependency.Rank + 1)
+            values.push(dependency.Value)
+        if rank > 64: throw "mState: dependency depth exceeds 64"
+        computing = true
+        local value = nil
+        try:
+            value = work(values)
+        finally:
+            computing = false
+        for dependency in copy: RequireAlive(dependency)
+        node = NewNode(value, true, rank, work, copy)
+        for dependency in copy:
+            dependency.Dependents.push(node)
+            node.Life.Add(Unlink(dependency, node))
+    catch failure:
+        if node != nil: Dispose(node)
+        failed = true
+        problem = failure
+    finally:
+        pump_gate.Reset()
+    # Any writes queued by another task during construction still get a drainer.
+    local failures = Drain()
+    if failed: throw problem
+    if failures.length > 0:
+        Dispose(node)
+        throw failures[0]
+    local handle = node.Handle
+    RequireAlive(node)
+    return handle
+
+local Batch = func(work):
+    RequireWritablePhase()
+    if work == nil: throw "mState: batch callback is required"
+    batch_depth++
+    try:
+        work()
+    catch failure:
+        requests.push({ Kind = "Failure", Failure = failure })
+    finally:
+        batch_depth--
+    return Drain()
+
+return { New = New, Derived = Derived, Batch = Batch }

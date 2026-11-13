@@ -1,0 +1,365 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# local watch = import("/mLibraries/mPlayer").New({
+#     OnCharacter = func(scope): print(scope.GetPlayer().Name)
+# }, nil)
+# Own watch.Destroy with the lifetime that created this observer.
+
+local mCleanup = import("/mLibraries/mCleanup")
+
+local Finite = func(value):
+    try:
+        return (value < 0 or value >= 0) and not math.is_infinite(value)
+    catch invalid:
+        return false
+
+local Record = func(value, allowed, maximum):
+    try:
+        if table.count(value) > maximum: return false
+        for key in table.keys(value):
+            if allowed[key] != true: return false
+        return true
+    catch invalid:
+        return false
+
+local ArrayLength = func(value, maximum):
+    try:
+        if table.count(value) > maximum: return -1
+        local dictionary = false
+        try:
+            table.keys(value)
+            dictionary = true
+        catch not_dictionary:
+            pass
+        if dictionary: return -1
+        return value.length
+    catch invalid:
+        return -1
+
+local MakeScope = func(player, character):
+    local entry = { Active = true, Player = player, Character = character }
+    local owner = mCleanup.New()
+    player = nil
+    character = nil
+    local scope = {}
+    scope.Add = func(callback):
+        if not entry.Active: throw "mPlayer scope is inactive."
+        return owner.Add(callback)
+    scope.AddConnection = func(connection):
+        if not entry.Active: throw "mPlayer scope is inactive."
+        return owner.AddConnection(connection)
+    scope.AddInstance = func(instance):
+        if not entry.Active: throw "mPlayer scope is inactive."
+        return owner.AddInstance(instance)
+    scope.IsActive = expr(): entry.Active
+    scope.GetPlayer = expr(): entry.Active and entry.Player or nil
+    scope.GetCharacter = expr(): entry.Active and entry.Character or nil
+    local Invalidate = func():
+        entry.Active = false
+        entry.Player = nil
+        entry.Character = nil
+    local Close = func():
+        Invalidate()
+        return owner.Destroy()
+    return { Public = scope, Invalidate = Invalidate, Close = Close }
+
+local ChangedHandler = func(callback):
+    return func(property):
+        if property == "Character": callback()
+
+local NativeAdapter = func():
+    local adapter = {}
+    adapter.GetPlayers = func(): return game.Players.GetPlayers()
+    adapter.IsPresent = expr(player): player.IsConnected
+    adapter.GetCharacter = func(player):
+        local character = player.Character
+        if character != nil and character.IsInDataModel: return character
+        return nil
+    adapter.ConnectAdded = expr(callback): game.Players.PlayerAdded.Connect(callback)
+    adapter.ConnectRemoved = expr(callback): game.Players.PlayerRemoved.Connect(callback)
+    adapter.ConnectCharacter = func(player, callback):
+        local owner = mCleanup.New()
+        try:
+            owner.AddConnection(player.CharacterAdded.Connect(callback))
+            owner.AddConnection(player.Changed.Connect(ChangedHandler(callback)))
+        catch failure:
+            owner.Destroy()
+            throw failure
+        return { Disconnect = owner.Destroy }
+    adapter.ConnectEnded = func(character, callback):
+        local owner = mCleanup.New()
+        try:
+            owner.AddConnection(character.Removed.Connect(callback))
+            owner.AddConnection(character.Destroyed.Connect(callback))
+        catch failure:
+            owner.Destroy()
+            throw failure
+        return { Disconnect = owner.Destroy }
+    return adapter
+
+local CopyAdapter = func(adapter):
+    if adapter == nil: return NativeAdapter()
+    local allowed = { GetPlayers = true, IsPresent = true, GetCharacter = true, ConnectAdded = true, ConnectRemoved = true, ConnectCharacter = true, ConnectEnded = true }
+    if not Record(adapter, allowed, 7): throw "Invalid mPlayer adapter."
+    local copy = {}
+    for key in table.keys(allowed):
+        local callback = adapter[key]
+        if callback == nil: throw "Invalid mPlayer adapter."
+        copy[key] = callback
+    return copy
+
+local Options = func(config):
+    if not Record(config, { OnPlayer = true, OnCharacter = true, OnError = true, MaxPlayers = true }, 4):
+        throw "Invalid mPlayer options."
+    if config.OnPlayer == nil and config.OnCharacter == nil:
+        throw "mPlayer requires OnPlayer or OnCharacter."
+    local maximum = config.MaxPlayers
+    if maximum == nil: maximum = 128
+    if not Finite(maximum) or maximum < 1 or maximum > 1024:
+        throw "Invalid mPlayer MaxPlayers."
+    local integer = math.floor(maximum)
+    if maximum < integer or maximum > integer: throw "Invalid mPlayer MaxPlayers."
+    return { OnPlayer = config.OnPlayer, OnCharacter = config.OnCharacter, OnError = config.OnError, MaxPlayers = maximum }
+
+local MakeGate = func():
+    local claims = 0
+    local finished = 0
+    local retired = false
+    local gate = { OnRetire = nil }
+    local Finish = func():
+        local ticket = finished++
+        if ticket != 0: return
+        local callback = gate.OnRetire
+        gate.OnRetire = nil
+        if callback != nil: callback()
+    gate.Release = func():
+        claims = 0
+        if retired:
+            local ticket = claims++
+            if ticket == 0: Finish()
+    gate.Take = func():
+        local ticket = claims++
+        if ticket != 0: return false
+        if retired:
+            gate.Release()
+            return false
+        return true
+    gate.Retire = func():
+        retired = true
+        local ticket = claims++
+        if ticket == 0: Finish()
+    return gate
+
+local Snapshot = func(adapter, enqueue, maximum):
+    local players = adapter.GetPlayers()
+    local count = ArrayLength(players, 1024)
+    if count < 0: throw "mPlayer adapter returned an invalid roster."
+    if count > maximum: return false
+    for player in players: enqueue("add", player)
+    return true
+
+local New = func(config, adapter):
+    local state = { Handlers = Options(config), Adapter = CopyAdapter(adapter), Records = [], Queue = [], Closed = false, StopFailure = nil }
+    config = nil
+    adapter = nil
+    local maximum = state.Handlers.MaxPlayers
+    local event_limit = 4 * maximum + 16
+    local owner = mCleanup.New()
+    local gate = MakeGate()
+    local Drain = nil
+    local Enqueue = nil
+    local Adopt = func(connection):
+        try:
+            owner.AddConnection(connection)
+        catch failure:
+            if connection != nil: connection.Disconnect()
+            throw failure
+
+    local Report = func(stage, failure):
+        local callback = state.Handlers.OnError
+        if callback != nil:
+            try:
+                callback(stage, failure)
+            catch ignored:
+                pass
+
+    local CloseScope = func(scope):
+        if scope == nil: return
+        for failure in scope.Close(): Report("Cleanup", failure)
+
+    local Find = func(player):
+        for record in state.Records:
+            if record.Player == player: return record
+        return nil
+
+    local Invalidate = func(record):
+        record.Scope.Invalidate()
+        local character_scope = record.CharacterScope
+        if character_scope != nil: character_scope.Invalidate()
+
+    local CloseCharacter = func(record):
+        local connection = record.CharacterConnection
+        local scope = record.CharacterScope
+        record.CharacterConnection = nil
+        record.CharacterScope = nil
+        record.Character = nil
+        if connection != nil:
+            try:
+                connection.Disconnect()
+            catch failure:
+                Report("Cleanup", failure)
+        CloseScope(scope)
+
+    local CloseRecord = func(record):
+        Invalidate(record)
+        CloseCharacter(record)
+        CloseScope(record.Scope)
+        record.Player = nil
+
+    local Stop = func(stage, failure):
+        if state.Closed: return
+        state.Closed = true
+        if stage != nil: state.StopFailure = { Stage = stage, Error = failure }
+        for record in state.Records: Invalidate(record)
+        gate.Retire()
+
+    gate.OnRetire = func():
+        for failure in owner.Destroy(): Report("Cleanup", failure)
+        local records = state.Records
+        state.Records = []
+        state.Queue.clear()
+        for record in records: CloseRecord(record)
+        local failure = state.StopFailure
+        state.StopFailure = nil
+        if failure != nil: Report(failure.Stage, failure.Error)
+        state.Handlers = {}
+        state.Adapter = {}
+
+    local Call = func(name, scope):
+        local callback = state.Handlers[name]
+        if callback == nil: return true
+        if state.Closed or not scope.Public.IsActive(): return false
+        try:
+            callback(scope.Public)
+            return true
+        catch failure:
+            CloseScope(scope)
+            Report(name, failure)
+            return false
+
+    local Reconcile = func(record):
+        if state.Closed or record.Failed or not record.Scope.Public.IsActive(): return
+        local character = state.Adapter.GetCharacter(record.Player)
+        if character == record.Character: return
+        CloseCharacter(record)
+        if state.Closed or not record.Scope.Public.IsActive(): return
+        character = state.Adapter.GetCharacter(record.Player)
+        if character == nil: return
+        local scope = MakeScope(record.Player, character)
+        record.Character = character
+        record.CharacterScope = scope
+        record.CharacterConnection = state.Adapter.ConnectEnded(character, func():
+            scope.Invalidate()
+            Enqueue("character", record.Player)
+        )
+        if record.CharacterConnection == nil: throw "mPlayer adapter returned no character connection."
+        if state.Closed or not record.Scope.Public.IsActive():
+            scope.Invalidate()
+            return
+        if state.Adapter.IsPresent(record.Player) != true:
+            Enqueue("remove", record.Player)
+            return
+        if state.Adapter.GetCharacter(record.Player) != character:
+            CloseCharacter(record)
+            Enqueue("character", record.Player)
+            return
+        Call("OnCharacter", scope)
+
+    local AddPlayer = func(player):
+        if player == nil or state.Closed or Find(player) != nil or state.Adapter.IsPresent(player) != true: return
+        if state.Records.length >= maximum:
+            Stop("Capacity", "mPlayer player limit reached.")
+            return
+        local record = { Player = player, Scope = MakeScope(player, nil), Character = nil, CharacterScope = nil, CharacterConnection = nil, Failed = false }
+        state.Records.push(record)
+        if state.Closed:
+            record.Scope.Invalidate()
+            return
+        local connection = state.Adapter.ConnectCharacter(player, func(): Enqueue("character", record.Player))
+        try:
+            record.Scope.Public.AddConnection(connection)
+        catch failure:
+            if connection != nil: connection.Disconnect()
+            throw failure
+        if not Call("OnPlayer", record.Scope):
+            record.Failed = true
+            return
+        Reconcile(record)
+
+    Drain = func():
+        if not gate.Take(): return
+        try:
+            local processed = 0
+            while not state.Closed and state.Queue.length > 0:
+                processed += 1
+                if processed > event_limit:
+                    Stop("Capacity", "mPlayer event processing limit reached.")
+                    break
+                local event = state.Queue.remove_at(0)
+                local record = Find(event.Player)
+                if event.Kind == "add":
+                    AddPlayer(event.Player)
+                elif event.Kind == "remove":
+                    if record != nil:
+                        state.Records.remove(record)
+                        CloseRecord(record)
+                elif record != nil:
+                    Reconcile(record)
+        catch failure:
+            Stop("Adapter", failure)
+        finally:
+            gate.Release()
+        if not state.Closed and state.Queue.length > 0: Drain()
+
+    Enqueue = func(kind, player):
+        if state.Closed or player == nil: return
+        if kind == "remove":
+            local record = Find(player)
+            if record != nil: Invalidate(record)
+        state.Queue.push({ Kind = kind, Player = player })
+        if state.Closed:
+            state.Queue.clear()
+            return
+        if state.Queue.length > event_limit:
+            Stop("Capacity", "mPlayer pending event limit reached.")
+            return
+        Drain()
+
+    local observer = {}
+    observer.GetPlayers = func():
+        local players = []
+        if state.Closed: return players
+        for record in state.Records:
+            if record.Scope.Public.IsActive(): players.push(record.Player)
+        return players
+    observer.GetCharacter = func(player):
+        if state.Closed: return nil
+        local record = Find(player)
+        if record == nil: return nil
+        local scope = record.CharacterScope
+        if scope == nil or not scope.Public.IsActive(): return nil
+        return scope.Public.GetCharacter()
+    observer.IsDestroyed = expr(): state.Closed
+    observer.Destroy = func(): Stop(nil, nil)
+
+    try:
+        Adopt(state.Adapter.ConnectAdded(func(player): Enqueue("add", player)))
+        Adopt(state.Adapter.ConnectRemoved(func(player): Enqueue("remove", player)))
+        if not Snapshot(state.Adapter, Enqueue, maximum):
+            Stop("Capacity", "mPlayer player limit reached.")
+    catch failure:
+        Stop("Adapter", failure)
+        throw "mPlayer adapter startup failed."
+    return observer
+
+return { New = New }

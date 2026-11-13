@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Bounded ban records. The caller owns storage, permissions and enforcement.
+# local bans = import("/mLibraries/mBan").New(nil)
+# local active = bans.Get(records, user_id, host.time())
+
+local MAX_ID = 9007199254740991
+local INVALID = "Invalid mBan data."
+local fields = { Id = true, UserId = true, Name = true, ActorId = true, Actor = true, Reason = true, IssuedAt = true, ExpiresAt = true }
+local Fail = expr(code, message): { Ok = false, Code = code, Message = message }
+
+local Finite = func(value):
+    try: return (value >= 0 or value < 0) and not math.is_infinite(value)
+    catch invalid: return false
+local UserId = func(value):
+    if not Finite(value) or value < -MAX_ID or value > MAX_ID: return false
+    local integer = math.floor(value)
+    return (value < 0 or value > 0) and not (value < integer or value > integer)
+local Stamp = expr(value): Finite(value) and value >= 0
+local Text = func(value, maximum):
+    try: return string.length(value) <= maximum and not string.match(value, "[\\x00-\\x1f\\x7f]")
+    catch invalid: return false
+local RequireMap = func(value):
+    try: table.keys(value)
+    catch invalid: throw INVALID
+local RequireId = func(value):
+    if not UserId(value): throw INVALID
+local RequireStamp = func(value):
+    if not Stamp(value): throw INVALID
+local RequireToken = func(value):
+    if not Text(value, 64) or value == "": throw INVALID
+local RequireRecord = func(record):
+    RequireMap(record)
+    if table.count(record) != 8: throw INVALID
+    for key in table.keys(record):
+        if fields[key] != true: throw INVALID
+    RequireToken(record.Id)
+    RequireId(record.UserId)
+    RequireId(record.ActorId)
+    if not Text(record.Name, 64) or not Text(record.Actor, 64) or not Text(record.Reason, 256): throw INVALID
+    RequireStamp(record.IssuedAt)
+    RequireStamp(record.ExpiresAt)
+    if record.ExpiresAt > 0 and record.ExpiresAt <= record.IssuedAt: throw INVALID
+local CopyRecord = func(record):
+    return {
+        Id = record.Id, UserId = record.UserId, Name = record.Name,
+        ActorId = record.ActorId, Actor = record.Actor, Reason = record.Reason,
+        IssuedAt = record.IssuedAt, ExpiresAt = record.ExpiresAt
+    }
+local Active = expr(record, now): record.ExpiresAt <= 0 or record.ExpiresAt > now
+
+local New = func(config):
+    local limit = 128
+    if config != nil:
+        RequireMap(config)
+        if table.count(config) > 1: throw INVALID
+        for key in table.keys(config):
+            if key != "Limit": throw INVALID
+        if config.Limit != nil: limit = config.Limit
+    if not Finite(limit) or limit < 1 or limit > 1024: throw INVALID
+    local integer = math.floor(limit)
+    if limit < integer or limit > integer: throw INVALID
+    local Validate = func(records):
+        RequireMap(records)
+        if table.count(records) > limit: throw INVALID
+        local ids = {}
+        for key in table.keys(records):
+            if not Text(key, 64): throw INVALID
+            local record = records[key]
+            RequireRecord(record)
+            if key != tostring(record.UserId) or ids[record.Id] == true: throw INVALID
+            ids[record.Id] = true
+        return true
+    local CopyActive = func(records, now):
+        local next = {}
+        for key in table.keys(records):
+            local record = records[key]
+            if Active(record, now): next[key] = CopyRecord(record)
+        return next
+    return {
+        Validate = Validate,
+        Get = func(records, user_id, now):
+            Validate(records)
+            RequireId(user_id)
+            RequireStamp(now)
+            local record = records[tostring(user_id)]
+            if record == nil or not Active(record, now): return nil
+            return CopyRecord(record)
+        ,
+        List = func(records, now):
+            Validate(records)
+            RequireStamp(now)
+            local result = []
+            for record in table.values(records):
+                if Active(record, now): result.push(CopyRecord(record))
+            return result.sort(expr(a, b): a.UserId < b.UserId)
+        ,
+        Set = func(records, record, now):
+            Validate(records)
+            RequireRecord(record)
+            RequireStamp(now)
+            if not Active(record, now): return Fail("Expired", "The ban has already expired.")
+            local next = CopyActive(records, now)
+            local key = tostring(record.UserId)
+            for entry in table.values(next):
+                if entry.UserId != record.UserId and entry.Id == record.Id: return Fail("Conflict", "That ban ID belongs to another account.")
+            if next[key] == nil and table.count(next) >= limit: return Fail("Full", "The ban list is full.")
+            next[key] = CopyRecord(record)
+            return { Ok = true, Value = next }
+        ,
+        Remove = func(records, user_id, expected_id, now):
+            Validate(records)
+            RequireId(user_id)
+            RequireToken(expected_id)
+            RequireStamp(now)
+            local key = tostring(user_id)
+            local record = records[key]
+            if record != nil and record.Id != expected_id: return Fail("Conflict", "The ban changed. Refresh before removing it.")
+            local next = CopyActive(records, now)
+            local removed = next[key] != nil
+            table.remove(next, key)
+            return { Ok = true, Value = next, Removed = removed }
+    }
+
+return { New = New }

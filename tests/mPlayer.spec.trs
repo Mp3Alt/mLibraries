@@ -1,0 +1,395 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+local mPlayer = import("/mLibraries/mPlayer")
+local mSignal = import("/mLibraries/mSignal")
+local kit = import("/mLibraries/mTestKit")
+
+local Fire = func(signal, payload):
+    local errors = signal.Fire(payload)
+    if errors.length > 0: throw errors[0]
+
+local Character = func(name):
+    return { Name = name, Alive = true, Destroyed = mSignal.New() }
+
+local Player = func(name, id):
+    return { Name = name, UserId = id, Present = true, Character = nil, Changed = mSignal.New() }
+
+local Fake = func(initial):
+    local roster = initial
+    local added = mSignal.New()
+    local removed = mSignal.New()
+    local fake = { OnSnapshot = nil, Added = added, Removed = removed }
+    local adapter = {}
+    adapter.GetPlayers = func():
+        local snapshot = []
+        for player in roster: snapshot.push(player)
+        local hook = fake.OnSnapshot
+        if hook != nil: hook()
+        return snapshot
+    adapter.IsPresent = expr(player): player.Present
+    adapter.GetCharacter = func(player):
+        local character = player.Character
+        if character != nil and character.Alive: return character
+        return nil
+    adapter.ConnectAdded = expr(callback): added.Connect(callback)
+    adapter.ConnectRemoved = expr(callback): removed.Connect(callback)
+    adapter.ConnectCharacter = func(player, callback):
+        return player.Changed.Connect(func(value): callback())
+    adapter.ConnectEnded = expr(character, callback): character.Destroyed.Connect(callback)
+    fake.Adapter = adapter
+    fake.Join = func(player):
+        player.Present = true
+        roster.push(player)
+        Fire(added, player)
+    fake.Leave = func(player):
+        player.Present = false
+        roster.remove(player)
+        Fire(removed, player)
+    fake.SetCharacter = func(player, character):
+        player.Character = character
+        Fire(player.Changed, nil)
+    fake.DestroyCharacter = func(player):
+        local character = player.Character
+        player.Character = nil
+        character.Alive = false
+        Fire(character.Destroyed, nil)
+        Fire(player.Changed, nil)
+    return fake
+
+local Run = func():
+    local suite = kit.New("mPlayer")
+    suite.Test("existing players and characters receive independent scopes", func():
+        local player = Player("existing", 1)
+        local character = Character("first")
+        player.Character = character
+        local fake = Fake([player])
+        local log = ""
+        local watch = mPlayer.New({
+            OnPlayer = func(scope):
+                log += "player;"
+                suite.Equal(scope.GetPlayer(), player, "correct player")
+                suite.Equal(scope.GetCharacter(), nil, "player scope has no character")
+            ,
+            OnCharacter = func(scope):
+                log += "character;"
+                suite.Equal(scope.GetCharacter(), character, "correct character")
+        }, fake.Adapter)
+        suite.Equal(log, "player;character;", "player setup precedes character setup")
+        local snapshot = watch.GetPlayers()
+        snapshot.clear()
+        suite.Equal(watch.GetPlayers().length, 1, "roster is copied")
+        suite.Equal(watch.GetCharacter(player), character, "observed character")
+        watch.Destroy()
+    )
+    suite.Test("future join spawn and duplicate notifications are deduplicated", func():
+        local fake = Fake([])
+        local player = Player("future", 1)
+        local players = 0
+        local characters = 0
+        local watch = mPlayer.New({ OnPlayer = func(scope): players += 1, OnCharacter = func(scope): characters += 1 }, fake.Adapter)
+        fake.Join(player)
+        fake.SetCharacter(player, Character("new"))
+        Fire(fake.Added, player)
+        Fire(player.Changed, nil)
+        suite.Equal(players, 1, "one setup for membership")
+        suite.Equal(characters, 1, "one setup for character identity")
+        watch.Destroy()
+    )
+    suite.Test("replacement invalidates and drains old character before new callback", func():
+        local player = Player("replace", 1)
+        player.Character = Character("old")
+        local fake = Fake([player])
+        local old_scope = nil
+        local log = ""
+        local watch = mPlayer.New({ OnCharacter = func(scope):
+            local character = scope.GetCharacter()
+            log += character.Name + ";"
+            if character.Name == "old":
+                old_scope = scope
+                scope.Add(func():
+                    suite.Expect(not scope.IsActive(), "inactive before teardown")
+                    suite.Equal(scope.GetCharacter(), nil, "expired handle releases character")
+                    log += "clean;"
+                )
+        }, fake.Adapter)
+        local old_character = player.Character
+        fake.SetCharacter(player, Character("new"))
+        Fire(old_character.Destroyed, nil)
+        suite.Equal(log, "old;clean;new;", "old teardown precedes new setup")
+        suite.Expect(not old_scope.IsActive(), "retained scope inactive")
+        suite.Throws(func(): old_scope.Add(func(): return nil), "expired registration rejected")
+        watch.Destroy()
+    )
+    suite.Test("replacement while adopting the end subscription skips stale character setup", func():
+        local player = Player("adopting", 1)
+        local old = Character("old")
+        local current = Character("current")
+        player.Character = old
+        local fake = Fake([player])
+        local connect = fake.Adapter.ConnectEnded
+        fake.Adapter.ConnectEnded = func(character, callback):
+            local connection = connect(character, callback)
+            if character == old: fake.SetCharacter(player, current)
+            return connection
+        local calls = []
+        local watch = mPlayer.New({ OnCharacter = func(scope): calls.push(scope.GetCharacter()) }, fake.Adapter)
+        suite.Equal(calls.length, 1, "stale character callback skipped")
+        suite.Equal(calls[0], current, "only the current character is initialized")
+        suite.Equal(watch.GetCharacter(player), current, "current character observed")
+        suite.Equal(old.Destroyed.GetListenerCount(), 0, "superseded subscription released")
+        watch.Destroy()
+        suite.Equal(current.Destroyed.GetListenerCount(), 0, "current subscription released")
+    )
+    suite.Test("removal while adopting the end subscription closes every scope", func():
+        local player = Player("departing", 1)
+        local character = Character("old")
+        player.Character = character
+        local fake = Fake([player])
+        local connect = fake.Adapter.ConnectEnded
+        fake.Adapter.ConnectEnded = func(current, callback):
+            local connection = connect(current, callback)
+            fake.Leave(player)
+            return connection
+        local calls = 0
+        local cleaned = 0
+        local watch = mPlayer.New({
+            OnPlayer = func(scope): scope.Add(func(): cleaned += 1),
+            OnCharacter = func(scope): calls += 1
+        }, fake.Adapter)
+        suite.Equal(calls, 0, "removed membership cannot initialize a character")
+        suite.Equal(cleaned, 1, "player scope drained once")
+        suite.Equal(watch.GetPlayers().length, 0, "removed membership excluded")
+        suite.Equal(character.Destroyed.GetListenerCount(), 0, "adopted end subscription released")
+        suite.Equal(player.Changed.GetListenerCount(), 0, "player subscription released")
+        watch.Destroy()
+    )
+    suite.Test("character destruction closes its lifetime before respawn", func():
+        local player = Player("destroy", 1)
+        player.Character = Character("old")
+        local fake = Fake([player])
+        local cleaned = 0
+        local calls = 0
+        local watch = mPlayer.New({ OnCharacter = func(scope):
+            calls += 1
+            scope.Add(func(): cleaned += 1)
+        }, fake.Adapter)
+        fake.DestroyCharacter(player)
+        suite.Equal(cleaned, 1, "destroyed character cleaned")
+        suite.Equal(watch.GetCharacter(player), nil, "no current character")
+        fake.SetCharacter(player, Character("respawn"))
+        suite.Equal(calls, 2, "respawn observed")
+        watch.Destroy()
+        suite.Equal(cleaned, 2, "new character also cleaned")
+    )
+    suite.Test("leave closes character then player and clears retained scopes", func():
+        local player = Player("leave", 1)
+        player.Character = Character("avatar")
+        local fake = Fake([player])
+        local scopes = []
+        local log = ""
+        local watch = mPlayer.New({
+            OnPlayer = func(scope):
+                scopes.push(scope)
+                scope.Add(func(): log += "player;")
+            ,
+            OnCharacter = func(scope):
+                scopes.push(scope)
+                scope.Add(func(): log += "character;")
+        }, fake.Adapter)
+        fake.Leave(player)
+        suite.Equal(log, "character;player;", "nested lifetime closes first")
+        suite.Equal(watch.GetPlayers().length, 0, "departed membership removed")
+        for scope in scopes:
+            suite.Expect(not scope.IsActive(), "scope inactive")
+            suite.Equal(scope.GetPlayer(), nil, "player reference released")
+            suite.Equal(scope.GetCharacter(), nil, "character reference released")
+        watch.Destroy()
+    )
+    suite.Test("same user ID on another player object cannot be purged by old leave", func():
+        local old = Player("old", 7)
+        local replacement = Player("replacement", 7)
+        local fake = Fake([old])
+        local watch = mPlayer.New({ OnPlayer = func(scope): return nil }, fake.Adapter)
+        fake.Join(replacement)
+        fake.Leave(old)
+        suite.Equal(watch.GetPlayers().length, 1, "replacement remains")
+        suite.Equal(watch.GetPlayers()[0], replacement, "object identity is membership key")
+        watch.Destroy()
+    )
+    suite.Test("connect first snapshot race cannot double initialize a join", func():
+        local player = Player("racing", 1)
+        local fake = Fake([player])
+        fake.OnSnapshot = func():
+            fake.OnSnapshot = nil
+            Fire(fake.Added, player)
+        local calls = 0
+        local watch = mPlayer.New({ OnPlayer = func(scope): calls += 1 }, fake.Adapter)
+        suite.Equal(calls, 1, "event and snapshot share one membership")
+        watch.Destroy()
+    )
+    suite.Test("stale snapshot skips a player removed during snapshot", func():
+        local player = Player("departing", 1)
+        local fake = Fake([player])
+        fake.OnSnapshot = func():
+            fake.OnSnapshot = nil
+            fake.Leave(player)
+        local calls = 0
+        local watch = mPlayer.New({ OnPlayer = func(scope): calls += 1 }, fake.Adapter)
+        suite.Equal(calls, 0, "IsPresent rejects stale membership")
+        watch.Destroy()
+    )
+    suite.Test("player callback failure cleans resources and does not retry same membership", func():
+        local bad = Player("bad", 1)
+        local good = Player("good", 2)
+        local fake = Fake([bad, good])
+        local calls = 0
+        local cleaned = 0
+        local failures = []
+        local watch = mPlayer.New({
+            OnPlayer = func(scope):
+                calls += 1
+                if scope.GetPlayer() == bad:
+                    scope.Add(func(): cleaned += 1)
+                    throw "setup"
+            ,
+            OnError = func(stage, failure):
+                suite.Equal(cleaned, 1, "cleanup precedes failure report")
+                failures.push(stage + ":" + failure)
+        }, fake.Adapter)
+        Fire(fake.Added, bad)
+        suite.Equal(calls, 2, "other membership initialized once")
+        suite.Equal(failures[0], "OnPlayer:setup", "original callback failure")
+        suite.Equal(bad.Changed.GetListenerCount(), 0, "failed player subscriptions released")
+        watch.Destroy()
+    )
+    suite.Test("character callback failure is cleaned and next character can recover", func():
+        local player = Player("recover", 1)
+        player.Character = Character("bad")
+        local fake = Fake([player])
+        local calls = 0
+        local cleaned = 0
+        local problem = { Code = "character" }
+        local errors = []
+        local watch = mPlayer.New({
+            OnCharacter = func(scope):
+                calls += 1
+                if scope.GetCharacter().Name == "bad":
+                    scope.Add(func(): cleaned += 1)
+                    throw problem
+            ,
+            OnError = func(stage, failure): errors.push({ Stage = stage, Error = failure })
+        }, fake.Adapter)
+        Fire(player.Changed, nil)
+        suite.Equal(calls, 1, "failed identity is not retried")
+        suite.Equal(cleaned, 1, "failed scope drained")
+        suite.Equal(errors[0].Error, problem, "original thrown object")
+        fake.SetCharacter(player, Character("good"))
+        suite.Equal(calls, 2, "next identity initialized")
+        suite.Expect(not watch.IsDestroyed(), "observer continues")
+        watch.Destroy()
+    )
+    suite.Test("cleanup errors do not abandon remaining resources", func():
+        local player = Player("cleanup", 1)
+        local fake = Fake([player])
+        local cleaned = 0
+        local errors = []
+        local watch = mPlayer.New({
+            OnPlayer = func(scope):
+                scope.Add(func(): cleaned += 1)
+                scope.Add(func(): throw "cleanup")
+            ,
+            OnError = func(stage, failure): errors.push(stage + ":" + failure)
+        }, fake.Adapter)
+        fake.Leave(player)
+        suite.Equal(cleaned, 1, "other teardown ran")
+        suite.Equal(errors[0], "Cleanup:cleanup", "teardown failure observed")
+        watch.Destroy()
+    )
+    suite.Test("Destroy disconnects signals and is idempotent", func():
+        local player = Player("stop", 1)
+        local character = Character("avatar")
+        player.Character = character
+        local fake = Fake([player])
+        local calls = 0
+        local watch = mPlayer.New({ OnCharacter = func(scope): calls += 1 }, fake.Adapter)
+        watch.Destroy()
+        watch.Destroy()
+        fake.Join(Player("later", 2))
+        suite.Equal(calls, 1, "no new callbacks")
+        suite.Equal(fake.Added.GetListenerCount(), 0, "added disconnected")
+        suite.Equal(fake.Removed.GetListenerCount(), 0, "removed disconnected")
+        suite.Equal(player.Changed.GetListenerCount(), 0, "character changes disconnected")
+        suite.Equal(character.Destroyed.GetListenerCount(), 0, "destroyed disconnected")
+        suite.Equal(watch.GetPlayers().length, 0, "closed roster empty")
+    )
+    suite.Test("Destroy inside callback invalidates before returning and drains after callback", func():
+        local fake = Fake([])
+        local watch = nil
+        local cleaned = 0
+        local active_after = true
+        local rejected = false
+        watch = mPlayer.New({ OnPlayer = func(scope):
+            scope.Add(func(): cleaned += 1)
+            watch.Destroy()
+            active_after = scope.IsActive()
+            try:
+                scope.Add(func(): return nil)
+            catch inactive:
+                rejected = true
+        }, fake.Adapter)
+        fake.Join(Player("reentrant", 1))
+        suite.Equal(active_after, false, "immediate invalidation")
+        suite.Expect(rejected, "closed scope rejects work")
+        suite.Equal(cleaned, 1, "active consumer finishes teardown")
+        suite.Expect(watch.IsDestroyed(), "closed permanently")
+    )
+    suite.Test("startup adapter error disconnects already adopted subscriptions", func():
+        local fake = Fake([])
+        fake.Adapter.ConnectRemoved = func(callback): throw "adapter"
+        suite.Throws(func():
+            mPlayer.New({ OnPlayer = func(scope): return nil }, fake.Adapter)
+        , "startup fails")
+        suite.Equal(fake.Added.GetListenerCount(), 0, "partial startup subscription released")
+    )
+    suite.Test("configured player capacity retires observer and cleans old scopes", func():
+        local fake = Fake([])
+        local cleaned = 0
+        local stages = []
+        local watch = mPlayer.New({
+            MaxPlayers = 1,
+            OnPlayer = func(scope): scope.Add(func(): cleaned += 1),
+            OnError = func(stage, failure): stages.push(stage)
+        }, fake.Adapter)
+        fake.Join(Player("first", 1))
+        fake.Join(Player("overflow", 2))
+        suite.Expect(watch.IsDestroyed(), "capacity fails closed")
+        suite.Equal(cleaned, 1, "old scope cleaned")
+        suite.Equal(stages[0], "Capacity", "capacity is observable")
+    )
+    suite.Test("reentrant character event storm is bounded", func():
+        local fake = Fake([])
+        local player = Player("storm", 1)
+        local calls = 0
+        local stages = []
+        local watch = mPlayer.New({
+            MaxPlayers = 1,
+            OnCharacter = func(scope):
+                calls += 1
+                fake.SetCharacter(player, Character("next" + calls))
+            ,
+            OnError = func(stage, failure): stages.push(stage)
+        }, fake.Adapter)
+        fake.Join(player)
+        fake.SetCharacter(player, Character("start"))
+        suite.Expect(watch.IsDestroyed(), "event budget retires observer")
+        suite.Expect(calls <= 21, "bounded callback work")
+        suite.Equal(stages[0], "Capacity", "storm failure reported")
+    )
+    suite.Test("invalid options and adapter shapes reject before subscriptions", func():
+        for config in [nil, [], {}, { OnPlayer = func(scope): return nil, MaxPlayers = 0 }, { OnPlayer = func(scope): return nil, MaxPlayers = 1.000000000001 }]:
+            suite.Throws(func(): mPlayer.New(config, Fake([]).Adapter), "invalid options")
+        suite.Throws(func(): mPlayer.New({ OnPlayer = func(scope): return nil }, {}), "missing adapter fields")
+    )
+    return suite.Report()
+
+return { Run = Run }

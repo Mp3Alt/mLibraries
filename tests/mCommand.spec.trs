@@ -1,0 +1,616 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mCommand = import("/mLibraries/mCommand")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local Repeat = func(text, count):
+    local result = ""
+    for index in range(count):
+        result += text
+    return result
+
+local Allowed = expr(): { Authorize = expr(description): true }
+
+local Run = func():
+    local suite = mTestKit.New("mCommand")
+    local Register = func(commands, definition):
+        local result = commands.Register(definition)
+        suite.Expect(result.Ok, "registration succeeds: " + tostring(result.Code))
+        return result
+
+    suite.Test("parser separates spaces and tabs and normalizes ASCII command names", func():
+        local result = mCommand.New().Parse(" \tPiNg alpha\t42 ")
+        suite.Expect(result.Ok, "input parses")
+        suite.Equal(result.Value.Name, "ping", "normalized command")
+        suite.Equal(result.Value.Tokens.length, 2, "argument count")
+        suite.Equal(result.Value.Tokens[0], "alpha", "first argument")
+        suite.Equal(result.Value.Tokens[1], "42", "second argument")
+    )
+
+    suite.Test("quoted strings preserve spaces Unicode and empty values", func():
+        local result = mCommand.New().Parse('echo "hello there" "" "café"')
+        suite.Expect(result.Ok, "quoted input parses")
+        suite.Equal(result.Value.Tokens[0], "hello there", "space preserved")
+        suite.Equal(result.Value.Tokens[1], "", "empty string preserved")
+        suite.Equal(result.Value.Tokens[2], "café", "Unicode preserved")
+    )
+
+    suite.Test("quoted escapes support only quote and backslash", func():
+        local result = mCommand.New().Parse('echo "a\\\"b\\\\c"')
+        suite.Expect(result.Ok, "supported escapes parse")
+        suite.Equal(result.Value.Tokens[0], 'a"b\\c', "escapes decoded once")
+        suite.Equal(mCommand.New().Parse('echo "a\\q"').Code, "InvalidSyntax", "unknown escape rejected")
+        suite.Equal(mCommand.New().Parse('echo "a\\n"').Code, "InvalidSyntax", "newline escape rejected")
+        suite.Equal(mCommand.New().Parse('echo a\\b').Code, "InvalidSyntax", "unquoted backslash rejected")
+    )
+
+    suite.Test("malformed quote boundaries are rejected", func():
+        local commands = mCommand.New()
+        local bad = ['echo "open', 'echo "closed"tail', 'echo ab"cd', 'echo "tail\\']
+        for text in bad:
+            suite.Equal(commands.Parse(text).Code, "InvalidSyntax", "malformed quote rejected")
+    )
+
+    suite.Test("chaining and line breaks are rejected", func():
+        local commands = mCommand.New()
+        local bad = ["help;help", "help\nhelp", "help\rhelp", "help && help", "help | help", "help || help", 'echo "a;b"']
+        for text in bad:
+            suite.Equal(commands.Parse(text).Code, "InvalidSyntax", "multiple-command syntax rejected")
+        suite.Expect(commands.Parse('echo "a&b|c"').Ok, "quoted operators remain data")
+    )
+
+    suite.Test("blank and non-string inputs return structured failures", func():
+        local commands = mCommand.New()
+        suite.Equal(commands.Parse("").Code, "EmptyInput", "empty input")
+        suite.Equal(commands.Parse(" \t ").Code, "EmptyInput", "blank input")
+        local values = [nil, false, 0, [], {}, { text = "help" }]
+        for value in values:
+            local result = commands.Parse(value)
+            suite.Equal(result.Ok, false, "bad type is not success")
+            suite.Equal(result.Code, "InvalidInput", "bad type code")
+    )
+
+    suite.Test("C1 controls are rejected even inside quoted data", func():
+        # The string below deliberately contains U+0081, not a backslash escape.
+        local text = 'echo "beforeafter"'
+        suite.Equal(mCommand.New().Parse(text).Code, "InvalidSyntax", "C1 control rejected")
+    )
+
+    suite.Test("input length boundary is checked before token work", func():
+        local commands = mCommand.New()
+        local edge = 'echo "' + Repeat("x", 505) + '"'
+        suite.Equal(string.length(edge), 512, "edge fixture length")
+        suite.Expect(commands.Parse(edge).Ok, "512 characters accepted")
+        suite.Equal(commands.Parse(edge + " ").Code, "InvalidInput", "513 characters rejected")
+    )
+
+    suite.Test("token limit includes the command", func():
+        local commands = mCommand.New()
+        local text = "echo" + Repeat(" x", 15)
+        local edge = commands.Parse(text)
+        suite.Expect(edge.Ok, "16 total tokens accepted")
+        suite.Equal(edge.Value.Tokens.length, 15, "15 argument tokens")
+        suite.Equal(commands.Parse(text + " x").Code, "TooManyTokens", "17 tokens rejected")
+    )
+
+    suite.Test("command names are bounded ASCII identifiers without prefixes", func():
+        local commands = mCommand.New()
+        local bad = ["1help", "/help", ":help", "héllo", "a.b", Repeat("a", 33)]
+        for text in bad:
+            suite.Equal(commands.Parse(text).Code, "InvalidSyntax", "invalid command name")
+        suite.Equal(commands.Parse("Some_name-2").Value.Name, "some_name-2", "allowed name punctuation")
+    )
+
+    suite.Test("minimal definitions receive copied empty metadata", func():
+        local commands = mCommand.New()
+        local result = Register(commands, { Name = "PING", Run = expr(context, args): "pong" })
+        suite.Equal(result.Value.Name, "ping", "canonical name")
+        suite.Equal(result.Value.Description, "", "empty description")
+        suite.Equal(result.Value.Aliases.length, 0, "empty aliases")
+        suite.Equal(result.Value.Arguments.length, 0, "empty arguments")
+        suite.Equal(result.Value.Run, nil, "handler is private")
+        suite.Equal(commands.Execute(Allowed(), "PiNg").Value, "pong", "registered handler")
+    )
+
+    suite.Test("aliases execute the canonical command", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "ping", Aliases = ["P", "PONG"], Run = expr(context, args): true })
+        local canonical = nil
+        local context = { Authorize = func(description):
+            canonical = description.Name
+            return true
+        }
+        suite.Expect(commands.Execute(context, "PONG").Ok, "alias dispatch")
+        suite.Equal(canonical, "ping", "authorization uses canonical metadata")
+    )
+
+    suite.Test("name and alias collisions are case insensitive", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "first", Aliases = ["f"], Run = expr(context, args): 1 })
+        local definitions = [
+            { Name = "FIRST", Run = expr(context, args): 2 },
+            { Name = "F", Run = expr(context, args): 2 },
+            { Name = "second", Aliases = ["FIRST"], Run = expr(context, args): 2 },
+            { Name = "second", Aliases = ["F"], Run = expr(context, args): 2 }
+        ]
+        for definition in definitions:
+            suite.Equal(commands.Register(definition).Code, "DuplicateName", "collision rejected")
+        suite.Equal(commands.Describe().Value.length, 1, "no partial registrations")
+    )
+
+    suite.Test("aliases must be distinct within one definition", func():
+        local commands = mCommand.New()
+        suite.Equal(commands.Register({ Name = "ping", Aliases = ["PING"], Run = expr(context, args): true }).Code, "DuplicateName", "alias cannot equal name")
+        suite.Equal(commands.Register({ Name = "ping", Aliases = ["p", "P"], Run = expr(context, args): true }).Code, "DuplicateName", "duplicate aliases")
+    )
+
+    suite.Test("malformed definition records never throw or register", func():
+        local commands = mCommand.New()
+        local definitions = [nil, false, 7, "ping", [], {}, { Name = "ping" }, { Name = "ping", Run = expr(context, args): true, Extra = true }]
+        for definition in definitions:
+            suite.Equal(commands.Register(definition).Code, "InvalidDefinition", "bad definition rejected")
+        suite.Equal(commands.Describe().Value.length, 0, "registry unchanged")
+    )
+
+    suite.Test("invalid name types and characters are rejected", func():
+        local commands = mCommand.New()
+        local names = [nil, 0, false, [], {}, "", "1name", "white space", "héllo", "a.b", Repeat("a", 33)]
+        for name in names:
+            suite.Equal(commands.Register({ Name = name, Run = expr(context, args): true }).Code, "InvalidDefinition", "invalid name rejected")
+    )
+
+    suite.Test("aliases must be arrays and are bounded at eight", func():
+        local commands = mCommand.New()
+        local aliases = []
+        for index in range(8):
+            aliases.push("alias" + index)
+        Register(commands, { Name = "first", Aliases = aliases, Run = expr(context, args): true })
+        aliases.push("extra")
+        suite.Equal(commands.Register({ Name = "second", Aliases = aliases, Run = expr(context, args): true }).Code, "InvalidDefinition", "ninth alias rejected")
+        suite.Equal(commands.Register({ Name = "second", Aliases = {}, Run = expr(context, args): true }).Code, "InvalidDefinition", "dictionary aliases rejected")
+        suite.Equal(commands.Register({ Name = "second", Aliases = "alias", Run = expr(context, args): true }).Code, "InvalidDefinition", "string aliases rejected")
+    )
+
+    suite.Test("forged array dictionaries cannot invoke supplied methods", func():
+        local commands = mCommand.New()
+        local invoked = false
+        local forged = { length = 0, index_of = func(value):
+            invoked = true
+            return -1
+        }
+        suite.Equal(commands.Register({ Name = "ping", Aliases = forged, Run = expr(context, args): true }).Code, "InvalidDefinition", "forged aliases rejected")
+        suite.Equal(commands.Register({ Name = "ping", Arguments = forged, Run = expr(context, args): true }).Code, "InvalidDefinition", "forged arguments rejected")
+        suite.Equal(invoked, false, "user method never called during shape checks")
+    )
+
+    suite.Test("argument definitions require supported types and distinct names", func():
+        local commands = mCommand.New()
+        local bad = [
+            {}, "argument", [nil], ["argument"],
+            [{ Name = "target", Type = "player" }],
+            [{ Name = "count", Type = "NUMBER" }],
+            [{ Name = "count", Type = "number", Optional = true }],
+            [{ Name = "count", Type = "number" }, { Name = "COUNT", Type = "number" }]
+        ]
+        for arguments in bad:
+            suite.Equal(commands.Register({ Name = "test", Arguments = arguments, Run = expr(context, args): true }).Code, "InvalidDefinition", "invalid argument definition")
+    )
+
+    suite.Test("argument limit is fifteen", func():
+        local commands = mCommand.New()
+        local arguments = []
+        for index in range(15):
+            arguments.push({ Name = "arg" + index, Type = "string" })
+        Register(commands, { Name = "edge", Arguments = arguments, Run = expr(context, args): true })
+        suite.Expect(commands.Execute(Allowed(), "edge" + Repeat(" x", 15)).Ok, "maximum argument count executes")
+        arguments.push({ Name = "extra", Type = "string" })
+        suite.Equal(commands.Register({ Name = "over", Arguments = arguments, Run = expr(context, args): true }).Code, "InvalidDefinition", "sixteenth definition rejected")
+    )
+
+    suite.Test("descriptions are bounded strings", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "edge", Description = Repeat("x", 160), Run = expr(context, args): true })
+        suite.Equal(commands.Register({ Name = "over", Description = Repeat("x", 161), Run = expr(context, args): true }).Code, "InvalidDefinition", "long description")
+        suite.Equal(commands.Register({ Name = "bad", Description = false, Run = expr(context, args): true }).Code, "InvalidDefinition", "non-string description")
+    )
+
+    suite.Test("failed registration does not reserve names or aliases", func():
+        local commands = mCommand.New()
+        local failed = commands.Register({ Name = "ping", Aliases = ["p"], Arguments = [{ Name = "bad", Type = "unsupported" }], Run = expr(context, args): true })
+        suite.Equal(failed.Ok, false, "invalid registration fails")
+        Register(commands, { Name = "ping", Aliases = ["p"], Run = expr(context, args): true })
+        suite.Expect(commands.Execute(Allowed(), "p").Ok, "names remain available")
+    )
+
+    suite.Test("definitions are copied before registration returns", func():
+        local commands = mCommand.New()
+        local definition = { Name = "echo", Aliases = ["say"], Description = "original", Arguments = [{ Name = "Text", Type = "string" }], Run = expr(context, args): args.text }
+        Register(commands, definition)
+        definition.Name = "changed"
+        definition.Aliases[0] = "new"
+        definition.Arguments[0].Name = "changed"
+        definition.Arguments[0].Type = "number"
+        definition.Description = "changed"
+        definition.Run = expr(context, args): "wrong"
+        suite.Equal(commands.Execute(Allowed(), "say hello").Value, "hello", "copied handler and argument metadata")
+        suite.Equal(commands.Describe().Value[0].Description, "original", "copied description")
+        suite.Equal(commands.Execute(Allowed(), "new hello").Code, "UnknownCommand", "mutated alias not registered")
+    )
+
+    suite.Test("registration and description outputs cannot mutate registry metadata", func():
+        local commands = mCommand.New()
+        local registered = Register(commands, { Name = "echo", Aliases = ["say"], Arguments = [{ Name = "value", Type = "string" }], Run = expr(context, args): args.value })
+        registered.Value.Name = "changed"
+        registered.Value.Aliases[0] = "new"
+        registered.Value.Arguments[0].Type = "number"
+        local described = commands.Describe()
+        described.Value[0].Arguments[0].Name = "other"
+        described.Value[0].Aliases.push("extra")
+        described.Value.push({ Name = "fake" })
+        suite.Equal(commands.Execute(Allowed(), "say hello").Value, "hello", "private metadata unchanged")
+        suite.Equal(commands.Describe().Value.length, 1, "private command count")
+        suite.Equal(commands.Describe().Value[0].Aliases.length, 1, "private alias count")
+    )
+
+    suite.Test("registry limit is sixty-four commands", func():
+        local commands = mCommand.New()
+        for index in range(64):
+            Register(commands, { Name = "command" + index, Run = expr(context, args): true })
+        suite.Equal(commands.Describe().Value.length, 64, "maximum command count")
+        suite.Equal(commands.Register({ Name = "overflow", Run = expr(context, args): true }).Code, "RegistryFull", "overflow rejected")
+    )
+
+    suite.Test("Describe preserves registration order without exposing handlers", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "zebra", Run = expr(context, args): true })
+        Register(commands, { Name = "alpha", Run = expr(context, args): true })
+        local described = commands.Describe().Value
+        suite.Equal(described[0].Name, "zebra", "first registration")
+        suite.Equal(described[1].Name, "alpha", "second registration")
+        suite.Equal(described[0].Run, nil, "handler omitted")
+    )
+
+    suite.Test("unknown and malformed commands do not call authorization or handlers", func():
+        local commands = mCommand.New()
+        local authorizations = 0
+        local calls = 0
+        Register(commands, { Name = "ping", Run = func(context, args): calls += 1 })
+        local context = { Authorize = func(description):
+            authorizations += 1
+            return true
+        }
+        suite.Equal(commands.Execute(context, "unknown").Code, "UnknownCommand", "unknown command")
+        suite.Equal(commands.Execute(context, "ping;ping").Code, "InvalidSyntax", "malformed command")
+        suite.Equal(authorizations, 0, "no authorization for unsupported input")
+        suite.Equal(calls, 0, "no handler called")
+    )
+
+    suite.Test("authorization precedes conversion and handler execution", func():
+        local commands = mCommand.New()
+        local calls = 0
+        Register(commands, { Name = "count", Arguments = [{ Name = "amount", Type = "number" }], Run = func(context, args): calls += 1 })
+        local authorized = 0
+        local context = { Authorize = func(description):
+            authorized += 1
+            return false
+        }
+        suite.Equal(commands.Execute(context, "count invalid").Code, "Unauthorized", "deny precedes number validation")
+        suite.Equal(commands.Execute(context, "count").Code, "Unauthorized", "deny precedes arity validation")
+        suite.Equal(authorized, 2, "authorization invoked")
+        suite.Equal(calls, 0, "denied handler never runs")
+    )
+
+    suite.Test("missing or malformed authorization context is denied", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "ping", Run = expr(context, args): true })
+        local contexts = [nil, false, 0, [], {}, "context"]
+        for context in contexts:
+            suite.Equal(commands.Execute(context, "ping").Code, "Unauthorized", "invalid context denied")
+    )
+
+    suite.Test("authorization must return literal true", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "ping", Run = expr(context, args): true })
+        local values = [nil, false, 0, 1, "true", [], {}]
+        for value in values:
+            local context = { Authorize = expr(description): value }
+            suite.Equal(commands.Execute(context, "ping").Code, "Unauthorized", "non-true result denied")
+    )
+
+    suite.Test("authorization exceptions and non-callable fields stay private", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "ping", Run = expr(context, args): true })
+        local throwing = { Authorize = func(description): throw "private authorization secret" }
+        local result = commands.Execute(throwing, "ping")
+        suite.Equal(result.Code, "AuthorizationFailed", "authorization failure code")
+        suite.Equal(result.Message, "Command authorization failed.", "static public message")
+        suite.Equal(result.Error, nil, "raw exception omitted")
+        suite.Equal(commands.Execute({ Authorize = 4 }, "ping").Code, "AuthorizationFailed", "non-callable authorization contained")
+    )
+
+    suite.Test("authorization receives a fresh description with no handler", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "count", Aliases = ["c"], Arguments = [{ Name = "amount", Type = "number" }], Run = expr(context, args): args.amount })
+        local context = { Authorize = func(description):
+            suite.Equal(description.Name, "count", "canonical metadata")
+            suite.Equal(description.Run, nil, "no handler exposed")
+            description.Name = "changed"
+            description.Aliases[0] = "new"
+            description.Arguments[0].Type = "string"
+            return true
+        }
+        suite.Equal(commands.Execute(context, "c 7").Value, 7, "authorization cannot change conversion")
+        suite.Equal(commands.Describe().Value[0].Name, "count", "name remains private")
+        suite.Equal(commands.Describe().Value[0].Arguments[0].Type, "number", "type remains private")
+    )
+
+    suite.Test("argument count is exact", func():
+        local commands = mCommand.New()
+        local calls = 0
+        Register(commands, { Name = "echo", Arguments = [{ Name = "value", Type = "string" }], Run = func(context, args): calls += 1 })
+        suite.Equal(commands.Execute(Allowed(), "echo").Code, "ArgumentCount", "missing argument")
+        suite.Equal(commands.Execute(Allowed(), "echo one two").Code, "ArgumentCount", "extra argument")
+        suite.Equal(calls, 0, "invalid arity never executes")
+    )
+
+    suite.Test("number arguments accept finite decimal and exponent forms", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "number", Arguments = [{ Name = "Value", Type = "number" }], Run = expr(context, args): args.value })
+        local cases = [["0", 0], ["+42", 42], ["-.5", -0.5], ["1.", 1], ["1.2e2", 120], ["-2E-2", -0.02]]
+        for example in cases:
+            local result = commands.Execute(Allowed(), "number " + example[0])
+            suite.Expect(result.Ok, "finite number succeeds")
+            suite.Equal(result.Value, example[1], "converted numeric value")
+    )
+
+    suite.Test("number arguments reject NaN infinity overflow and non-decimal syntax", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "number", Arguments = [{ Name = "value", Type = "number" }], Run = expr(context, args): args.value })
+        local values = ["NaN", "Infinity", "-Infinity", "1e999", "0x10", "1,000", "12x", "--1", '" 2"', '""']
+        for value in values:
+            suite.Equal(commands.Execute(Allowed(), "number " + value).Code, "InvalidArgument", "invalid number rejected")
+    )
+
+    suite.Test("boolean arguments accept true and false without truthiness conversion", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "boolean", Arguments = [{ Name = "value", Type = "boolean" }], Run = expr(context, args): args.value })
+        suite.Equal(commands.Execute(Allowed(), "boolean TRUE").Value, true, "true accepted")
+        local result = commands.Execute(Allowed(), "boolean False")
+        suite.Expect(result.Ok, "false is success")
+        suite.Equal(result.Value, false, "false retained")
+        for value in ["0", "1", "on", "off", '""', "truＥ", "falſe"]:
+            suite.Equal(commands.Execute(Allowed(), "boolean " + value).Code, "InvalidArgument", "not a boolean token")
+    )
+
+    suite.Test("string arguments are data rather than executable source", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "echo", Arguments = [{ Name = "text", Type = "string" }], Run = expr(context, args): args.text })
+        suite.Equal(commands.Execute(Allowed(), 'echo "world.Destroy()"').Value, "world.Destroy()", "source-looking text remains text")
+        suite.Equal(commands.Execute(Allowed(), 'echo ""').Value, "", "empty string accepted")
+        suite.Equal(commands.Execute(Allowed(), 'echo "nil"').Value, "nil", "nil text stays string")
+    )
+
+    suite.Test("handlers preserve nil false and zero in successful envelopes", func():
+        for value in [nil, false, 0]:
+            local commands = mCommand.New()
+            Register(commands, { Name = "value", Run = expr(context, args): value })
+            local result = commands.Execute(Allowed(), "value")
+            suite.Equal(result.Ok, true, "tagged success")
+            suite.Equal(result.Value, value, "unaltered result")
+    )
+
+    suite.Test("handler exceptions are generic even for nil and table throws", func():
+        for value in [nil, "private handler secret", { Secret = "private" }]:
+            local commands = mCommand.New()
+            Register(commands, { Name = "fail", Run = func(context, args): throw value })
+            local result = commands.Execute(Allowed(), "fail")
+            suite.Equal(result.Ok, false, "failure tag")
+            suite.Equal(result.Code, "CommandFailed", "handler failure code")
+            suite.Equal(result.Message, "Command execution failed.", "static public error")
+            suite.Equal(result.Error, nil, "no raw exception")
+            suite.Equal(result.Value, nil, "no leaked thrown value")
+    )
+
+    suite.Test("non-callable handlers fail only at authorized invocation", func():
+        local commands = mCommand.New()
+        Register(commands, { Name = "bad", Run = false })
+        suite.Equal(commands.Execute({ Authorize = expr(description): false }, "bad").Code, "Unauthorized", "deny before invalid call")
+        suite.Equal(commands.Execute(Allowed(), "bad").Code, "CommandFailed", "invalid call contained")
+    )
+
+    suite.Test("each dispatch owns fresh typed arguments and keeps context identity", func():
+        local commands = mCommand.New()
+        local context = Allowed()
+        local observed = nil
+        Register(commands, { Name = "count", Arguments = [{ Name = "amount", Type = "number" }], Run = func(received, args):
+            observed = received
+            local value = args.amount
+            args.amount = 999
+            return value
+        })
+        suite.Equal(commands.Execute(context, "count 2").Value, 2, "first argument")
+        suite.Equal(commands.Execute(context, "count 3").Value, 3, "new argument record")
+        suite.Equal(observed, context, "trusted context passed unchanged")
+    )
+
+    suite.Test("independent registries do not share definitions", func():
+        local first = mCommand.New()
+        local second = mCommand.New()
+        Register(first, { Name = "ping", Run = expr(context, args): true })
+        suite.Equal(second.Execute(Allowed(), "ping").Code, "UnknownCommand", "registry isolation")
+        suite.Equal(second.Describe().Value.length, 0, "empty independent description")
+    )
+
+    return suite.Report()
+
+# Native-script entry point. Importing it is safe; calling it requires Play.
+local RunConcurrent = func():
+    local suite = mTestKit.New("mCommandConcurrent")
+    local WaitAll = func(done):
+        for turn in range(600):
+            local complete = true
+            for finished in done:
+                if not finished:
+                    complete = false
+            if complete:
+                return true
+            wait(0)
+        return false
+
+    suite.Test("concurrent registration publishes every accepted name and alias", func():
+        local commands = mCommand.New()
+        local done = [false, false, false, false, false]
+        local errors = []
+        local control = { Stop = false }
+        local WritersDone = func():
+            for index in range(4):
+                if not done[index]:
+                    return false
+            return true
+
+        for worker in range(4):
+            spawn(func():
+                try:
+                    for position in range(16):
+                        if control.Stop:
+                            return
+                        local index = worker * 16 + position
+                        local name = "command" + index
+                        local definition = {
+                            Name = name,
+                            Aliases = ["alias" + index, "short" + index],
+                            Run = expr(context, args): name
+                        }
+                        local accepted = false
+                        for attempt in range(600):
+                            if control.Stop:
+                                return
+                            local result = commands.Register(definition)
+                            if result.Ok:
+                                accepted = true
+                                break
+                            if result.Code != "RegistrationBusy":
+                                errors.push("registration failed: " + tostring(result.Code))
+                                return
+                            wait(0)
+                        if not accepted:
+                            errors.push("registration retry limit reached")
+                            return
+                catch failure:
+                    errors.push(failure)
+                finally:
+                    done[worker] = true
+            )
+
+        spawn(func():
+            try:
+                for turn in range(600):
+                    if control.Stop or WritersDone():
+                        return
+                    local described = commands.Describe()
+                    if not described.Ok:
+                        errors.push("description failed")
+                        return
+                    for description in described.Value:
+                        for alias in description.Aliases:
+                            local result = commands.Execute(Allowed(), alias)
+                            if not result.Ok or result.Value != description.Name:
+                                errors.push("published alias could not execute its canonical command")
+                                return
+                    wait(0)
+                errors.push("registration observer limit reached")
+            catch failure:
+                errors.push(failure)
+            finally:
+                done[4] = true
+        )
+
+        local finished = WaitAll(done)
+        control.Stop = true
+        suite.Expect(finished, "all registration workers completed")
+        suite.Equal(errors.length, 0, "registration and observer workers had no failures")
+        suite.Equal(commands.Describe().Value.length, 64, "no accepted registrations were lost")
+        for index in range(64):
+            local first = commands.Execute(Allowed(), "alias" + index)
+            local second = commands.Execute(Allowed(), "short" + index)
+            suite.Expect(first.Ok, "first alias executes")
+            suite.Expect(second.Ok, "second alias executes")
+            suite.Equal(first.Value, "command" + index, "first alias maps correctly")
+            suite.Equal(second.Value, "command" + index, "second alias maps correctly")
+    )
+
+    suite.Test("yielding authorization keeps copied metadata and rejects revoked execution", func():
+        local commands = mCommand.New()
+        local calls = []
+        local initial = commands.Register({
+            Name = "count",
+            Aliases = ["c"],
+            Arguments = [{ Name = "amount", Type = "number" }],
+            Run = func(context, args):
+                calls.push(args.amount)
+                return args.amount
+        })
+        suite.Expect(initial.Ok, "initial registration")
+
+        local seen = [false, false]
+        local done = [false, false]
+        local allowed = [true, true]
+        local results = [nil, nil]
+        local errors = []
+        local gate = { Open = false }
+        for index in range(2):
+            spawn(func():
+                try:
+                    local context = { Authorize = func(description):
+                        description.Name = "changed"
+                        description.Aliases[0] = "changed"
+                        description.Arguments[0].Type = "string"
+                        seen[index] = true
+                        while not gate.Open:
+                            wait(0)
+                        return allowed[index]
+                    }
+                    local text = "c 7"
+                    if index == 1:
+                        text = "c invalid"
+                    results[index] = commands.Execute(context, text)
+                catch failure:
+                    errors.push(failure)
+                finally:
+                    done[index] = true
+            )
+
+        local both_waiting = false
+        local added = nil
+        try:
+            for turn in range(600):
+                if seen[0] and seen[1]:
+                    both_waiting = true
+                    break
+                wait(0)
+            if both_waiting:
+                added = commands.Register({ Name = "later", Run = expr(context, args): true })
+                local copy = commands.Describe().Value
+                copy[0].Arguments[0].Name = "changed"
+                allowed[1] = false
+        finally:
+            gate.Open = true
+
+        local finished = WaitAll(done)
+        suite.Expect(both_waiting, "both authorizers reached their native wait")
+        suite.Expect(finished, "both execution workers completed")
+        suite.Equal(errors.length, 0, "execution workers had no failures")
+        suite.Expect(added.Ok, "registry can publish another command while policies wait")
+        suite.Expect(results[0].Ok, "allowed dispatch succeeds")
+        suite.Equal(results[0].Value, 7, "copied argument definition still converts to a number")
+        suite.Equal(results[1].Code, "Unauthorized", "revoked policy denies before invalid argument conversion")
+        suite.Equal(calls.length, 1, "denied handler never ran")
+        suite.Equal(calls[0], 7, "only the authorized typed argument reached its handler")
+        suite.Equal(commands.Describe().Value[0].Name, "count", "metadata mutation never changed the registry")
+        suite.Expect(commands.Execute(Allowed(), "later").Ok, "new command remains registered")
+    )
+
+    return suite.Report()
+
+return { Run = Run, RunConcurrent = RunConcurrent }

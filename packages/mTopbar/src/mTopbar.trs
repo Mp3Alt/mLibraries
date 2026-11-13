@@ -1,0 +1,987 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Client-side buttons styled after the TruWorlds 43.7 toolbar.
+# local mTopbar = import("/mLibraries/mTopbar")
+# local icon = mTopbar.GetDefault().Add({ Name = "Settings", Label = "S", Tooltip = "Settings" })
+# icon.Selected.Connect(expr(button): print("opened"))
+# icon.Destroy()
+
+local mSignal = import("/mLibraries/mSignal")
+local mCleanup = import("/mLibraries/mCleanup")
+local clear = new Color4(0, 0, 0, 0)
+local white = new Color4(1, 1, 1)
+local glass = new Color4(0.6, 0.6, 0.6)
+local button_timing = new TweenParams(0.2, EasingFunc.Back, EasingTrans.Out)
+local item_timing = new TweenParams(0.2, EasingFunc.Cubic, EasingTrans.Out)
+local highlight_in = new TweenParams(0.15, EasingFunc.Linear, EasingTrans.Out)
+local highlight_out = new TweenParams(0.075, EasingFunc.Linear, EasingTrans.Out)
+local highlight_bump = new TweenParams(0.15, EasingFunc.Back, EasingTrans.Out)
+local default_bar = nil
+
+local TextValue = func(value, maximum, name):
+    if value == nil: return ""
+    if string.length(value) > maximum: throw "mTopbar: " + name + " is too long"
+    return value
+
+local NumberValue = func(value, minimum, maximum, whole):
+    if not (value >= minimum and value <= maximum): throw "mTopbar: number is out of range"
+    local integer = math.floor(value)
+    if whole and (value < integer or value > integer): throw "mTopbar: expected an integer"
+    return value
+
+local BoolValue = func(value):
+    if value != true and value != false: throw "mTopbar: expected a boolean"
+    return value
+
+local SideValue = func(value):
+    if value != "Left" and value != "Right": throw "mTopbar: Side must be Left or Right"
+    return value
+
+local MakeAddGate = func():
+    local busy = 0
+    return {
+        Take = expr(): busy++ == 0,
+        Reset = func():
+            busy = 0
+    }
+
+local Once = func():
+    local claims = 0
+    return expr(): claims++ == 0
+
+local default_gate = MakeAddGate()
+
+local OwnConnection = func(owner, connection):
+    try:
+        owner.AddConnection(connection)
+    catch unavailable:
+        connection.Disconnect()
+        throw unavailable
+
+local MakeLabel = func(parent, name, text, x, y, width, height, size):
+    return new UITextPanel() {
+        Name = name, Text = text, Position = new Vector2(x, y), Size = new Vector2(width, height),
+        FontName = FontName.Lexend, TextSize = size, RichText = false, TextColor = white,
+        TextAlignment = UITextAlignment.Center, TextVerticalAlignment = UITextVerticalAlignment.Center,
+        TextOverflow = UITextOverflow.Ellipsis, Color = clear, BlocksPointer = false, Parent = parent
+    }
+
+local MakeButton = func(parent, name, width, height):
+    return new UIButton() {
+        Name = name, Text = "", Size = new Vector2(width, height), Roundness = 15,
+        Color = clear, AutoTintColor = false, BorderWidth = 0,
+        BlocksPointer = true, ZIndex = 1, Parent = parent
+    }
+
+local MakeVisual = func(button):
+    local visual = new UIPanel() {
+        Name = "Visual", AnchorRight = 1, AnchorBottom = 1, Size = new Vector2(0, 0),
+        Pivot = new Vector2(0.5, 0.5), Color = glass, Style = UIPanelStyle.FrostedGlass,
+        Roundness = 15, BlocksPointer = false, Parent = button
+    }
+    local content = new UIPanel() {
+        Name = "Content", AnchorRight = 1, AnchorBottom = 1, Size = new Vector2(0, 0),
+        Pivot = new Vector2(0.5, 0.5), Color = clear, BlocksPointer = false, Parent = visual
+    }
+    return { Visual = visual, Content = content }
+
+local RequireEntry = func(entry):
+    local state = entry.Bar
+    if entry.Destroyed or state == nil: throw "mTopbar: icon is destroyed"
+    if state.Destroyed: throw "mTopbar: bar is destroyed"
+    return state
+
+local RequireBar = func(state):
+    if state.Destroyed: throw "mTopbar: bar is destroyed"
+
+local CancelTween = func(slot):
+    local current = slot.Current
+    slot.Current = nil
+    if current != nil: current.Cancel()
+
+local FinishedTween = func(slot, tween, completed):
+    return func():
+        if slot.Current != tween: return
+        slot.Current = nil
+        if completed != nil: completed()
+
+local PlayTween = func(slot, target, timing, properties, completed):
+    CancelTween(slot)
+    local tween = Tween.Play(target, timing, properties)
+    slot.Current = tween
+    tween.Completed.Connect(FinishedTween(slot, tween, completed))
+
+local ClosePopup = func(state):
+    state.PopupOwner = nil
+    local popup = state.Popup
+    local dismiss = state.Dismiss
+    if popup == nil: return
+    popup.Visible = false
+    if dismiss != nil: dismiss.Visible = false
+    state.MenuLife.Clean()
+    for child in popup.GetChildren(): child.Destroy()
+
+local Motion = func(entry, force):
+    local view = entry.View
+    if entry.Destroyed or view == nil: return
+    local mode = "Button"
+    local target = view.Visual
+    local timing = button_timing
+    local hover = 1.12
+    local press = 0.92
+    local press_alpha = 0
+    local dock = entry.Dock
+    local dock_frame = nil
+    if dock != nil:
+        dock_frame = dock.Frame
+        if dock.Destroyed or dock_frame == nil: dock = nil
+    if dock != nil:
+        mode = "Single"
+        if dock.Count >= 2:
+            mode = "Item"
+            timing = item_timing
+            hover = 1.15
+            press = 0.9
+            press_alpha = 0.25
+    if entry.MotionMode != mode:
+        CancelTween(entry.Motion)
+        view.Visual.Scale = new Vector2(1, 1)
+        view.Visual.Transparency = 0
+        view.Content.Scale = new Vector2(1, 1)
+        view.Content.Transparency = 0
+        entry.MotionMode = mode
+        entry.MotionScale = 1
+        entry.MotionAlpha = 0
+    local over = entry.Hovered and entry.Enabled
+    local held = entry.Pressed and over
+    local scale = 1
+    local alpha = 0
+    if not entry.Enabled:
+        alpha = 0.5
+    elif held:
+        scale = press
+        alpha = press_alpha
+    elif over:
+        scale = hover
+    if not force and entry.MotionScale == scale and entry.MotionAlpha == alpha: return
+    entry.MotionScale = scale
+    entry.MotionAlpha = alpha
+    local properties = { Scale = new Vector2(scale, scale), Transparency = alpha }
+    PlayTween(entry.Motion, target, timing, properties, nil)
+    if mode == "Single" and not dock.Destroyed and dock.Count == 1: PlayTween(dock.Motion, dock_frame, timing, properties, nil)
+
+local ResetPointer = func(entry):
+    entry.Hovered = false
+    entry.Pressed = false
+    local dock = entry.Dock
+    if dock != nil and dock.Hovered == entry: dock.Hovered = nil
+    Motion(entry, false)
+
+local ResetDock = func(dock, count):
+    local highlight = dock.Highlight
+    local frame = dock.Frame
+    if dock.Destroyed or highlight == nil or frame == nil: return
+    if dock.Count == count: return
+    CancelTween(dock.Motion)
+    CancelTween(dock.Fade)
+    CancelTween(dock.Slide)
+    CancelTween(dock.Scale)
+    dock.Count = count
+    dock.Hovered = nil
+    dock.Shown = nil
+    highlight.Visible = false
+    highlight.Transparency = 1
+    highlight.Scale = new Vector2(0.7, 0.7)
+    frame.Scale = new Vector2(1, 1)
+    frame.Transparency = 0
+    for entry in dock.Items:
+        CancelTween(entry.Motion)
+        entry.Hovered = false
+        entry.Pressed = false
+        entry.MotionMode = nil
+
+local HideDockHighlight = func(dock):
+    return func():
+        local highlight = dock.Highlight
+        if not dock.Destroyed and highlight != nil and dock.Shown == nil: highlight.Visible = false
+
+local SettleDockBump = func(dock, item):
+    return func():
+        local highlight = dock.Highlight
+        if not dock.Destroyed and highlight != nil and dock.Shown == item:
+            PlayTween(dock.Scale, highlight, highlight_bump, { Scale = new Vector2(1, 1) }, nil)
+
+local UpdateDockHighlight = func(dock):
+    local state = dock.Bar
+    local highlight = dock.Highlight
+    if dock.Destroyed or state == nil or highlight == nil or dock.Count < 2: return
+    local next = dock.Hovered
+    if next != nil and (next.Destroyed or not next.Enabled or not next.LayoutVisible or not state.Visible): next = nil
+    if next == dock.Shown: return
+    local previous = dock.Shown
+    dock.Shown = next
+    if next == nil:
+        PlayTween(dock.Fade, highlight, highlight_out, { Transparency = 1 }, HideDockHighlight(dock))
+        PlayTween(dock.Scale, highlight, button_timing, { Scale = new Vector2(0.7, 0.7) }, nil)
+    elif previous == nil:
+        CancelTween(dock.Slide)
+        highlight.Position = new Vector2(next.DockCenter, 24)
+        highlight.Visible = true
+        PlayTween(dock.Fade, highlight, highlight_in, { Transparency = 0 }, nil)
+        PlayTween(dock.Scale, highlight, button_timing, { Scale = new Vector2(1, 1) }, nil)
+    else:
+        PlayTween(dock.Slide, highlight, item_timing, { Position = new Vector2(next.DockCenter, 24) }, nil)
+        PlayTween(dock.Scale, highlight, highlight_bump, { Scale = new Vector2(1.1, 1.1) }, SettleDockBump(dock, next))
+
+local Paint = func(entry):
+    local view = entry.View
+    if entry.Destroyed or view == nil: return
+    local width = view.Button.Size.X
+    if entry.RenderEnabled != entry.Enabled:
+        view.Button.Disabled = not entry.Enabled
+        entry.RenderEnabled = entry.Enabled
+    view.Visual.Color = glass
+    view.Visual.Style = UIPanelStyle.FrostedGlass
+    if entry.Dock != nil:
+        view.Visual.Color = clear
+        view.Visual.Style = UIPanelStyle.None
+    view.Image.ImageId = entry.Image
+    view.Glyph.Visible = entry.Image != ""
+    view.Glyph.Position = new Vector2((width - entry.ImageSize) / 2, (48 - entry.ImageSize) / 2)
+    view.Glyph.Size = new Vector2(entry.ImageSize, entry.ImageSize)
+    view.Label.Position = new Vector2((width - 40) / 2, 0)
+    view.Label.Text = entry.Label
+    view.Label.Visible = entry.Image == ""
+    view.Badge.Position = new Vector2(width - 19, -3)
+    view.Badge.Visible = entry.Badge > 0
+    view.Badge.Text = tostring(entry.Badge)
+    if entry.Badge > 99: view.Badge.Text = "99+"
+    Motion(entry, false)
+
+local ConnectMotion = func(entry, owner):
+    local view = entry.View
+    if entry.Destroyed or view == nil: return
+    local button = view.Button
+    OwnConnection(owner, button.PointerEnter.Connect(func():
+        if entry.Destroyed: return
+        entry.Hovered = true
+        local dock = entry.Dock
+        if dock != nil and not dock.Destroyed and entry.Enabled: dock.Hovered = entry
+        Motion(entry, true)
+    ))
+    OwnConnection(owner, button.PointerExit.Connect(func():
+        if entry.Destroyed: return
+        entry.Hovered = false
+        local dock = entry.Dock
+        if dock != nil and dock.Hovered == entry: dock.Hovered = nil
+        Motion(entry, true)
+    ))
+    OwnConnection(owner, button.MouseDown.Connect(func(mouse):
+        if entry.Destroyed or mouse != MouseButton.Left or not entry.Enabled: return
+        entry.Pressed = true
+        Motion(entry, true)
+    ))
+    local Release = func(mouse):
+        if entry.Destroyed or mouse != MouseButton.Left: return
+        entry.Pressed = false
+        Motion(entry, true)
+    OwnConnection(owner, button.MouseUp.Connect(Release))
+    OwnConnection(owner, button.MouseCancelled.Connect(Release))
+    OwnConnection(owner, button.ParentChanged.Connect(func(parent):
+        if entry.Destroyed: return
+        entry.Pressed = false
+        Motion(entry, true)
+    ))
+
+local SetSelected = nil
+local Activate = nil
+local Layout = nil
+local OpenPopup = nil
+local DestroyEntry = nil
+local DestroyBar = nil
+local Undock = nil
+
+SetSelected = func(entry, selected):
+    local state = RequireEntry(entry)
+    BoolValue(selected)
+    if selected and (not entry.Enabled or not entry.Visible or not state.Visible): return false
+    if entry.Selected == selected: return false
+    local previous = []
+    # Publish the group state before invoking any application callbacks.
+    local popup_owner = state.PopupOwner
+    if selected and popup_owner != nil and popup_owner != state and popup_owner != entry and popup_owner.Selected:
+        popup_owner.Selected = false
+        Paint(popup_owner)
+        previous.push(popup_owner)
+    if selected and entry.Group != "":
+        for other in state.Icons:
+            if other != entry and other.Group == entry.Group and other.Selected:
+                other.Selected = false
+                Paint(other)
+                previous.push(other)
+    entry.Selected = selected
+    Paint(entry)
+    if state.PopupOwner == entry or selected: ClosePopup(state)
+    if selected and entry.Menu.length > 0: OpenPopup(state, entry)
+    for other in previous:
+        if not other.Destroyed and not other.Selected: other.Deselected.Fire(other.Handle)
+    if not entry.Destroyed and entry.Selected == selected:
+        if selected:
+            entry.SelectedSignal.Fire(entry.Handle)
+        else:
+            entry.Deselected.Fire(entry.Handle)
+    return true
+
+Activate = func(entry):
+    local state = RequireEntry(entry)
+    if not state.Visible or not entry.Visible or not entry.Enabled: return false
+    if entry.Toggle or entry.Menu.length > 0: SetSelected(entry, not entry.Selected)
+    if not entry.Destroyed: entry.Activated.Fire(entry.Handle)
+    return true
+
+local MakeMenuPress = func(state, entry, item, overflow):
+    return func():
+        if state.Destroyed or entry.Destroyed or not entry.Enabled or not entry.Visible: return
+        ClosePopup(state)
+        if overflow:
+            Activate(entry)
+        else:
+            if entry.Selected: SetSelected(entry, false)
+            if entry.Destroyed: return
+            try:
+                item.Run(entry.Handle)
+            catch failure:
+                warn("mTopbar menu: " + tostring(failure))
+
+local ConnectMenuHover = func(owner, button, visual, content, enabled):
+    local entry = {
+        View = { Button = button, Visual = visual, Content = content },
+        Enabled = enabled, Hovered = false, Pressed = false, Destroyed = false,
+        Dock = nil, Motion = { Current = nil }, MotionMode = nil
+    }
+    owner.Add(func():
+        entry.Destroyed = true
+        CancelTween(entry.Motion)
+    )
+    ConnectMotion(entry, owner)
+    Motion(entry, false)
+
+OpenPopup = func(state, owner):
+    local popup = state.Popup
+    local dismiss = state.Dismiss
+    if state.Destroyed or popup == nil or dismiss == nil: return
+    ClosePopup(state)
+    state.PopupOwner = owner
+    local entries = state.Overflow
+    local overflow = owner == state
+    local x = state.MoreX
+    if not overflow:
+        entries = owner.Menu
+        x = owner.X
+    local popup_space = math.max(48, state.Width - state.RowRight - 8)
+    local width = math.min(224, popup_space)
+    x = math.max(0, math.min(x, state.Width - state.RowRight - width))
+    local top = state.RowTop + 56
+    local height = math.min(entries.length * 40 + 8, math.max(0, state.Height - top - 8))
+    popup.Position = new Vector2(x, top)
+    popup.Size = new Vector2(width, height)
+    popup.ScrollToStart()
+    for index in range(entries.length):
+        local item = entries[index]
+        local entry = owner
+        local text = item.Text
+        local image = item.Image
+        local disabled = item.Disabled
+        if overflow:
+            entry = item
+            text = entry.Tooltip
+            if text == "": text = entry.Name
+            image = entry.Image
+            disabled = not entry.Enabled
+        local button = MakeButton(popup, "Item" + index, width - 8, 40)
+        button.Position = new Vector2(4, 4 + index * 40)
+        button.Roundness = 10
+        button.Color = clear
+        button.Disabled = disabled
+        local parts = MakeVisual(button)
+        parts.Visual.Style = UIPanelStyle.None
+        parts.Visual.Color = clear
+        local label = MakeLabel(parts.Content, "Label", text, 40, 0, width - 60, 40, 14)
+        label.TextAlignment = UITextAlignment.Left
+        if image == "":
+            label.Position = new Vector2(12, 0)
+            label.Size = new Vector2(width - 32, 40)
+        local glyph = new UIPanel() {
+            Name = "Glyph", Position = new Vector2(8, 8), Size = new Vector2(24, 24),
+            Color = white, BlocksPointer = false, Visible = image != "", Parent = parts.Content
+        }
+        new UIBackgroundImage() { ImageId = image, Fit = UIImageFit.Cover, Parent = glyph }
+        ConnectMenuHover(state.MenuLife, button, parts.Visual, parts.Content, not disabled)
+        OwnConnection(state.MenuLife, button.Pressed.Connect(MakeMenuPress(state, entry, item, overflow)))
+    if state.Destroyed: return
+    dismiss.Visible = true
+    popup.Visible = height > 0
+
+local EntryOrder = func(entry):
+    local dock = entry.Dock
+    if dock != nil:
+        local items = dock.Items
+        if not dock.Destroyed and items.length > 0: return items[0].Order
+    return entry.Order
+
+local SortedIcons = func(state):
+    local result = []
+    for entry in state.Icons:
+        if entry.Destroyed or not entry.Visible: continue
+        local order = EntryOrder(entry)
+        local index = 0
+        while index < result.length:
+            local other_order = EntryOrder(result[index])
+            if other_order > order: break
+            index += 1
+        result.insert(index, entry)
+    return result
+
+Layout = func(state):
+    local screen = state.Screen
+    local dismiss = state.Dismiss
+    local more = state.More
+    local more_entry = state.MoreEntry
+    if state.Destroyed or screen == nil or dismiss == nil or more == nil or more_entry == nil: return
+    local size = screen.SafeAreaSize
+    state.Width = size.X
+    state.Height = size.Y
+    local popup_owner = state.PopupOwner
+    ClosePopup(state)
+    local available = math.max(0, size.X - state.Left - state.Right)
+    local row_left = state.Left
+    local row_right = state.Right
+    local row_top = state.Top
+    # Keep full-size controls reachable when the two native clusters leave no slot.
+    if available < 48:
+        row_left = 8
+        row_right = 8
+        row_top += 56
+        available = math.max(0, size.X - 16)
+    state.RowTop = row_top
+    state.RowRight = row_right
+    dismiss.Position = new Vector2(0, row_top + 48)
+    dismiss.Size = new Vector2(0, -row_top - 48)
+    local icons = SortedIcons(state)
+    local units = []
+    local seen = []
+    local total = 0
+    for entry in icons:
+        if entry.Destroyed: continue
+        local dock = entry.Dock
+        if dock == nil or dock.Destroyed:
+            units.push({ Items = [entry], Dock = nil, Width = 48, Side = entry.Side })
+            total += 56
+        elif not seen.contains(dock):
+            local members = dock.Items
+            if members.length == 0: continue
+            local first = members[0]
+            local items = []
+            for member in members:
+                if not member.Destroyed and member.Visible: items.push(member)
+            if items.length == 0: continue
+            units.push({ Items = items, Dock = dock, Width = items.length * 44 + 8, Side = first.Side })
+            seen.push(dock)
+            total += items.length * 44 + 16
+    local budget = available
+    if total - 8 > available: budget = math.max(0, available - 56)
+    state.Overflow = []
+    for entry in state.Icons: entry.LayoutVisible = false
+    for dock in state.Docks: dock.OnRow = false
+    local left = row_left
+    local right = size.X - row_right
+    for unit in units:
+        if unit.Width > budget:
+            for entry in unit.Items: state.Overflow.push(entry)
+            continue
+        budget -= unit.Width + 8
+        local x = left
+        if unit.Side == "Right":
+            right -= unit.Width
+            x = right
+            right -= 8
+        else:
+            left += unit.Width + 8
+        if unit.Dock != nil:
+            local dock = unit.Dock
+            local frame = dock.Frame
+            if dock.Destroyed or frame == nil: continue
+            ResetDock(dock, unit.Items.length)
+            dock.OnRow = true
+            frame.Size = new Vector2(unit.Width, 48)
+            frame.Pivot = new Vector2(0, 0)
+            frame.Position = new Vector2(x, row_top)
+            if unit.Items.length == 1:
+                frame.Pivot = new Vector2(0.5, 0.5)
+                frame.Position = new Vector2(x + unit.Width / 2, row_top + 24)
+        for index in range(unit.Items.length):
+            local entry = unit.Items[index]
+            local view = entry.View
+            if entry.Destroyed or view == nil: continue
+            local offset = 0
+            local width = 48
+            if unit.Dock != nil:
+                width = 52
+                if unit.Items.length >= 2:
+                    width = 44
+                    offset = 4 + index * 44
+                entry.DockCenter = offset + width / 2
+            entry.X = x + offset
+            view.Button.Position = new Vector2(entry.X, row_top)
+            view.Button.Size = new Vector2(width, 48)
+            entry.LayoutVisible = true
+    for dock in state.Docks:
+        local frame = dock.Frame
+        if dock.Destroyed or frame == nil: continue
+        frame.Visible = dock.OnRow and state.Visible
+        if not dock.OnRow or not state.Visible: ResetDock(dock, 0)
+    for entry in state.Icons:
+        local view = entry.View
+        if entry.Destroyed or view == nil: continue
+        view.Button.Visible = entry.LayoutVisible and state.Visible
+        if not entry.LayoutVisible or not state.Visible: ResetPointer(entry)
+        Paint(entry)
+        if not entry.LayoutVisible or not state.Visible:
+            CancelTween(entry.Motion)
+            view.Visual.Scale = new Vector2(1, 1)
+            local alpha = 0
+            if not entry.Enabled: alpha = 0.5
+            view.Visual.Transparency = alpha
+            entry.MotionScale = 1
+            entry.MotionAlpha = alpha
+    state.MoreX = left
+    more.Position = new Vector2(left, row_top)
+    more.Visible = state.Visible and state.Overflow.length > 0 and available >= 48
+    if not more.Visible:
+        ResetPointer(more_entry)
+        CancelTween(more_entry.Motion)
+        more_entry.View.Visual.Scale = new Vector2(1, 1)
+        more_entry.View.Visual.Transparency = 0
+        more_entry.MotionScale = 1
+        more_entry.MotionAlpha = 0
+    if state.Visible and popup_owner != nil:
+        if popup_owner == state:
+            if more.Visible: OpenPopup(state, state)
+        elif not popup_owner.Destroyed and popup_owner.Selected and popup_owner.Menu.length > 0:
+            OpenPopup(state, popup_owner)
+
+local SetField = func(entry, key, value):
+    local state = RequireEntry(entry)
+    if key == "Image": value = TextValue(value, 256, key)
+    elif key == "ImageSize": value = NumberValue(value, 8, 40, false)
+    elif key == "Label": value = TextValue(value, 64, key)
+    elif key == "Tooltip": value = TextValue(value, 128, key)
+    elif key == "Badge": value = NumberValue(value, 0, 9999, true)
+    elif key == "Order": value = NumberValue(value, -1000000, 1000000, false)
+    elif key == "Side":
+        value = SideValue(value)
+        if entry.Dock != nil: throw "mTopbar: undock before changing Side"
+    elif key == "Enabled" or key == "Visible": value = BoolValue(value)
+    if key == "Order" or key == "ImageSize":
+        local previous = entry[key]
+        if not (previous < value or previous > value): return
+    elif entry[key] == value: return
+    entry[key] = value
+    if key == "Enabled": entry.Pressed = false
+    if key == "Visible" and not value: ResetPointer(entry)
+    if (key == "Enabled" or key == "Visible") and not value and entry.Selected: SetSelected(entry, false)
+    if entry.Destroyed: return
+    Paint(entry)
+    if key == "Order" or key == "Side" or key == "Visible":
+        Layout(state)
+    elif (key == "Image" or key == "Tooltip" or key == "Enabled") and state.PopupOwner == state and state.Overflow.contains(entry):
+        OpenPopup(state, state)
+
+local CopyMenu = func(items):
+    local record = false
+    try:
+        table.keys(items)
+        record = true
+    catch not_record:
+        pass
+    if record or table.count(items) > 16: throw "mTopbar: expected up to 16 menu items"
+    local result = []
+    for item in items:
+        if item.Run == nil: throw "mTopbar: menu items require Run"
+        local disabled = false
+        if item.Disabled != nil: disabled = BoolValue(item.Disabled)
+        result.push({ Text = TextValue(item.Text, 64, "menu text"), Image = TextValue(item.Image, 256, "menu image"), Disabled = disabled, Run = item.Run })
+    return result
+
+local SetMenu = func(entry, items):
+    local state = RequireEntry(entry)
+    local menu = CopyMenu(items)
+    if entry.Selected: SetSelected(entry, false)
+    if entry.Destroyed: return
+    entry.Menu = menu
+
+local GetState = func(entry):
+    return {
+        Name = entry.Name, Image = entry.Image, ImageSize = entry.ImageSize, Label = entry.Label, Tooltip = entry.Tooltip,
+        Badge = entry.Badge, Order = entry.Order, Side = entry.Side, Enabled = entry.Enabled,
+        Visible = entry.Visible, Selected = entry.Selected, Toggle = entry.Toggle, Group = entry.Group,
+        Key = entry.Key, MenuCount = entry.Menu.length, Destroyed = entry.Destroyed
+    }
+
+local MakeHandle = func(entry):
+    return {
+        Activated = entry.Activated, Selected = entry.SelectedSignal, Deselected = entry.Deselected,
+        SetImage = expr(value): SetField(entry, "Image", value),
+        SetImageSize = expr(value): SetField(entry, "ImageSize", value),
+        SetLabel = expr(value): SetField(entry, "Label", value),
+        SetTooltip = expr(value): SetField(entry, "Tooltip", value),
+        SetBadge = expr(value): SetField(entry, "Badge", value),
+        SetOrder = expr(value): SetField(entry, "Order", value),
+        SetSide = expr(value): SetField(entry, "Side", value),
+        SetEnabled = expr(value): SetField(entry, "Enabled", value),
+        SetVisible = expr(value): SetField(entry, "Visible", value),
+        SetSelected = expr(value): SetSelected(entry, value),
+        SetMenu = expr(items): SetMenu(entry, items),
+        BindKey = func(key):
+            RequireEntry(entry)
+            if key != nil: game.InputSystem.IsKeyPressed(key)
+            entry.Key = key
+        ,
+        Activate = expr(): Activate(entry),
+        IsSelected = expr(): entry.Selected,
+        IsDestroyed = expr(): entry.Destroyed,
+        GetState = expr(): GetState(entry),
+        Destroy = expr(): DestroyEntry(entry)
+    }
+
+local ConnectEntry = func(entry):
+    local view = entry.View
+    if entry.Destroyed or view == nil: throw "mTopbar: icon was removed during registration"
+    ConnectMotion(entry, entry.Life)
+    OwnConnection(entry.Life, view.Button.Pressed.Connect(func():
+        if not entry.Destroyed: Activate(entry)
+    ))
+
+DestroyEntry = func(entry):
+    if not entry.Close(): return
+    entry.Destroyed = true
+    local state = entry.Bar
+    local view = entry.View
+    local dock = entry.Dock
+    entry.Selected = false
+    state.Icons.remove(entry)
+    if dock != nil: Undock(dock)
+    if state.PopupOwner == entry: ClosePopup(state)
+    entry.Life.Destroy()
+    CancelTween(entry.Motion)
+    if view != nil: view.Button.Destroy()
+    entry.Activated.Destroy()
+    entry.SelectedSignal.Destroy()
+    entry.Deselected.Destroy()
+    entry.Menu = []
+    entry.Key = nil
+    entry.Handle = nil
+    entry.View = nil
+    entry.Bar = nil
+    if not state.Destroyed:
+        if state.AutoDestroy and state.Icons.length == 0:
+            DestroyBar(state)
+        else:
+            Layout(state)
+
+local AddEntry = func(state, config):
+    RequireBar(state)
+    if state.Icons.length >= 64: throw "mTopbar: at most 64 icons per bar"
+    local name = TextValue(config.Name, 64, "Name")
+    if name == "": throw "mTopbar: Name is required"
+    for other in state.Icons:
+        if other.Name == name: throw "mTopbar: duplicate Name"
+    local entry = {
+        Bar = state, Name = name, Image = TextValue(config.Image, 256, "Image"), ImageSize = 28,
+        Label = TextValue(config.Label, 64, "Label"), Tooltip = TextValue(config.Tooltip, 128, "Tooltip"),
+        Badge = 0, Order = 0, Side = "Left", Toggle = true, Group = TextValue(config.Group, 64, "Group"),
+        Enabled = true, Visible = true, Selected = false, Destroyed = false, Close = Once(), Key = config.Key, Menu = [], X = 0,
+        Life = mCleanup.New(), Activated = mSignal.New(), SelectedSignal = mSignal.New(), Deselected = mSignal.New(),
+        Motion = { Current = nil }, MotionMode = "Button", MotionScale = 1, MotionAlpha = 0,
+        Hovered = false, Pressed = false, Dock = nil, LayoutVisible = false
+    }
+    if config.Badge != nil: entry.Badge = NumberValue(config.Badge, 0, 9999, true)
+    if config.Order != nil: entry.Order = NumberValue(config.Order, -1000000, 1000000, false)
+    if config.Side != nil: entry.Side = SideValue(config.Side)
+    if config.Toggle != nil: entry.Toggle = BoolValue(config.Toggle)
+    if config.Enabled != nil: entry.Enabled = BoolValue(config.Enabled)
+    if config.Visible != nil: entry.Visible = BoolValue(config.Visible)
+    if config.ImageSize != nil: entry.ImageSize = NumberValue(config.ImageSize, 8, 40, false)
+    if entry.Key != nil: game.InputSystem.IsKeyPressed(entry.Key)
+    local button = MakeButton(state.Screen, name, 48, 48)
+    entry.View = { Button = button }
+    try:
+        local parts = MakeVisual(button)
+        local glyph = new UIPanel() {
+            Name = "Glyph", Position = new Vector2(10, 10), Size = new Vector2(28, 28),
+            Color = white, BlocksPointer = false, Parent = parts.Content
+        }
+        local image = new UIBackgroundImage() { ImageId = entry.Image, Fit = UIImageFit.Cover, Parent = glyph }
+        local label = MakeLabel(parts.Content, "Label", entry.Label, 4, 0, 40, 48, 16)
+        local badge = MakeLabel(parts.Visual, "Badge", "", 29, -3, 24, 20, 10)
+        badge.Color = new Color4(0.85, 0.85, 0.85)
+        badge.TextColor = new Color4(0.08, 0.08, 0.08)
+        badge.Roundness = 10
+        entry.View = { Button = button, Visual = parts.Visual, Content = parts.Content, Glyph = glyph, Image = image, Label = label, Badge = badge }
+        RequireBar(state)
+        entry.Handle = MakeHandle(entry)
+        local handle = entry.Handle
+        state.Icons.push(entry)
+        ConnectEntry(entry)
+        Paint(entry)
+        Layout(state)
+        RequireBar(state)
+        if entry.Destroyed: throw "mTopbar: icon was removed during registration"
+        return handle
+    catch failure:
+        DestroyEntry(entry)
+        throw failure
+
+local Add = func(state, config):
+    RequireBar(state)
+    if not state.AddGate.Take(): throw "mTopbar: another icon registration is in progress"
+    try:
+        return AddEntry(state, config)
+    finally:
+        state.AddGate.Reset()
+
+Undock = func(dock):
+    if not dock.Close(): return
+    dock.Destroyed = true
+    local state = dock.Bar
+    local items = dock.Items
+    local frame = dock.Frame
+    dock.Items = []
+    dock.Bar = nil
+    state.Docks.remove(dock)
+    CancelTween(dock.Motion)
+    CancelTween(dock.Fade)
+    CancelTween(dock.Slide)
+    CancelTween(dock.Scale)
+    for entry in items:
+        if entry.Dock != dock: continue
+        entry.Dock = nil
+        local view = entry.View
+        if entry.Destroyed or view == nil: continue
+        view.Button.Size = new Vector2(48, 48)
+        ResetPointer(entry)
+        if not entry.Destroyed: Paint(entry)
+    frame.Destroy()
+    dock.Frame = nil
+    dock.Highlight = nil
+    if not state.Destroyed: Layout(state)
+
+local MakeDockHandle = func(dock):
+    return { Destroy = expr(): Undock(dock), IsDestroyed = expr(): dock.Destroyed }
+
+local DockEntries = func(state, first, second):
+    RequireBar(state)
+    local a = nil
+    local b = nil
+    for entry in state.Icons:
+        if entry.Handle == first: a = entry
+        if entry.Handle == second: b = entry
+    if a == nil or b == nil or a == b: throw "mTopbar: dock two distinct icons from this bar"
+    if a.Dock != nil or b.Dock != nil: throw "mTopbar: an icon is already docked"
+    if a.Side != b.Side: throw "mTopbar: docked icons must use the same Side"
+    local frame = new UIPanel() { Name = "Dock", Size = new Vector2(96, 48), Roundness = 15, Color = glass, Style = UIPanelStyle.FrostedGlass, BlocksPointer = true, Parent = state.Screen }
+    local highlight = new UIPanel() {
+        Name = "Highlight", Size = new Vector2(52, 52), Pivot = new Vector2(0.5, 0.5),
+        Color = glass, Style = UIPanelStyle.FrostedGlass, Roundness = 15, BlocksPointer = false,
+        Scale = new Vector2(0.7, 0.7), Transparency = 1, Visible = false, Parent = frame
+    }
+    local dock = {
+        Items = [a, b], Bar = state, Frame = frame, Highlight = highlight, Destroyed = false, Close = Once(),
+        Count = 0, Hovered = nil, Shown = nil, OnRow = false,
+        Motion = { Current = nil }, Fade = { Current = nil }, Slide = { Current = nil }, Scale = { Current = nil }
+    }
+    try:
+        RequireBar(state)
+        if a.Destroyed or b.Destroyed or a.Dock != nil or b.Dock != nil: throw "mTopbar: dock membership changed"
+        a.Dock = dock
+        b.Dock = dock
+        state.Docks.push(dock)
+        Paint(a)
+        Paint(b)
+        Layout(state)
+        RequireBar(state)
+        if a.Destroyed or b.Destroyed or a.Dock != dock or b.Dock != dock: throw "mTopbar: dock membership changed"
+    catch failure:
+        if a.Dock == dock: a.Dock = nil
+        if b.Dock == dock: b.Dock = nil
+        state.Docks.remove(dock)
+        Undock(dock)
+        if not state.Destroyed: Layout(state)
+        throw failure
+    return MakeDockHandle(dock)
+
+local Dock = func(state, first, second):
+    RequireBar(state)
+    if not state.AddGate.Take(): throw "mTopbar: another registration is in progress"
+    try:
+        return DockEntries(state, first, second)
+    finally:
+        state.AddGate.Reset()
+
+DestroyBar = func(state):
+    if not state.Close(): return
+    state.Destroyed = true
+    local icons = state.Icons
+    local docks = state.Docks
+    local screen = state.Screen
+    state.Icons = []
+    state.Docks = []
+    state.Life.Destroy()
+    ClosePopup(state)
+    if state.MoreEntry != nil:
+        state.MoreEntry.Destroyed = true
+        CancelTween(state.MoreEntry.Motion)
+    state.MenuLife.Destroy()
+    for entry in icons: DestroyEntry(entry)
+    for dock in docks: Undock(dock)
+    if screen != nil: screen.Destroy()
+    state.Screen = nil
+    state.Popup = nil
+    state.Dismiss = nil
+    state.More = nil
+    state.MoreEntry = nil
+    state.Overflow = []
+
+local SetVisible = func(state, visible):
+    RequireBar(state)
+    BoolValue(visible)
+    if state.Visible == visible: return
+    state.Visible = visible
+    local snapshot = []
+    for entry in state.Icons: snapshot.push(entry)
+    if not visible:
+        for entry in snapshot:
+            if not entry.Destroyed and entry.Selected: SetSelected(entry, false)
+    if not state.Destroyed: Layout(state)
+
+local MakeBarHandle = func(state):
+    return {
+        Add = expr(config): Add(state, config),
+        Dock = expr(first, second): Dock(state, first, second),
+        SetVisible = expr(visible): SetVisible(state, visible),
+        SetInsets = func(left, right, top):
+            RequireBar(state)
+            NumberValue(left, 0, 4096, false)
+            NumberValue(right, 0, 4096, false)
+            NumberValue(top, 0, 4096, false)
+            state.Left = left
+            state.Right = right
+            state.Top = top
+            Layout(state)
+        ,
+        GetCount = expr(): state.Icons.length,
+        IsDestroyed = expr(): state.Destroyed,
+        Destroy = expr(): DestroyBar(state)
+    }
+
+local ConnectBar = func(state):
+    ConnectMotion(state.MoreEntry, state.Life)
+    OwnConnection(state.Life, state.More.Pressed.Connect(func():
+        local owner = state.PopupOwner
+        if owner == state:
+            ClosePopup(state)
+        else:
+            if owner != nil and not owner.Destroyed and owner.Selected: SetSelected(owner, false)
+            OpenPopup(state, state)
+    ))
+    OwnConnection(state.Life, state.Dismiss.Pressed.Connect(func():
+        local owner = state.PopupOwner
+        ClosePopup(state)
+        if owner != nil and owner != state and not owner.Destroyed and owner.Selected: SetSelected(owner, false)
+    ))
+    OwnConnection(state.Life, game.UICanvas.Changed.Connect(func(property):
+        if property == "ViewportSize": Layout(state)
+    ))
+    OwnConnection(state.Life, state.Screen.Removed.Connect(func(): DestroyBar(state)))
+    OwnConnection(state.Life, game.InputSystem.KeyPressed.Connect(func(key):
+        if state.Destroyed or not state.Visible or game.UiFocus.Focused != nil: return
+        # First registered visible, enabled match wins; keys are never consumed.
+        for entry in state.Icons:
+            if entry.Key != nil and entry.Key == key and entry.Visible and entry.Enabled:
+                Activate(entry)
+                break
+    ))
+    OwnConnection(state.Life, game.TimeSystem.FrameStepped.Connect(func(delta):
+        local screen = state.Screen
+        if state.Destroyed or screen == nil: return
+        for dock in state.Docks: UpdateDockHighlight(dock)
+        state.Elapsed += delta
+        if state.Elapsed < 0.25: return
+        state.Elapsed = 0
+        local size = screen.SafeAreaSize
+        if size.X != state.Width or size.Y != state.Height: Layout(state)
+    ))
+
+local New = func(options):
+    if options == nil: options = {}
+    local state = {
+        Icons = [], Docks = [], Overflow = [], Life = mCleanup.New(), MenuLife = mCleanup.New(), Destroyed = false, Close = Once(),
+        Left = 168, Right = 218, Top = 8, RowTop = 8, RowRight = 218, Width = 0, Height = 0, MoreX = 0, Elapsed = 0,
+        AddGate = MakeAddGate(),
+        Visible = true, AutoDestroy = false, PopupOwner = nil
+    }
+    if options.LeftInset != nil: state.Left = NumberValue(options.LeftInset, 0, 4096, false)
+    if options.RightInset != nil: state.Right = NumberValue(options.RightInset, 0, 4096, false)
+    if options.TopInset != nil: state.Top = NumberValue(options.TopInset, 0, 4096, false)
+    if options.AutoDestroy != nil: state.AutoDestroy = BoolValue(options.AutoDestroy)
+    local name = "mTopbar"
+    if options.Name != nil: name = TextValue(options.Name, 64, "Name")
+    state.Screen = new ScreenUI() { Name = name, DisplayOrder = 50, MobileScale = 1, UseSafeArea = true, Parent = game.UICanvas }
+    try:
+        state.Dismiss = MakeButton(state.Screen, "Dismiss", 0, 0)
+        state.Dismiss.Color = clear
+        state.Dismiss.AutoTintColor = false
+        state.Dismiss.Roundness = 0
+        state.Dismiss.AnchorRight = 1
+        state.Dismiss.AnchorBottom = 1
+        state.Dismiss.ZIndex = 5
+        state.Dismiss.Visible = false
+        state.More = MakeButton(state.Screen, "More", 48, 48)
+        local more = MakeVisual(state.More)
+        state.MoreEntry = {
+            View = { Button = state.More, Visual = more.Visual, Content = more.Content },
+            Enabled = true, Hovered = false, Pressed = false, Destroyed = false,
+            Dock = nil, Motion = { Current = nil }, MotionMode = "Button", MotionScale = 1, MotionAlpha = 0
+        }
+        MakeLabel(more.Content, "Label", "...", 0, -4, 48, 48, 24)
+        state.More.Visible = false
+        state.Popup = new UIScrollPanel() {
+            Name = "Menu", Color = glass, Style = UIPanelStyle.FrostedGlass, Roundness = 15, ScrollX = false,
+            ScrollbarWidth = 3, ScrollbarColor = new Color4(0.45, 0.45, 0.45),
+            ScrollbarTrackColor = clear, Modal = true, ZIndex = 6, Visible = false, Parent = state.Screen
+        }
+
+
+        ConnectBar(state)
+        Layout(state)
+    catch failure:
+        DestroyBar(state)
+        throw failure
+    return MakeBarHandle(state)
+
+local GetDefault = func():
+    while true:
+        local current = default_bar
+        if current != nil and not current.IsDestroyed(): return current
+        if default_gate.Take():
+            try:
+                current = default_bar
+                if current != nil and not current.IsDestroyed(): return current
+                default_bar = New({ AutoDestroy = true })
+                return default_bar
+            finally:
+                default_gate.Reset()
+        # Only overlapping first construction yields; normal access returns above.
+        wait(0)
+
+return { New = New, GetDefault = GetDefault }

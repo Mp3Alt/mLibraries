@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Optional local Creator fixture. Attach once; caller owns the native remote.
+
+if game.ServerId != "": throw "mNet native fixture is for Creator playtests only."
+local mNet = import("/mLibraries/mNet")
+local mPacket = import("/mLibraries/mPacket")
+local mCleanup = import("/mLibraries/mCleanup")
+if world.FindFirstChild("mNetNative") != nil: throw "mNet native fixture already exists."
+local lifetime = mCleanup.New()
+local folder = new Folder() { Name = "mNetNative" }
+local remote = new RemoteEvent() { Name = "Messages", Parent = folder }
+local server = mNet.NewServer({ Remote = remote, Burst = 64, Rate = 64 })
+local packet = mPacket.New({ Id = 71, Fields = [{ Name = "Amount", Type = "integer", Min = -100, Max = 100 }] })
+local Authorize = expr(context): context.IsActive() and context.Sender.IsConnected and context.Sender.UserId < 0
+local Any = expr(value): { Ok = true, Value = value }
+server.Register({ Name = "echo", Kind = "Request", Authorize = Authorize, Validate = Any, Run = expr(context, value): value })
+server.Register({ Name = "actor", Kind = "Request", Authorize = Authorize, Validate = Any, Run = expr(context, value): context.Sender.UserId })
+server.Register({ Name = "packet", Kind = "Request", Authorize = Authorize, Validate = packet.Decode, Run = expr(context, value): value[0].Amount })
+server.Register({ Name = "denied", Kind = "Request", Authorize = expr(context): false, Validate = Any, Run = func(context, value): throw "denied handler must not execute" })
+server.Register({ Name = "slow", Kind = "Request", Authorize = Authorize, Validate = Any, Run = func(context, value):
+    wait(0.15)
+    return value
+})
+server.Register({ Name = "pushready", Kind = "Request", Authorize = Authorize, Validate = mNet.NoPayload, Run = func(context, value):
+    server.Send(context.Sender, "notice", nil)
+    server.Send(context.Sender, "notice", false)
+    server.Send(context.Sender, "notice", 0)
+    return "ready"
+})
+local stopped = false
+local Stop = func():
+    if stopped: return
+    stopped = true
+    server.Destroy()
+    lifetime.Destroy()
+
+lifetime.AddInstance(folder)
+lifetime.AddConnection(game.Players.PlayerRemoved.Connect(func(player): server.RemovePeer(player)))
+lifetime.AddConnection(folder.Destroyed.Connect(Stop))
+lifetime.AddConnection(this.Removed.Connect(Stop))
+folder.Parent = world
+print("mNet native server ready.")

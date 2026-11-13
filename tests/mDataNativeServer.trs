@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Creator-only acceptance fixture. Keep live data in playtests disabled.
+if game.ServerId != "": throw "mData native tests require a Creator playtest"
+local mData = import("/mLibraries/mData")
+local kit = import("/mLibraries/mTestKit")
+local suite = kit.New("mDataNative")
+local name = "mLibraries_mData_acceptance_20261111"
+local backend = game.DataSystem.GetStore(name)
+local leftovers = backend.ListKeysAsync({ prefix = "run-", pageSize = 100 })
+for key in leftovers.Items:
+    if string.ends_with(key, "-shutdown"): backend.RemoveAsync(key)
+local prefix = "run-" + host.time() + "-"
+local keys = []
+local offset = { Seconds = 0 }
+local Config = func():
+    return { Name = name, Defaults = { Coins = 0, Enabled = false }, LeaseSeconds = 30, AutosaveSeconds = 5 }
+local Runtime = func(id):
+    return { Store = backend, SessionId = id, Clock = expr(): host.time() + offset.Seconds, Wait = wait, Spawn = spawn }
+local a = mData.New(Config(), Runtime("A-" + prefix))
+local b = mData.New(Config(), Runtime("B-" + prefix))
+local NewKey = func(label):
+    local key = prefix + label
+    keys.push(key)
+    return key
+try:
+    suite.Test("local data roundtrip preserves profile values", func():
+        local key = NewKey("roundtrip")
+        local first = a.Load(key)
+        suite.Expect(first.Ok, "first load")
+        first.Profile.Update(func(data): data.Coins = 17)
+        suite.Expect(first.Profile.Release().Ok, "save and release")
+        local second = b.Load(key)
+        suite.Expect(second.Ok, "second session loads")
+        suite.Equal(second.Profile.Get().Coins, 17, "progress retained")
+        suite.Equal(second.Profile.Get().Enabled, false, "false retained")
+        suite.Expect(second.Profile.Release().Ok, "second release")
+    )
+    suite.Test("real concurrent claim admits one session", func():
+        local key = NewKey("claim")
+        local results = []
+        spawn(func(): results.push(a.Load(key)))
+        spawn(func(): results.push(b.Load(key)))
+        local deadline = host.time() + 8
+        while results.length < 2 and host.time() < deadline: wait(0)
+        suite.Equal(results.length, 2, "both native operations settled")
+        local accepted = 0
+        local locked = 0
+        for result in results:
+            if result.Ok:
+                accepted += 1
+                suite.Expect(result.Profile.Release().Ok, "winner releases")
+            elif result.Code == "Locked":
+                locked += 1
+        suite.Equal(accepted, 1, "exactly one claimant")
+        suite.Equal(locked, 1, "second session denied")
+    )
+    suite.Test("stored lease takeover fences the old live handle", func():
+        local key = NewKey("fence")
+        local old = a.Load(key).Profile
+        old.Update(func(data): data.Coins = 99)
+        backend.UpdateAsync(key, func(record):
+            record.Lock.ExpiresAt = host.time() - 1
+            return record
+        )
+        local fresh = b.Load(key).Profile
+        fresh.Update(func(data): data.Coins = 5)
+        suite.Expect(fresh.Save().Ok, "new session saves")
+        suite.Expect(not old.Save().Ok, "old generation cannot overwrite")
+        suite.Equal(backend.GetAsync(key).Data.Coins, 5, "new data retained")
+        suite.Expect(fresh.Release().Ok, "new lease released")
+    )
+    suite.Test("autosave Step writes and renews using native storage", func():
+        local key = NewKey("autosave")
+        local profile = a.Load(key).Profile
+        profile.Update(func(data): data.Coins = 23)
+        offset.Seconds = 10
+        local result = a.Step(1)
+        suite.Expect(result.Ok and result.Value.length == 1 and result.Value[0].Result.Ok, "one native autosave")
+        suite.Equal(backend.GetAsync(key).Data.Coins, 23, "autosave reached storage")
+        offset.Seconds = 0
+        suite.Expect(profile.Release().Ok, "release after logical clock offset")
+    )
+    suite.Test("bounded close releases multiple native keys", func():
+        for index in range(4): suite.Expect(a.Load(NewKey("close" + index)).Ok, "profile loaded")
+        local report = a.Close(8)
+        suite.Expect(report.Ok and report.Released == 4, "all four releases completed")
+        suite.Equal(a.GetCount(), 0, "no tracked profiles")
+    )
+    local marker = "restart-marker"
+    local stored = backend.GetAsync(marker)
+    if stored == nil:
+        local profile = b.Load(marker).Profile
+        profile.Update(func(data): data.Coins = 314)
+        suite.Expect(profile.Release().Ok, "restart marker saved")
+        print("mDataPersistence: seeded local marker; restart the playtest")
+    else:
+        suite.Test("local data survives a playtest restart", func():
+            local loaded = b.Load(marker)
+            suite.Expect(loaded.Ok, "marker acquired after restart")
+            suite.Equal(loaded.Profile.Get().Coins, 314, "previous-playtest value retained")
+            suite.Expect(loaded.Profile.Release().Ok, "marker lease released")
+            backend.RemoveAsync(marker)
+        )
+    b.Close(8)
+finally:
+    a.Close(1)
+    b.Close(1)
+    for key in keys: backend.RemoveAsync(key)
+suite.Test("the native default adapter drains a dirty profile", func():
+    local shutdown = mData.New({ Name = name, Defaults = { Coins = 0 } }, nil)
+    local key = prefix + "shutdown"
+    try:
+        local loaded = shutdown.Load(key)
+        suite.Expect(loaded.Ok, "native default load")
+        loaded.Profile.Update(func(data): data.Coins = 81)
+        suite.Expect(shutdown.Close(10).Ok, "default native close finished")
+        local saved = backend.GetAsync(key)
+        suite.Expect(saved != nil and saved.Data.Coins == 81 and saved.Lock == nil, "saved and unlocked")
+    finally:
+        shutdown.Close(1)
+        backend.RemoveAsync(key)
+)
+game.ShuttingDown.Connect(func(): print("mDataShuttingDown: observed in Creator"))
+local report = suite.Report()
+print(report.Name + ": " + report.Passed + " passed, " + report.Failed + " failed")
+for failure in report.Failures: print(report.Name + ": " + failure)

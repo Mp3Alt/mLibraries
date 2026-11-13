@@ -1,0 +1,1164 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Native client-script contracts. No synthetic clicks or keyboard input.
+
+local mTopbar = import("/mLibraries/mTopbar")
+local suite = import("/mLibraries/mTestKit").New("mTopbarNative")
+
+local WithBar = func(work):
+    local bar = mTopbar.New({ Name = "mTopbarTests", LeftInset = 168, RightInset = 8, TopInset = 8, AutoDestroy = false })
+    bar.SetVisible(false)
+    try:
+        work(bar)
+    finally:
+        bar.Destroy()
+
+local AllDone = func(values):
+    for value in values:
+        if not value: return false
+    return true
+
+local WaitAll = func(done):
+    for turn in range(600):
+        if AllDone(done): return true
+        wait(0)
+    return false
+
+local Near = expr(value, expected): value >= expected - 0.002 and value <= expected + 0.002
+
+local CheckVisual = func(target, scale, transparency, message):
+    local size = target.Scale
+    suite.Expect(Near(size.X, scale) and Near(size.Y, scale), message + " scale")
+    suite.Expect(Near(target.Transparency, transparency), message + " transparency")
+
+local WaitSpan = func(seconds):
+    local started = host.time()
+    for turn in range(300):
+        if host.time() - started >= seconds: return
+        wait(0)
+    throw "native fixture did not reach its bounded time interval"
+
+local AwaitVisual = func(target, scale, transparency):
+    local started = host.time()
+    local stable = 0
+    local last_scale = target.Scale
+    local last_transparency = target.Transparency
+    for turn in range(300):
+        wait(0)
+        local elapsed = host.time() - started
+        last_scale = target.Scale
+        last_transparency = target.Transparency
+        if elapsed >= 0.2 and Near(last_scale.X, scale) and Near(last_scale.Y, scale) and Near(last_transparency, transparency):
+            stable++
+            if stable >= 3: return
+        else:
+            stable = 0
+        if elapsed >= 0.8: break
+    throw "visual did not settle: scale=" + last_scale.X + "," + last_scale.Y + "; transparency=" + last_transparency
+
+local MovingTween = func(target):
+    local started = host.time()
+    for turn in range(300):
+        local tween = target.FindFirstChild("Tween")
+        if tween != nil and tween.IsInDataModel:
+            local progress = tween.Progress
+            if progress > 0 and progress < 1: return tween
+        if host.time() - started >= 0.18: break
+        wait(0)
+    throw "native fixture did not observe an in-flight visual tween"
+
+local FixtureButton = func(name):
+    local screen = game.UICanvas.FindFirstChild("mTopbarTests")
+    suite.Expect(screen != nil, "fixture screen exists")
+    local button = screen.FindFirstChild(name)
+    suite.Expect(button != nil, "fixture hit button exists")
+    return button
+
+local FixtureVisual = func(name):
+    local visual = FixtureButton(name).FindFirstChild("Visual")
+    suite.Expect(visual != nil, "fixture visual exists")
+    return visual
+
+local LeftEdge = expr(item): item.Position.X - item.Size.X * item.Pivot.X
+
+local DockRoom = func(screen):
+    local size = screen.SafeAreaSize
+    if size.X >= 104 and size.Y >= 64:
+        print("mTopbar dock geometry checked in usable viewport " + size.X + "x" + size.Y)
+        return true
+    print("mTopbar dock geometry not checked: insufficient viewport " + size.X + "x" + size.Y)
+    return false
+
+suite.Test("a new owned bar starts empty and keeps declared icon defaults", func():
+    WithBar(func(bar):
+        suite.Equal(bar.GetCount(), 0, "initial count")
+        local icon = bar.Add({ Name = "first", Label = "A" })
+        local state = icon.GetState()
+        suite.Equal(bar.GetCount(), 1, "one owned icon")
+        suite.Equal(state.Name, "first", "name")
+        suite.Equal(state.Label, "A", "label")
+        suite.Equal(state.Image, "", "no image by default")
+        suite.Equal(state.ImageSize, 28, "default glyph size")
+        suite.Equal(state.Tooltip, "", "no tooltip by default")
+        suite.Equal(state.Badge, 0, "no badge by default")
+        suite.Equal(state.Order, 0, "default order")
+        suite.Equal(state.Side, "Left", "default side")
+        suite.Equal(state.Enabled, true, "enabled default")
+        suite.Equal(state.Visible, true, "visible default")
+        suite.Equal(state.Selected, false, "initially unselected")
+        suite.Equal(state.MenuCount, 0, "no menu by default")
+    )
+)
+
+suite.Test("duplicate names fail without changing count", func():
+    WithBar(func(bar):
+        bar.Add({ Name = "same", Label = "A" })
+        suite.Throws(func(): bar.Add({ Name = "same", Label = "B" }), "duplicate rejected")
+        suite.Equal(bar.GetCount(), 1, "failed addition has no partial icon")
+    )
+)
+
+suite.Test("the sixty-four icon bound is enforced before publication", func():
+    WithBar(func(bar):
+        for index in range(64):
+            bar.Add({ Name = "icon" + index, Label = "A" })
+        suite.Equal(bar.GetCount(), 64, "capacity accepted")
+        suite.Throws(func(): bar.Add({ Name = "overflow", Label = "A" }), "overflow rejected")
+        suite.Equal(bar.GetCount(), 64, "overflow did not change count")
+    )
+)
+
+suite.Test("icon names must be nonempty bounded strings", func():
+    WithBar(func(bar):
+        for value in [nil, false, 1, [], {}, "", string.repeat("n", 65)]:
+            suite.Throws(func(): bar.Add({ Name = value, Label = "A" }), "bad name rejected")
+        local name = string.repeat("n", 64)
+        suite.Equal(bar.Add({ Name = name, Label = "A" }).GetState().Name, name, "name boundary accepted")
+    )
+)
+
+suite.Test("label tooltip and image bounds are strict without coercion", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "text", Label = string.repeat("L", 64), Tooltip = string.repeat("T", 128) })
+        suite.Equal(icon.GetState().Label, string.repeat("L", 64), "label boundary")
+        suite.Equal(icon.GetState().Tooltip, string.repeat("T", 128), "tooltip boundary")
+        suite.Throws(func(): icon.SetLabel(string.repeat("x", 65)), "long label rejected")
+        suite.Throws(func(): icon.SetTooltip(string.repeat("x", 129)), "long tooltip rejected")
+        suite.Throws(func(): icon.SetImage(string.repeat("x", 257)), "long image rejected")
+        for value in [false, 0, [], {}]:
+            suite.Throws(func(): icon.SetLabel(value), "label must be text")
+            suite.Throws(func(): icon.SetTooltip(value), "tooltip must be text")
+            suite.Throws(func(): icon.SetImage(value), "image must be text")
+        icon.SetLabel("")
+        icon.SetTooltip("")
+        icon.SetImage("")
+        suite.Equal(icon.GetState().Label, "", "text can be cleared")
+    )
+)
+
+suite.Test("configuration booleans require literal boolean values", func():
+    WithBar(func(bar):
+        for value in [0, 1, "true", [], {}]:
+            suite.Throws(func(): bar.Add({ Name = "enabled", Enabled = value }), "bad Enabled rejected")
+            suite.Throws(func(): bar.Add({ Name = "visible", Visible = value }), "bad Visible rejected")
+            suite.Throws(func(): bar.Add({ Name = "toggle", Toggle = value }), "bad Toggle rejected")
+        suite.Equal(bar.GetCount(), 0, "bad definitions did not publish icons")
+    )
+)
+
+suite.Test("side and finite order have explicit bounds", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "order", Label = "A", Side = "Right", Order = -1000000 })
+        suite.Equal(icon.GetState().Side, "Right", "right lane")
+        icon.SetSide("Left")
+        icon.SetOrder(1000000)
+        suite.Equal(icon.GetState().Order, 1000000, "upper endpoint")
+        icon.SetOrder(0.25)
+        suite.Equal(icon.GetState().Order, 0.25, "finite fractional order")
+        for value in ["left", "Center", false, 0, []]:
+            suite.Throws(func(): icon.SetSide(value), "unsupported side rejected")
+        for value in [-1000001, 1000001, "1", false, 0 / 0, 1e308 * 10]:
+            suite.Throws(func(): icon.SetOrder(value), "invalid order rejected")
+        suite.Equal(icon.GetState().Order, 0.25, "failed mutation preserves order")
+    )
+)
+
+suite.Test("badges require exact whole numbers from zero through 9999", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "badge", Label = "A", Badge = 9999 })
+        suite.Equal(icon.GetState().Badge, 9999, "upper badge endpoint")
+        for value in [-1, 10000, 0.5, 1 + 1e-12, "1", false, 0 / 0, 1e308 * 10]:
+            suite.Throws(func(): icon.SetBadge(value), "invalid badge rejected")
+        suite.Equal(icon.GetState().Badge, 9999, "bad mutation preserved badge")
+        icon.SetBadge(0)
+        suite.Equal(icon.GetState().Badge, 0, "zero clears badge")
+    )
+)
+
+suite.Test("GetState and source config are independent metadata copies", func():
+    WithBar(func(bar):
+        local config = { Name = "copy", Label = "original", Tooltip = "hint", Badge = 2, Side = "Right" }
+        local icon = bar.Add(config)
+        config.Label = "changed"
+        config.Tooltip = "changed"
+        local first = icon.GetState()
+        local second = icon.GetState()
+        suite.Expect(first != second, "fresh state records")
+        first.Label = "changed"
+        first.Enabled = false
+        suite.Equal(icon.GetState().Label, "original", "metadata does not alias config or snapshots")
+        suite.Equal(icon.GetState().Enabled, true, "snapshot does not control icon")
+        icon.SetLabel("later")
+        suite.Equal(second.Label, "original", "earlier snapshots remain unchanged")
+    )
+)
+
+suite.Test("enabled visible and selected setters reject truthy nonbooleans", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "bool", Label = "A" })
+        for value in [0, 1, "true", [], {}]:
+            suite.Throws(func(): icon.SetEnabled(value), "bad enabled setter")
+            suite.Throws(func(): icon.SetVisible(value), "bad visible setter")
+            suite.Throws(func(): icon.SetSelected(value), "bad selection setter")
+        suite.Equal(icon.GetState().Enabled, true, "enabled unchanged")
+        suite.Equal(icon.GetState().Visible, true, "visible unchanged")
+        suite.Equal(icon.IsSelected(), false, "selection unchanged")
+    )
+)
+
+suite.Test("key binding may change and clear without synthesizing input", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "key", Label = "A", Key = KeyName.Q })
+        suite.Equal(icon.GetState().Key, KeyName.Q, "configured key")
+        icon.BindKey(KeyName.E)
+        suite.Equal(icon.GetState().Key, KeyName.E, "replacement key")
+        icon.BindKey(nil)
+        suite.Equal(icon.GetState().Key, nil, "binding cleared")
+        suite.Throws(func(): icon.BindKey("not-a-key"), "unknown key rejected")
+    )
+)
+
+suite.Test("non-toggle activation emits its icon without selecting", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local icon = bar.Add({ Name = "action", Label = "A", Toggle = false })
+        local calls = 0
+        local received = nil
+        icon.Activated.Connect(func(payload):
+            calls += 1
+            received = payload
+        )
+        suite.Equal(icon.Activate(), true, "activation accepted")
+        suite.Equal(calls, 1, "one notification")
+        suite.Equal(received, icon, "single payload is the icon")
+        suite.Equal(icon.IsSelected(), false, "momentary action remains unselected")
+    )
+)
+
+suite.Test("toggle activation changes selection once per activation", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local icon = bar.Add({ Name = "toggle", Label = "A", Toggle = true })
+        local selected = 0
+        local deselected = 0
+        icon.Selected.Connect(func(payload):
+            suite.Equal(payload, icon, "selection payload")
+            selected += 1
+        )
+        icon.Deselected.Connect(func(payload): deselected += 1)
+        suite.Expect(icon.Activate(), "first activation")
+        suite.Expect(icon.IsSelected(), "first activation selects")
+        suite.Expect(icon.Activate(), "second activation")
+        suite.Expect(not icon.IsSelected(), "second activation deselects")
+        suite.Equal(selected, 1, "one select")
+        suite.Equal(deselected, 1, "one deselect")
+    )
+)
+
+suite.Test("manual selection reports changes without Activated", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local icon = bar.Add({ Name = "manual", Label = "A" })
+        local activations = 0
+        local selections = 0
+        icon.Activated.Connect(func(payload): activations += 1)
+        icon.Selected.Connect(func(payload): selections += 1)
+        suite.Equal(icon.SetSelected(true), true, "new selection changed")
+        suite.Equal(icon.SetSelected(true), false, "same selection unchanged")
+        suite.Equal(icon.SetSelected(false), true, "deselection changed")
+        suite.Equal(icon.SetSelected(false), false, "same deselection unchanged")
+        suite.Equal(activations, 0, "setters do not activate")
+        suite.Equal(selections, 1, "idempotent selection does not repeat signals")
+    )
+)
+
+suite.Test("disabling a selected icon deselects and blocks activation", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local icon = bar.Add({ Name = "disabled", Label = "A" })
+        icon.SetSelected(true)
+        icon.SetEnabled(false)
+        suite.Expect(not icon.IsSelected(), "disabled icon deselects")
+        suite.Equal(icon.Activate(), false, "disabled activation rejected")
+        icon.SetEnabled(true)
+        suite.Equal(icon.Activate(), true, "reenabled activation accepted")
+    )
+)
+
+suite.Test("hiding a selected icon deselects and blocks activation", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local icon = bar.Add({ Name = "hidden", Label = "A" })
+        icon.SetSelected(true)
+        icon.SetVisible(false)
+        suite.Expect(not icon.IsSelected(), "hidden icon deselects")
+        suite.Equal(icon.Activate(), false, "hidden activation rejected")
+        icon.SetVisible(true)
+        suite.Equal(icon.Activate(), true, "shown activation accepted")
+    )
+)
+
+suite.Test("a group deselects its old member before selecting the new member", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local first = bar.Add({ Name = "first", Label = "A", Group = "pages" })
+        local second = bar.Add({ Name = "second", Label = "B", Group = "pages" })
+        local events = []
+        first.Deselected.Connect(func(payload): events.push("old deselected"))
+        second.Selected.Connect(func(payload): events.push("new selected"))
+        first.SetSelected(true)
+        second.SetSelected(true)
+        suite.Expect(not first.IsSelected() and second.IsSelected(), "group has one selection")
+        suite.Equal(events.length, 2, "two transitions")
+        suite.Equal(events[0], "old deselected", "old notification first")
+        suite.Equal(events[1], "new selected", "new notification second")
+    )
+)
+
+suite.Test("different and empty groups do not deselect unrelated icons", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local first = bar.Add({ Name = "first", Label = "A", Group = "one" })
+        local second = bar.Add({ Name = "second", Label = "B", Group = "two" })
+        local third = bar.Add({ Name = "third", Label = "C" })
+        local fourth = bar.Add({ Name = "fourth", Label = "D" })
+        for icon in [first, second, third, fourth]: icon.SetSelected(true)
+        for icon in [first, second, third, fourth]:
+            suite.Expect(icon.IsSelected(), "unrelated selection remains")
+    )
+)
+
+suite.Test("a Selected listener can destroy its own icon", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local icon = bar.Add({ Name = "self", Label = "A" })
+        icon.Selected.Connect(func(payload): icon.Destroy())
+        icon.Activate()
+        suite.Expect(icon.IsDestroyed(), "reentrant self destruction completed")
+        suite.Equal(bar.GetCount(), 0, "destroyed icon was removed")
+    )
+)
+
+suite.Test("old group member may destroy the incoming selection", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local first = bar.Add({ Name = "first", Label = "A", Group = "pages" })
+        local second = bar.Add({ Name = "second", Label = "B", Group = "pages" })
+        first.SetSelected(true)
+        first.Deselected.Connect(func(payload): second.Destroy())
+        second.SetSelected(true)
+        suite.Expect(second.IsDestroyed(), "incoming icon destruction retained")
+        suite.Expect(not second.IsSelected(), "destroyed target was not selected afterward")
+        suite.Equal(bar.GetCount(), 1, "only the surviving icon remains")
+    )
+)
+
+suite.Test("an Activated listener can destroy the complete bar", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local first = bar.Add({ Name = "first", Label = "A" })
+        local second = bar.Add({ Name = "second", Label = "B" })
+        first.Activated.Connect(func(payload): bar.Destroy())
+        first.Activate()
+        suite.Expect(bar.IsDestroyed(), "bar destroyed during dispatch")
+        suite.Expect(first.IsDestroyed() and second.IsDestroyed(), "all icons destroyed")
+        suite.Equal(bar.GetCount(), 0, "bar releases its registry")
+    )
+)
+
+suite.Test("throwing user listeners do not prevent later listeners", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local icon = bar.Add({ Name = "errors", Label = "A", Toggle = false })
+        local later = 0
+        icon.Activated.Connect(func(payload): throw "private listener failure")
+        icon.Activated.Connect(func(payload): later += 1)
+        suite.Expect(icon.Activate(), "activation survives user error")
+        suite.Equal(later, 1, "later listener still ran")
+        suite.Expect(icon.Activate(), "another activation remains usable")
+        suite.Equal(later, 2, "no stuck admission state")
+    )
+)
+
+suite.Test("icon destruction is idempotent and frees its name", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "reuse", Label = "A" })
+        icon.Destroy()
+        icon.Destroy()
+        suite.Equal(bar.GetCount(), 0, "double destroy does not decrement twice")
+        local replacement = bar.Add({ Name = "reuse", Label = "B" })
+        suite.Equal(replacement.GetState().Label, "B", "replacement may reuse released name")
+        suite.Expect(not replacement.IsDestroyed(), "replacement alive")
+    )
+)
+
+suite.Test("destroying an icon releases all three public signals", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "signals", Label = "A" })
+        icon.Activated.Connect(func(payload): pass)
+        icon.Selected.Connect(func(payload): pass)
+        icon.Deselected.Connect(func(payload): pass)
+        icon.Destroy()
+        for signal in [icon.Activated, icon.Selected, icon.Deselected]:
+            suite.Expect(signal.IsDestroyed(), "owned signal destroyed")
+            suite.Equal(signal.GetListenerCount(), 0, "listeners released")
+    )
+)
+
+suite.Test("destroyed icon mutation methods throw while state remains inspectable", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "dead", Label = "A" })
+        icon.Destroy()
+        suite.Expect(icon.IsDestroyed(), "destroyed marker")
+        suite.Expect(icon.GetState() != nil, "state inspection survives")
+        local mutations = [
+            func(): icon.SetImage(""), func(): icon.SetLabel("A"), func(): icon.SetTooltip("A"),
+            func(): icon.SetBadge(0), func(): icon.SetOrder(0), func(): icon.SetSide("Left"), func(): icon.SetImageSize(28),
+            func(): icon.SetEnabled(true), func(): icon.SetVisible(true), func(): icon.SetSelected(true),
+            func(): icon.BindKey(nil), func(): icon.Activate(), func(): icon.SetMenu([])
+        ]
+        for mutation in mutations:
+            suite.Throws(mutation, "destroyed icon cannot mutate")
+    )
+)
+
+suite.Test("bar destruction is idempotent and closes all owned icons", func():
+    WithBar(func(bar):
+        local first = bar.Add({ Name = "first", Label = "A" })
+        local second = bar.Add({ Name = "second", Label = "B" })
+        bar.Destroy()
+        bar.Destroy()
+        suite.Expect(bar.IsDestroyed(), "destroyed marker")
+        suite.Equal(bar.GetCount(), 0, "empty after destroy")
+        suite.Expect(first.IsDestroyed() and second.IsDestroyed(), "icons retired")
+        suite.Throws(func(): bar.Add({ Name = "later", Label = "C" }), "dead bar cannot add")
+        suite.Throws(func(): bar.SetVisible(true), "dead bar cannot show")
+        suite.Throws(func(): bar.SetInsets(0, 0, 0), "dead bar cannot resize")
+    )
+)
+
+suite.Test("AutoDestroy closes only after its last icon is removed", func():
+    local bar = mTopbar.New({ Name = "mTopbarTests", AutoDestroy = true })
+    bar.SetVisible(false)
+    try:
+        local first = bar.Add({ Name = "first", Label = "A" })
+        local second = bar.Add({ Name = "second", Label = "B" })
+        first.Destroy()
+        suite.Expect(not bar.IsDestroyed(), "one live icon keeps bar alive")
+        second.Destroy()
+        suite.Expect(bar.IsDestroyed(), "last icon closes automatic bar")
+        suite.Equal(bar.GetCount(), 0, "automatic cleanup released registry")
+    finally:
+        bar.Destroy()
+)
+
+suite.Test("menu definitions are adopted without running callbacks", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local icon = bar.Add({ Name = "menu", Label = "A" })
+        local calls = 0
+        local entries = [{ Text = "One", Run = func(): calls += 1 }, { Text = "Two", Disabled = true, Run = func(): calls += 1 }]
+        icon.SetMenu(entries)
+        entries[0].Text = "changed"
+        entries.push({ Text = "Three", Run = func(): calls += 1 })
+        suite.Equal(icon.GetState().MenuCount, 2, "caller append does not alter private menu count")
+        icon.SetSelected(true)
+        icon.SetSelected(false)
+        suite.Equal(calls, 0, "adoption and open/close do not execute menu actions")
+        icon.SetMenu([])
+        suite.Equal(icon.GetState().MenuCount, 0, "menu clears")
+    )
+)
+
+suite.Test("flat menus enforce sixteen entries and preserve the previous menu on failure", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "menu", Label = "A" })
+        local entries = []
+        for index in range(16): entries.push({ Text = "Entry " + index, Run = func(): pass })
+        icon.SetMenu(entries)
+        suite.Equal(icon.GetState().MenuCount, 16, "menu capacity accepted")
+        entries.push({ Text = "Overflow", Run = func(): pass })
+        suite.Throws(func(): icon.SetMenu(entries), "seventeenth entry rejected")
+        suite.Equal(icon.GetState().MenuCount, 16, "invalid replacement did not partially commit")
+    )
+)
+
+suite.Test("menu input must be a real flat array without invoking forged methods", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "menu", Label = "A" })
+        local called = false
+        local forged = { length = 0, index_of = func(value): called = true }
+        for value in [false, 0, "menu", {}, forged, [[{ Text = "Nested", Run = func(): pass }]]]:
+            suite.Throws(func(): icon.SetMenu(value), "malformed menu rejected")
+        suite.Equal(called, false, "untrusted member was not called")
+        suite.Equal(icon.GetState().MenuCount, 0, "no partial menu")
+    )
+)
+
+suite.Test("missing menu actions and invalid menu text are rejected", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "menu", Label = "A" })
+        for entry in [{ Text = "No action" }, { Text = false, Run = func(): pass }, { Text = "Invalid image", Image = false, Run = func(): pass }, { Text = "Invalid disabled", Disabled = "true", Run = func(): pass }]:
+            suite.Throws(func(): icon.SetMenu([entry]), "malformed entry rejected")
+        suite.Equal(icon.GetState().MenuCount, 0, "bad entries did not publish")
+    )
+)
+
+suite.Test("insets reject nonfinite negative and excessive values", func():
+    WithBar(func(bar):
+        bar.SetInsets(0, 4096, 0)
+        bar.SetInsets(168, 8, 8)
+        for value in [-1, 4097, "8", false, 0 / 0, 1e308 * 10]:
+            suite.Throws(func(): bar.SetInsets(value, 8, 8), "invalid left inset")
+            suite.Throws(func(): bar.SetInsets(168, value, 8), "invalid right inset")
+            suite.Throws(func(): bar.SetInsets(168, 8, value), "invalid top inset")
+    )
+)
+
+suite.Test("invalid bar options throw before returning a live owner", func():
+    for options in [false, "bar", 0, [], { Name = "mTopbarTests", LeftInset = -1 }, { Name = "mTopbarTests", AutoDestroy = "true" }]:
+        suite.Throws(func(): mTopbar.New(options), "bad bar options rejected")
+)
+
+suite.Test("glyph size accepts eight through forty without changing hitbox state", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "glyph", Label = "A", ImageSize = 40 })
+        suite.Equal(icon.GetState().ImageSize, 40, "configured glyph boundary")
+        icon.SetImageSize(8)
+        suite.Equal(icon.GetState().ImageSize, 8, "lower glyph boundary")
+        for value in [7, 41, "28", false, 0 / 0, 1e308 * 10]:
+            suite.Throws(func(): icon.SetImageSize(value), "invalid glyph size rejected")
+        suite.Equal(icon.GetState().ImageSize, 8, "failed glyph mutation preserves state")
+        suite.Equal(icon.GetState().Visible, true, "glyph sizing preserves requested visibility")
+        suite.Equal(icon.GetState().Enabled, true, "glyph sizing preserves enabled state")
+    )
+)
+
+suite.Test("the default owner is shared without disturbing preexisting icons", func():
+    local bar = mTopbar.GetDefault()
+    local icon = nil
+    try:
+        suite.Equal(mTopbar.GetDefault(), bar, "live default instance reused")
+        icon = bar.Add({ Name = "mTopbarTestDefault", Label = "T" })
+        suite.Expect(bar.GetCount() >= 1, "test icon added alongside any application icons")
+    finally:
+        if icon != nil: icon.Destroy()
+    # Application startup may add its own icon while this fixture is running.
+    if bar.GetCount() == 0:
+        suite.Expect(bar.IsDestroyed(), "empty default automatically retires")
+    else:
+        suite.Expect(not bar.IsDestroyed(), "preexisting owner was preserved")
+)
+
+suite.Test("docking two icons preserves their independent state and ownership", func():
+    WithBar(func(bar):
+        local first = bar.Add({ Name = "first", Label = "A", Badge = 2 })
+        local second = bar.Add({ Name = "second", Label = "B", Order = 3 })
+        local dock = bar.Dock(first, second)
+        suite.Expect(not dock.IsDestroyed(), "new dock is alive")
+        suite.Equal(bar.GetCount(), 2, "dock does not replace icons")
+        suite.Equal(first.GetState().Badge, 2, "first state retained")
+        suite.Equal(second.GetState().Order, 3, "second state retained")
+        suite.Expect(not first.IsSelected() and not second.IsSelected(), "docking does not activate icons")
+    )
+)
+
+suite.Test("docks reject same foreign destroyed and forged partners", func():
+    WithBar(func(bar):
+        local other = mTopbar.New({ Name = "mTopbarTestsOther", AutoDestroy = false })
+        other.SetVisible(false)
+        try:
+            local first = bar.Add({ Name = "first", Label = "A" })
+            local second = bar.Add({ Name = "second", Label = "B" })
+            local foreign = other.Add({ Name = "foreign", Label = "C" })
+            suite.Throws(func(): bar.Dock(first, first), "same icon cannot dock twice")
+            suite.Throws(func(): bar.Dock(first, foreign), "foreign bar cannot be adopted")
+            local called = false
+            local forged = { GetState = func(): called = true }
+            suite.Throws(func(): bar.Dock(first, forged), "arbitrary table is not an owned handle")
+            suite.Equal(called, false, "forged handle methods not invoked")
+            second.Destroy()
+            suite.Throws(func(): bar.Dock(first, second), "destroyed partner rejected")
+            suite.Equal(bar.GetCount(), 1, "invalid docks did not alter registry")
+            suite.Equal(other.GetCount(), 1, "foreign owner retained its icon")
+        finally:
+            other.Destroy()
+    )
+)
+
+suite.Test("docking requires matching sides and undocked members", func():
+    WithBar(func(bar):
+        local first = bar.Add({ Name = "first", Label = "A", Side = "Right" })
+        local second = bar.Add({ Name = "second", Label = "B" })
+        local third = bar.Add({ Name = "third", Label = "C", Side = "Right" })
+        suite.Throws(func(): bar.Dock(first, second), "mismatched lanes rejected")
+        second.SetSide("Right")
+        local dock = bar.Dock(first, second)
+        suite.Throws(func(): bar.Dock(first, third), "already docked member rejected")
+        suite.Throws(func(): bar.Dock(third, second), "second docked member rejected")
+        suite.Expect(not dock.IsDestroyed(), "failed second dock did not retire original")
+        suite.Equal(bar.GetCount(), 3, "all icons remain owned")
+    )
+)
+
+suite.Test("explicit undocking is idempotent and does not destroy icons", func():
+    WithBar(func(bar):
+        local first = bar.Add({ Name = "first", Label = "A" })
+        local second = bar.Add({ Name = "second", Label = "B" })
+        local dock = bar.Dock(first, second)
+        dock.Destroy()
+        dock.Destroy()
+        suite.Expect(dock.IsDestroyed(), "retired dock marker")
+        suite.Expect(not first.IsDestroyed() and not second.IsDestroyed(), "both icons survive")
+        suite.Equal(bar.GetCount(), 2, "undock does not remove icons")
+        first.SetSide("Right")
+        suite.Equal(first.GetState().Side, "Right", "undocked icon may change lanes")
+    )
+)
+
+suite.Test("destroying a dock member undocks its survivor and bar destruction closes docks", func():
+    WithBar(func(bar):
+        local first = bar.Add({ Name = "first", Label = "A" })
+        local second = bar.Add({ Name = "second", Label = "B" })
+        local dock = bar.Dock(first, second)
+        first.Destroy()
+        suite.Expect(dock.IsDestroyed(), "member destruction retired dock")
+        suite.Expect(not second.IsDestroyed(), "survivor retained")
+        second.SetSide("Right")
+        suite.Equal(bar.GetCount(), 1, "one icon remains")
+        local third = bar.Add({ Name = "third", Label = "C", Side = "Right" })
+        local replacement = bar.Dock(second, third)
+        bar.Destroy()
+        suite.Expect(replacement.IsDestroyed(), "bar destruction retired its dock")
+        suite.Expect(second.IsDestroyed() and third.IsDestroyed(), "bar still owns both icons")
+        replacement.Destroy()
+    )
+)
+
+suite.Test("docked order and visibility changes preserve the pair until undocking", func():
+    WithBar(func(bar):
+        local first = bar.Add({ Name = "first", Label = "A", Order = 10 })
+        local second = bar.Add({ Name = "second", Label = "B", Order = 20 })
+        local dock = bar.Dock(first, second)
+        suite.Throws(func(): first.SetSide("Right"), "docked side cannot change")
+        suite.Throws(func(): second.SetSide("Right"), "either docked side cannot change")
+        second.SetOrder(-50)
+        first.SetVisible(false)
+        second.SetVisible(false)
+        suite.Expect(not dock.IsDestroyed(), "hiding is not destruction")
+        suite.Equal(bar.GetCount(), 2, "hidden pair retains ownership")
+        first.SetVisible(true)
+        second.SetVisible(true)
+        dock.Destroy()
+        suite.Equal(second.GetState().Order, -50, "stored order survives undocking")
+        suite.Equal(first.GetState().Side, "Left", "rejected side change preserved state")
+    )
+)
+
+suite.Test("native competing Add calls preserve unique names and the capacity bound", func():
+    WithBar(func(bar):
+        local published = []
+        for index in range(16): published.push(false)
+        local done = [false, false, false, false, false, false]
+        local accepted = [[], [], [], [], [], []]
+        local control = { Stop = false }
+        local StartWorker = func(worker):
+            spawn(func():
+                try:
+                    for index in range(16):
+                        local attempts = 0
+                        while not published[index] and attempts < 128 and not control.Stop:
+                            attempts += 1
+                            try:
+                                local icon = bar.Add({ Name = "shared" + index, Label = "A" })
+                                accepted[worker].push({ Index = index, Icon = icon })
+                                published[index] = true
+                            catch rejected:
+                                pass
+                            wait(0)
+                finally:
+                    done[worker] = true
+            )
+        for worker in range(6): StartWorker(worker)
+        local finished = WaitAll(done)
+        control.Stop = true
+        suite.Expect(finished, "all name contenders completed")
+        local seen = []
+        for index in range(16): seen.push(false)
+        local total = 0
+        for records in accepted:
+            for record in records:
+                suite.Expect(record.Icon != nil, "successful Add returned a handle")
+                suite.Expect(not seen[record.Index], "each name published exactly once")
+                seen[record.Index] = true
+                total += 1
+        suite.Equal(total, 16, "all shared names were registered")
+        suite.Equal(bar.GetCount(), 16, "no hidden duplicate registry entries")
+        for index in range(47): bar.Add({ Name = "capacity" + index, Label = "A" })
+        local capacity_done = [false, false, false, false, false, false]
+        local capacity_accepted = [false, false, false, false, false, false]
+        local StartCapacity = func(worker):
+            spawn(func():
+                try:
+                    bar.Add({ Name = "last" + worker, Label = "A" })
+                    capacity_accepted[worker] = true
+                catch rejected:
+                    pass
+                finally:
+                    capacity_done[worker] = true
+            )
+        for worker in range(6): StartCapacity(worker)
+        suite.Expect(WaitAll(capacity_done), "all capacity contenders completed")
+        local count = 0
+        for value in capacity_accepted:
+            if value: count += 1
+        suite.Equal(count, 1, "only one contender entered the final slot")
+        suite.Equal(bar.GetCount(), 64, "concurrent publication obeyed capacity")
+    )
+)
+
+suite.Test("native Add and Destroy contention never returns a live orphan icon", func():
+    for round in range(16):
+        WithBar(func(bar):
+            local started = [false, false, false]
+            local done = [false, false, false, false]
+            local accepted = [[], [], []]
+            local control = { Stop = false }
+            local StartAdder = func(worker):
+                spawn(func():
+                    try:
+                        for index in range(8):
+                            if control.Stop: return
+                            started[worker] = true
+                            try:
+                                local icon = bar.Add({ Name = "race" + worker + "_" + index, Label = "A" })
+                                accepted[worker].push({ Icon = icon })
+                            catch rejected:
+                                pass
+                            wait(0)
+                    finally:
+                        done[worker] = true
+                )
+            for worker in range(3): StartAdder(worker)
+            spawn(func():
+                try:
+                    WaitAll(started)
+                    bar.Destroy()
+                finally:
+                    done[3] = true
+            )
+            local finished = WaitAll(done)
+            control.Stop = true
+            bar.Destroy()
+            suite.Expect(finished, "all Add/Destroy workers completed")
+            suite.Expect(bar.IsDestroyed(), "bar reached terminal state")
+            suite.Equal(bar.GetCount(), 0, "terminal bar has no registered icons")
+            for records in accepted:
+                for record in records:
+                    suite.Expect(record.Icon != nil, "successful Add returned a handle during contention")
+                    suite.Expect(record.Icon.IsDestroyed(), "every returned icon followed bar destruction")
+        )
+)
+
+suite.Test("selecting an ungrouped menu icon retires the previous menu selection", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local first = bar.Add({ Name = "first", Label = "A", Group = "" })
+        local second = bar.Add({ Name = "second", Label = "B", Group = "" })
+        first.SetMenu([{ Text = "First action", Run = func(): pass }])
+        second.SetMenu([{ Text = "Second action", Run = func(): pass }])
+        local events = []
+        first.Deselected.Connect(func(payload):
+            events.push({ Event = "old", Icon = payload, Selected = payload.IsSelected() })
+        )
+        second.Selected.Connect(func(payload):
+            events.push({ Event = "new", Icon = payload, Selected = payload.IsSelected() })
+        )
+        first.SetSelected(true)
+        second.SetSelected(true)
+        suite.Expect(not first.IsSelected(), "previous menu owner no longer selected")
+        suite.Expect(second.IsSelected(), "new menu owner selected")
+        suite.Equal(events.length, 2, "one deselection and one selection")
+        suite.Equal(events[0].Event, "old", "previous menu notified before new menu")
+        suite.Equal(events[0].Icon, first, "old notification payload")
+        suite.Equal(events[0].Selected, false, "old callback observes deselection")
+        suite.Equal(events[1].Event, "new", "new menu notification")
+        suite.Equal(events[1].Icon, second, "new notification payload")
+        suite.Equal(events[1].Selected, true, "new callback observes selection")
+    )
+)
+
+suite.Test("menu owners deselect on disable or hide without altering unrelated selection", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local other = bar.Add({ Name = "other", Label = "O" })
+        local owner = bar.Add({ Name = "owner", Label = "M" })
+        owner.SetMenu([{ Text = "Action", Run = func(): pass }])
+        local deselections = 0
+        owner.Deselected.Connect(func(payload): deselections += 1)
+        wait(0)
+        bar.SetInsets(168, 8, 8)
+        local screen = game.UICanvas.FindFirstChild("mTopbarTests")
+        suite.Expect(screen != nil, "fixture screen exists")
+        local popup = screen.FindFirstChild("Menu")
+        suite.Expect(popup != nil, "fixture popup exists")
+        local size = screen.SafeAreaSize
+        # These fixture insets need 224 pixels for one row slot and 128 for a popup.
+        local check_visibility = size.X >= 224 and size.Y >= 128
+        other.SetSelected(true)
+        owner.SetSelected(true)
+        suite.Expect(owner.IsSelected(), "menu owner selected before disabling")
+        if check_visibility:
+            suite.Expect(popup.Visible, "menu opened before disabled-close check")
+        owner.SetEnabled(false)
+        suite.Expect(not owner.IsSelected(), "disabled owner deselects")
+        if check_visibility:
+            suite.Expect(not popup.Visible, "disabled owner closes its popup")
+        suite.Expect(other.IsSelected(), "unrelated nonmenu selection survives disabling")
+        suite.Equal(deselections, 1, "one disable deselection")
+        owner.SetEnabled(true)
+        owner.SetSelected(true)
+        suite.Expect(owner.IsSelected(), "menu owner selected before hiding")
+        if check_visibility:
+            suite.Expect(popup.Visible, "menu reopened before hidden-close check")
+        owner.SetVisible(false)
+        suite.Expect(not owner.IsSelected(), "hidden owner deselects")
+        if check_visibility:
+            suite.Expect(not popup.Visible, "hidden owner closes its popup")
+        suite.Expect(other.IsSelected(), "unrelated nonmenu selection survives hiding")
+        suite.Equal(deselections, 2, "one additional hide deselection")
+        suite.Equal(owner.GetState().MenuCount, 1, "closing does not erase menu definition")
+        if check_visibility:
+            print("mTopbar popup visibility checked in active viewport " + size.X + "x" + size.Y)
+        elif size.X <= 2 and size.Y <= 2:
+            print("mTopbar popup visibility not checked: inactive viewport " + size.X + "x" + size.Y)
+        else:
+            print("mTopbar popup visibility not checked: insufficient viewport " + size.X + "x" + size.Y)
+    )
+)
+
+suite.Test("standalone glass lives under a fixed clear hit button without an outline", func():
+    WithBar(func(bar):
+        bar.Add({ Name = "glass", Label = "G" })
+        local button = FixtureButton("glass")
+        local visual = FixtureVisual("glass")
+        suite.Equal(button.Style, UIPanelStyle.None, "hit button has no glass fill")
+        suite.Equal(button.Color.ToHex(), "00000000", "hit button remains clear")
+        suite.Equal(button.BorderWidth, 0, "hit button has no custom border")
+        suite.Equal(button.Size.X, 48, "fixed standalone hit width")
+        suite.Equal(button.Size.Y, 48, "fixed standalone hit height")
+        suite.Equal(button.AutoTintColor, false, "interaction does not change fill")
+        suite.Equal(visual.Style, UIPanelStyle.FrostedGlass, "child owns supported glass style")
+        suite.Equal(visual.Color.ToHex(), "999999FF", "native theme tint")
+        suite.Equal(visual.Roundness, 15, "native panel radius")
+        suite.Equal(visual.Pivot.X, 0.5, "visual scales around its horizontal center")
+        suite.Equal(visual.Pivot.Y, 0.5, "visual scales around its vertical center")
+        suite.Equal(visual.BlocksPointer, false, "visual does not intercept the hit button")
+        suite.Equal(button.FindFirstChild("Outline"), nil, "no custom hit-button outline")
+        suite.Equal(visual.FindFirstChild("Outline"), nil, "no custom visual outline")
+    )
+)
+
+suite.Test("docked icons share one glass surface and regain glass on undock", func():
+    WithBar(func(bar):
+        local first = bar.Add({ Name = "first", Label = "1" })
+        local second = bar.Add({ Name = "second", Label = "2" })
+        local dock = bar.Dock(first, second)
+        local screen = game.UICanvas.FindFirstChild("mTopbarTests")
+        local frame = screen.FindFirstChild("Dock")
+        local first_visual = FixtureVisual("first")
+        local second_visual = FixtureVisual("second")
+        suite.Equal(frame.Style, UIPanelStyle.FrostedGlass, "one shared glass frame")
+        suite.Equal(FixtureButton("first").Parent, screen, "first hit button is a screen sibling")
+        suite.Equal(FixtureButton("second").Parent, screen, "second hit button is a screen sibling")
+        suite.Equal(first_visual.Style, UIPanelStyle.None, "no stacked first tint")
+        suite.Equal(second_visual.Style, UIPanelStyle.None, "no stacked second tint")
+        dock.Destroy()
+        suite.Equal(FixtureVisual("first"), first_visual, "first visual is preserved")
+        suite.Equal(FixtureVisual("second"), second_visual, "second visual is preserved")
+        suite.Equal(first_visual.Style, UIPanelStyle.FrostedGlass, "first surface restored")
+        suite.Equal(second_visual.Style, UIPanelStyle.FrostedGlass, "second surface restored")
+    )
+)
+
+suite.Test("badge label and glyph-size changes preserve existing menu rows", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        wait(0)
+        bar.SetInsets(168, 8, 8)
+        local icon = bar.Add({ Name = "content", Label = "A" })
+        icon.SetMenu([{ Text = "Keep this row", Run = func(): pass }])
+        icon.SetSelected(true)
+        local screen = game.UICanvas.FindFirstChild("mTopbarTests")
+        local menu = screen.FindFirstChild("Menu")
+        local row = menu.FindFirstChild("Item0")
+        local visual = FixtureVisual("content")
+        suite.Expect(row != nil, "initial menu row exists")
+        icon.SetBadge(7)
+        icon.SetLabel("B")
+        icon.SetImageSize(32)
+        suite.Equal(menu.FindFirstChild("Item0"), row, "content changes do not rebuild the popup")
+        suite.Equal(FixtureVisual("content"), visual, "content changes preserve the animated visual")
+        suite.Expect(row.IsInDataModel, "original row remains owned")
+        suite.Expect(icon.IsSelected(), "content updates preserve selection")
+        suite.Equal(icon.GetState().Badge, 7, "badge updated")
+        suite.Equal(icon.GetState().Label, "B", "label updated")
+        suite.Equal(icon.GetState().ImageSize, 32, "image size updated")
+    )
+)
+
+suite.Test("standalone disable and enable settle actual native visual properties", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "fade", Label = "F" })
+        local button = FixtureButton("fade")
+        local visual = FixtureVisual("fade")
+        icon.SetEnabled(false)
+        local tween = MovingTween(visual)
+        suite.Equal(tween.Target, visual, "native tween targets the owned visual")
+        suite.Expect(Near(tween.Params.Time, 0.2), "native transition duration")
+        suite.Equal(tween.Params.Func, EasingFunc.Back, "standalone native easing")
+        suite.Equal(tween.Params.Trans, EasingTrans.Out, "standalone native transition")
+        AwaitVisual(visual, 1, 0.5)
+        suite.Equal(button.Size.X, 48, "visual motion leaves hit width fixed")
+        suite.Equal(button.Size.Y, 48, "visual motion leaves hit height fixed")
+        icon.SetEnabled(true)
+        AwaitVisual(visual, 1, 0)
+        suite.Expect(icon.GetState().Enabled, "enabled metadata agrees with settled native state")
+    )
+)
+
+suite.Test("an enabled replacement wins over an in-flight disabled fade", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "replace", Label = "R" })
+        local visual = FixtureVisual("replace")
+        icon.SetEnabled(false)
+        local previous = MovingTween(visual)
+        suite.Expect(visual.Transparency > 0, "the old fade actually started")
+        icon.SetEnabled(true)
+        AwaitVisual(visual, 1, 0)
+        suite.Expect(not previous.IsInDataModel, "superseded native tween is released")
+        WaitSpan(0.22)
+        CheckVisual(visual, 1, 0, "old completion cannot restore disabled state")
+    )
+)
+
+suite.Test("programmatic selection does not add a persistent native visual state", func():
+    WithBar(func(bar):
+        bar.SetInsets(0, 0, 4096)
+        bar.SetVisible(true)
+        local icon = bar.Add({ Name = "selection", Label = "S" })
+        local visual = FixtureVisual("selection")
+        suite.Expect(icon.SetSelected(true), "logical selection is accepted")
+        AwaitVisual(visual, 1, 0)
+        suite.Expect(icon.IsSelected(), "logical selection remains available")
+        suite.Expect(icon.SetSelected(false), "logical deselection is accepted")
+        AwaitVisual(visual, 1, 0)
+        suite.Equal(visual.FindFirstChild("Outline"), nil, "selection never creates a custom outline")
+    )
+)
+
+suite.Test("destroying an icon during motion removes its native tween and visual", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "destroy", Label = "D" })
+        local button = FixtureButton("destroy")
+        local visual = FixtureVisual("destroy")
+        local content = visual.FindFirstChild("Content")
+        icon.SetEnabled(false)
+        local tween = MovingTween(visual)
+        icon.Destroy()
+        suite.Expect(icon.IsDestroyed(), "icon is permanently destroyed")
+        suite.Expect(not button.IsInDataModel and not visual.IsInDataModel, "owned hit and visual removed")
+        suite.Expect(content != nil and not content.IsInDataModel, "content subtree removed")
+        suite.Expect(not tween.IsInDataModel, "in-flight native tween removed")
+        WaitSpan(0.25)
+        suite.Equal(bar.GetCount(), 0, "no icon resurrects after its former animation deadline")
+    )
+)
+
+suite.Test("dock ownership and usable-viewport geometry retain native pitch and padding", func():
+    WithBar(func(bar):
+        wait(0)
+        bar.SetInsets(0, 0, 4096)
+        local first = bar.Add({ Name = "first", Label = "1" })
+        local second = bar.Add({ Name = "second", Label = "2" })
+        local dock = bar.Dock(first, second)
+        local screen = game.UICanvas.FindFirstChild("mTopbarTests")
+        local frame = screen.FindFirstChild("Dock")
+        local a = FixtureButton("first")
+        local b = FixtureButton("second")
+        suite.Expect(not dock.IsDestroyed() and bar.GetCount() == 2, "both members remain owned")
+        suite.Expect(frame != nil and a.Parent == screen and b.Parent == screen, "independent native roots exist")
+        if not DockRoom(screen): return
+        suite.Equal(frame.Size.X, 96, "two native cells plus outer padding")
+        suite.Equal(frame.Size.Y, 48, "native dock height")
+        suite.Equal(a.Size.X, 44, "first hit cell width")
+        suite.Equal(b.Size.X, 44, "second hit cell width")
+        suite.Expect(Near(LeftEdge(a) - LeftEdge(frame), 4), "left outer padding")
+        suite.Expect(Near(LeftEdge(b) - LeftEdge(a), 44), "native cell pitch")
+        suite.Expect(Near(LeftEdge(frame) + frame.Size.X - LeftEdge(b) - b.Size.X, 4), "right outer padding")
+        suite.Expect(Near(LeftEdge(a) + a.Size.X / 2 - LeftEdge(frame), 26), "first native center")
+        suite.Expect(Near(LeftEdge(b) + b.Size.X / 2 - LeftEdge(frame), 70), "second native center")
+        CheckVisual(frame, 1, 0, "idle shared frame")
+    )
+)
+
+suite.Test("one-member dock lifetime and usable-viewport geometry retain the native width", func():
+    WithBar(func(bar):
+        wait(0)
+        bar.SetInsets(0, 0, 4096)
+        bar.SetVisible(true)
+        local first = bar.Add({ Name = "first", Label = "1" })
+        local second = bar.Add({ Name = "second", Label = "2" })
+        local dock = bar.Dock(first, second)
+        local screen = game.UICanvas.FindFirstChild("mTopbarTests")
+        local frame = screen.FindFirstChild("Dock")
+        first.SetVisible(false)
+        local remaining = FixtureButton("second")
+        suite.Expect(not dock.IsDestroyed() and bar.GetCount() == 2, "hidden member retains its ownership")
+        suite.Expect(not first.GetState().Visible and second.GetState().Visible, "exactly one member is logically visible")
+        if not DockRoom(screen): return
+        suite.Expect(frame.Visible, "one-member surface remains visible")
+        suite.Equal(frame.Size.X, 52, "single native dock width")
+        suite.Equal(remaining.Size.X, 52, "one-member hit target spans its surface")
+        suite.Expect(Near(LeftEdge(remaining), LeftEdge(frame)), "one-member hit target and surface align")
+        suite.Expect(Near(frame.Pivot.X, 0.5) and Near(frame.Pivot.Y, 0.5), "frame scales around its center")
+        second.SetVisible(false)
+        suite.Expect(not frame.Visible, "empty dock surface is hidden")
+        suite.Expect(not dock.IsDestroyed(), "temporary visibility does not destroy the relationship")
+    )
+)
+
+suite.Test("undocking during a fade restores standalone geometry and final disabled state", func():
+    WithBar(func(bar):
+        local first = bar.Add({ Name = "first", Label = "1" })
+        local second = bar.Add({ Name = "second", Label = "2" })
+        local visual = FixtureVisual("first")
+        first.SetEnabled(false)
+        MovingTween(visual)
+        local dock = bar.Dock(first, second)
+        local screen = game.UICanvas.FindFirstChild("mTopbarTests")
+        local frame = screen.FindFirstChild("Dock")
+        dock.Destroy()
+        suite.Expect(not frame.IsInDataModel, "former shared surface is removed")
+        suite.Equal(FixtureVisual("first"), visual, "same visual survives the layout-mode changes")
+        suite.Equal(visual.Style, UIPanelStyle.FrostedGlass, "standalone glass restored")
+        suite.Equal(FixtureButton("first").Size.X, 48, "standalone hit width restored")
+        suite.Equal(FixtureButton("second").Size.X, 48, "other hit width restored")
+        AwaitVisual(visual, 1, 0.5)
+        AwaitVisual(FixtureVisual("second"), 1, 0)
+        suite.Expect(not first.GetState().Enabled, "docking did not change enabled metadata")
+    )
+)
+
+suite.Test("bar destruction during a fade removes all owned native animation targets", func():
+    WithBar(func(bar):
+        local first = bar.Add({ Name = "first", Label = "1" })
+        local second = bar.Add({ Name = "second", Label = "2" })
+        local visual = FixtureVisual("first")
+        first.SetEnabled(false)
+        local tween = MovingTween(visual)
+        local screen = game.UICanvas.FindFirstChild("mTopbarTests")
+        local first_button = FixtureButton("first")
+        local second_button = FixtureButton("second")
+        bar.Destroy()
+        suite.Expect(bar.IsDestroyed() and first.IsDestroyed() and second.IsDestroyed(), "all public lifetimes close")
+        suite.Expect(not screen.IsInDataModel, "owned screen removed")
+        suite.Expect(not first_button.IsInDataModel and not second_button.IsInDataModel, "owned hit buttons removed")
+        suite.Expect(not visual.IsInDataModel and not tween.IsInDataModel, "visual and animation removed")
+        WaitSpan(0.25)
+        suite.Equal(game.UICanvas.FindFirstChild("mTopbarTests"), nil, "animation does not recreate an orphan screen")
+    )
+)
+
+suite.Test("numeric setters retain changes below tolerant equality", func():
+    WithBar(func(bar):
+        local icon = bar.Add({ Name = "precise", Label = "P" })
+        local order = 1e-12
+        local image_size = 28 + 1e-10
+        icon.SetOrder(order)
+        icon.SetImageSize(image_size)
+        local state = icon.GetState()
+        suite.Expect(not (state.Order < order or state.Order > order), "exact order retained")
+        suite.Expect(not (state.ImageSize < image_size or state.ImageSize > image_size), "exact image size retained")
+    )
+)
+
+suite.Test("replacing a menu preserves another menu owner and reentrant selection", func():
+    WithBar(func(bar):
+        bar.SetVisible(true)
+        local first = bar.Add({ Name = "first", Label = "A" })
+        local second = bar.Add({ Name = "second", Label = "B" })
+        local items = [{ Text = "Entry", Run = func(icon): pass }]
+        first.SetMenu(items)
+        second.SetMenu(items)
+        second.SetSelected(true)
+        local screen = game.UICanvas.FindFirstChild("mTopbarTests")
+        local popup = screen.FindFirstChild("Menu")
+        local row = popup.FindFirstChild("Item0")
+        suite.Expect(row != nil, "selected owner's menu is constructed even in a small viewport")
+        first.SetMenu(items)
+        suite.Expect(second.IsSelected(), "unrelated owner remains selected")
+        suite.Equal(popup.FindFirstChild("Item0"), row, "unrelated menu retains its native row")
+        first.SetSelected(true)
+        first.Deselected.Connect(func(icon): second.SetSelected(true))
+        first.SetMenu(items)
+        suite.Expect(second.IsSelected(), "reentrant menu selection remains selected")
+        suite.Expect(popup.FindFirstChild("Item0") != nil, "reentrant owner's menu remains constructed")
+    )
+)
+
+suite.Test("parallel icon dock and bar destruction closes each lifetime once", func():
+    for round in range(16):
+        WithBar(func(bar):
+            local icons = []
+            local docks = []
+            for index in range(16): icons.push(bar.Add({ Name = "close" + index, Label = "C" }))
+            for index in range(8): docks.push(bar.Dock(icons[index * 2], icons[index * 2 + 1]))
+            local done = []
+            local failures = []
+            for index in range(6): done.push(false)
+            local Worker = func(slot):
+                return func():
+                    try:
+                        if slot < 2: bar.Destroy()
+                        elif slot < 4:
+                            for dock in docks: dock.Destroy()
+                        else:
+                            for icon in icons: icon.Destroy()
+                        bar.Destroy()
+                    catch failure: failures.push(failure)
+                    finally: done[slot] = true
+            for index in range(6): spawn(Worker(index))
+            suite.Expect(WaitAll(done), "all disposal workers completed")
+            suite.Equal(failures.length, 0, "parallel disposal produced no errors")
+            suite.Expect(bar.IsDestroyed(), "bar closes")
+            suite.Equal(bar.GetCount(), 0, "bar has no remaining icon registrations")
+            for icon in icons: suite.Expect(icon.IsDestroyed(), "each icon closes")
+            for dock in docks: suite.Expect(dock.IsDestroyed(), "each dock closes")
+        )
+)
+
+local report = suite.Report()
+print(report.Name + ": " + report.Passed + " passed, " + report.Failed + " failed")
+for failure in report.Failures:
+    print(report.Name + ": " + failure)

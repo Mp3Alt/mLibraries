@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Real local transport, two clients. Payload preparation/reporting is untimed.
+if game.ServerId != "": throw "mNet load requires a Creator playtest."
+local mNet = import("/mLibraries/mNet")
+local mPacket = import("/mLibraries/mPacket")
+local folder = world.WaitForChild("mNetLoadReports", 20)
+if folder == nil: throw "mNet load server was not found."
+local control = folder.WaitForChild("Control", 10)
+local remote = folder.WaitForChild("Data", 10)
+local limited = folder.WaitForChild("Limited", 10)
+if control == nil or remote == nil or limited == nil: throw "mNet load remotes were not found."
+local player = game.Players.LocalPlayer
+local client = mNet.NewClient({ Remote = remote, Timeout = 2, MaxPending = 16 })
+local throttle = mNet.NewClient({ Remote = limited, Timeout = 0.75, MaxPending = 16 })
+local codec = mPacket.New({ Id = 91, Fields = [
+    { Name = "Id", Type = "integer", Min = 0, Max = 65535 },
+    { Name = "Quantity", Type = "integer", Min = 0, Max = 65535 },
+    { Name = "Flags", Type = "integer", Min = 0, Max = 255 }
+] })
+local next = nil
+local ended = false
+local control_connection = control.Connect(func(action, phase, index, entry):
+    if action == "go": next = { Phase = phase, Index = index, Entry = entry }
+    elif action == "finished": ended = true
+)
+
+local RunPhase = func(current):
+    local entry = current.Entry
+    local records = []
+    for index in range(entry.Rows): records.push({ Id = index + 1, Quantity = index % 17, Flags = index % 8 })
+    local payload = nil
+    if entry.Rows > 0: payload = codec.Encode(records).Value
+    if entry.Mode == "invalid": payload[payload.length - 1] = 999
+    local errors = []
+    local latencies = []
+    local sent = 0
+    local ok = 0
+    local denied = 0
+    local invalid = 0
+    local timed_out = 0
+    local other = 0
+    local pending = 0
+    local maximum = 0
+    local started = host.time()
+    local finish = started
+    local active = current.Index <= entry.Senders
+    local Send = func(endpoint, route, value):
+        local at = host.time()
+        sent += 1
+        pending += 1
+        maximum = math.max(maximum, pending)
+        endpoint.Request(route, value, func(outcome):
+            pending -= 1
+            latencies.push((host.time() - at) * 1000)
+            if outcome.Ok:
+                local valid = false
+                if entry.Mode == "throttle": valid = outcome.Value == player.UserId
+                else: valid = outcome.Value.UserId == player.UserId and outcome.Value.Rows == entry.Rows
+                if valid: ok += 1
+                else:
+                    other += 1
+                    if errors.length < 16: errors.push("Unexpected successful response.")
+            elif outcome.Code == "Denied": denied += 1
+            elif outcome.Code == "ValidationError": invalid += 1
+            elif outcome.Status == "TimedOut": timed_out += 1
+            else:
+                other += 1
+                if errors.length < 16: errors.push(outcome.Code)
+        )
+    local successful = true
+    if active and entry.Mode == "malformed" and current.Index == 1:
+        for index in range(96):
+            remote.Fire([])
+            sent += 1
+            if index % 12 == 11: wait(0.01)
+        wait(0.5)
+    elif active:
+        local next_send = started
+        local cap = 4
+        if entry.Mode == "throttle": cap = 8
+        while (sent < entry.Requests or pending > 0) and host.time() >= started and host.time() < started + 12:
+            local now = host.time()
+            if sent < entry.Requests and pending < cap and now >= next_send:
+                if entry.Mode == "throttle": Send(throttle, "ping", nil)
+                elif entry.Mode == "denied": Send(client, "denied", payload)
+                elif entry.Mode == "invalid": Send(client, "invalid", payload)
+                else: Send(client, "echo", payload)
+                if entry.Mode != "throttle": next_send = now + 0.02
+            client.Step()
+            throttle.Step()
+            wait(0.005)
+        if sent != entry.Requests or pending != 0: successful = false
+        if entry.Mode == "denied": successful = successful and denied == sent and ok == 0 and other == 0 and timed_out == 0
+        elif entry.Mode == "invalid": successful = successful and invalid == sent and ok == 0 and other == 0 and timed_out == 0
+        elif entry.Mode == "throttle": successful = successful and ok > 0 and ok <= 4 and timed_out == sent - ok and other == 0
+        else: successful = successful and ok == sent and other == 0 and timed_out == 0
+    finish = host.time()
+    local status = "complete"
+    if not successful: status = "failed"
+    return {
+        Name = entry.Name,
+        Phase = current.Phase,
+        Player = player.UserId,
+        Status = status,
+        Sent = sent,
+        Ok = ok,
+        Denied = denied,
+        Invalid = invalid,
+        TimedOut = timed_out,
+        Other = other,
+        PendingMaximum = maximum,
+        Start = started,
+        ElapsedMs = (finish - started) * 1000,
+        Latencies = latencies,
+        Errors = errors
+    }
+
+local started = host.time()
+local deadline = started + 150
+try:
+    control.Fire("ready", 0, "")
+    while not ended and host.time() >= started and host.time() < deadline:
+        local current = next
+        if current != nil:
+            next = nil
+            local report = RunPhase(current)
+            control.Fire("done", current.Phase, game.HttpSystem.JsonEncode(report))
+        else:
+            client.Step()
+            throttle.Step()
+            wait(0.01)
+finally:
+    control_connection.Disconnect()
+    client.Destroy()
+    throttle.Destroy()

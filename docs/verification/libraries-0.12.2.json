@@ -1,0 +1,264 @@
+{
+  "version": "0.12.2-dev",
+  "date": "2026-11-12",
+  "creator": "2026.43.7",
+  "docs_bundle": "2026.43.7+876eaeb2",
+  "libraries": 18,
+  "contracts": {
+    "Passed": 397,
+    "Failed": 0,
+    "Suites": [
+      {
+        "Name": "mSignal",
+        "Passed": 18,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mCleanup",
+        "Passed": 12,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mAsync",
+        "Passed": 22,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mCommand",
+        "Passed": 42,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mPacket",
+        "Passed": 41,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mNet",
+        "Passed": 40,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mState",
+        "Passed": 36,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mPlayer",
+        "Passed": 19,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mData",
+        "Passed": 29,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mSpring",
+        "Passed": 18,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mBind",
+        "Passed": 13,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mReactive",
+        "Passed": 26,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mControls",
+        "Passed": 4,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mWidgets",
+        "Passed": 2,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mStore",
+        "Passed": 25,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mBan",
+        "Passed": 25,
+        "Failed": 0,
+        "Failures": []
+      },
+      {
+        "Name": "mMessaging",
+        "Passed": 25,
+        "Failed": 0,
+        "Failures": []
+      }
+    ]
+  },
+  "load_smoke": {
+    "cases": 27,
+    "passed": 27,
+    "failed": 0,
+    "method": "One synchronous iteration per library workload in an atomic editor call; no native I/O."
+  },
+  "native_remote": {
+    "scope": "one Creator server, two real local clients; paced load, not maximum throughput",
+    "duration_seconds": 21.20300006866455,
+    "phase_receipts": 34,
+    "counters": [
+      {
+        "UserId": -1,
+        "Runs": 776,
+        "Throttle": 4
+      },
+      {
+        "UserId": -2,
+        "Runs": 400,
+        "Throttle": 4
+      }
+    ],
+    "ordinary_handlers": 1176,
+    "denied": 32,
+    "invalid_decodes": 32,
+    "denied_validation": 0,
+    "denied_handlers": 0,
+    "throttle_handlers": 8,
+    "failures": [],
+    "steady_requests": 1152,
+    "malformed_submissions": 96,
+    "fixture_sources": [
+      "tests/mNetLoadServer.trs",
+      "tests/mNetLoadClient.trs"
+    ],
+    "source_context": "Previous local two-client native run; production modules and these fixture bodies are unchanged in this checkout."
+  },
+  "hosted_cross_server": "Not verified.",
+  "sources": [
+    {
+      "name": "mSignal",
+      "source": "packages/mSignal/src/mSignal.trs",
+      "sha256": "3dd3018a181af06a9ff89218d08bd9391a0eadf7c65be58ce605dadfa718c00c",
+      "bytes": 3927
+    },
+    {
+      "name": "mCleanup",
+      "source": "packages/mCleanup/src/mCleanup.trs",
+      "sha256": "ee2482b5de4e3bafb34e3099c1104dc7484b72083dccd234117f4bf18ace123e",
+      "bytes": 2609
+    },
+    {
+      "name": "mAsync",
+      "source": "packages/mAsync/src/mAsync.trs",
+      "sha256": "0817280c4d37f235f83b2b48c0506db74e8aae0f26c0d58696a7a08202d62fd4",
+      "bytes": 5947
+    },
+    {
+      "name": "mCommand",
+      "source": "packages/mCommand/src/mCommand.trs",
+      "sha256": "e04dfbd6ea7ef4effc26e73332a11d8870ed766a7a4268d3fcdbce8b1dfc4304",
+      "bytes": 12766
+    },
+    {
+      "name": "mPacket",
+      "source": "packages/mPacket/src/mPacket.trs",
+      "sha256": "49994d8938992244394e1e7fa271db9cf83e6cf652c43f41efa8376648db2d34",
+      "bytes": 8834
+    },
+    {
+      "name": "mTopbar",
+      "source": "packages/mTopbar/src/mTopbar.trs",
+      "sha256": "45d47467d6e43a0c98a12125c0b8dc996d7d07ce7921f2f8e0acc88b435d8cde",
+      "bytes": 40319
+    },
+    {
+      "name": "mNet",
+      "source": "packages/mNet/src/mNet.trs",
+      "sha256": "8f2e87c5bd0124e88806f4d27036f0d054315f8d6d030a61c3bddec5aea13196",
+      "bytes": 21591
+    },
+    {
+      "name": "mState",
+      "source": "packages/mState/src/mState.trs",
+      "sha256": "5ab3571a61b9533e1f9a414c6d57c25c41c0b2bf63da8230dad54690e6146e27",
+      "bytes": 8542
+    },
+    {
+      "name": "mPlayer",
+      "source": "packages/mPlayer/src/mPlayer.trs",
+      "sha256": "2c5b914c710ad4ccccc50098dde40211895328b7c464007947b426e2a3fb1ec0",
+      "bytes": 13653
+    },
+    {
+      "name": "mData",
+      "source": "packages/mData/src/mData.trs",
+      "sha256": "9eed9d3a48d6128d8880386bfd5e621a8ccb0875e6ab0052c313ef1bd853565e",
+      "bytes": 19542
+    },
+    {
+      "name": "mSpring",
+      "source": "packages/mSpring/src/mSpring.trs",
+      "sha256": "176f6bb50381146cd6e684221d6ef95488307f6a9e4f29155a632fe0c6fe8af6",
+      "bytes": 8220
+    },
+    {
+      "name": "mBind",
+      "source": "packages/mBind/src/mBind.trs",
+      "sha256": "31ef2520c1540e0b724cc0735f75cc9e5272a62bd6216723a201941de9983fdb",
+      "bytes": 24928
+    },
+    {
+      "name": "mReactive",
+      "source": "packages/mReactive/src/mReactive.trs",
+      "sha256": "7c3fecbb7143b7b22c28041d47b2c82b3ac7f315740d62accdd9d45451c5c250",
+      "bytes": 22912
+    },
+    {
+      "name": "mControls",
+      "source": "packages/mControls/src/mControls.trs",
+      "sha256": "c3df72cc619334c117d3dd7389f0dd823393b6d3cf0f6fd535c4718bc2be6a62",
+      "bytes": 40932
+    },
+    {
+      "name": "mWidgets",
+      "source": "packages/mWidgets/src/mWidgets.trs",
+      "sha256": "05b50cb582e8daea3fb55efc5262d2e4db4330d48bb4057ee8195a586bb6b949",
+      "bytes": 7295
+    },
+    {
+      "name": "mStore",
+      "source": "packages/mStore/src/mStore.trs",
+      "sha256": "5465cdb85266ef3b200a84e1ab589a7ed5d0226bc66a3d944028c720fbc3b345",
+      "bytes": 9560
+    },
+    {
+      "name": "mBan",
+      "source": "packages/mBan/src/mBan.trs",
+      "sha256": "c042ce585ece17793129be5f562b7b00a940ebd241dcb22c8332f2cb3569788a",
+      "bytes": 5464
+    },
+    {
+      "name": "mMessaging",
+      "source": "packages/mMessaging/src/mMessaging.trs",
+      "sha256": "fb2b79f95ab12ec8bb1a5eaa33dd4a09ffd851cfd338cd3608f6a37e94572796",
+      "bytes": 11213
+    }
+  ],
+  "source_line_endings": "LF, matching Git attributes; production bodies are unchanged."
+}

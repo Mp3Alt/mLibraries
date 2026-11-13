@@ -1,0 +1,560 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# local ui = import("/mLibraries/mReactive").Scope({ AutoStep = false })
+# local count = ui.Value(0)
+# local label = ui.Computed([count], expr(values): "Count: " + values[0])
+# ui.New("UITextPanel", { Text = import("/mLibraries/mReactive").Bind(label) })
+# ui.Destroy()
+
+local mBind = import("/mLibraries/mBind")
+local mState = import("/mLibraries/mState")
+local mSpring = import("/mLibraries/mSpring")
+local zero2 = new Vector2()
+local zero3 = new Vector3()
+local Scope = nil
+local MakeScope = nil
+
+local Finite = func(value):
+    try:
+        return (value < 0 or value >= 0) and not math.is_infinite(value)
+    catch invalid:
+        return false
+
+local Axes = func(value, kind):
+    try:
+        if kind == 1:
+            if Finite(value): return [value]
+        elif kind == 2:
+            zero2.Dot(value)
+            if Finite(value.X) and Finite(value.Y): return [value.X, value.Y]
+        elif kind == 3:
+            zero3.Dot(value)
+            if Finite(value.X) and Finite(value.Y) and Finite(value.Z): return [value.X, value.Y, value.Z]
+    catch invalid:
+        pass
+    throw "mReactive: motion requires a finite value of its original numeric type"
+
+local KindOf = func(value):
+    if Finite(value): return 1
+    try:
+        zero2.Dot(value)
+        return 2
+    catch invalid:
+        pass
+    try:
+        zero3.Dot(value)
+        return 3
+    catch invalid:
+        return 0
+
+local Pack = func(axes, kind):
+    if kind == 1: return axes[0]
+    if kind == 2: return new Vector2(axes[0], axes[1])
+    return new Vector3(axes[0], axes[1], axes[2])
+
+local SameAxes = func(first, second):
+    for index in range(first.length):
+        if first[index] != second[index]: return false
+    return true
+
+local Easing = func(name):
+    if name == nil or name == "Linear": return expr(t): t
+    if name == "QuadIn": return expr(t): t * t
+    if name == "QuadOut": return expr(t): 1 - (1 - t) * (1 - t)
+    if name == "QuadInOut":
+        return func(t):
+            if t < 0.5: return 2 * t * t
+            return 1 - math.pow(-2 * t + 2, 2) / 2
+    if name == "CubicOut": return expr(t): 1 - math.pow(1 - t, 3)
+    throw "mReactive: unknown tween easing"
+
+local AutoStepOption = func(options):
+    if options == nil: return true
+    try:
+        for name in table.keys(options):
+            if name != "AutoStep": throw "invalid"
+        local auto = options.AutoStep
+        if auto == nil: return true
+        if auto != true and auto != false: throw "invalid"
+        return auto
+    catch invalid:
+        throw "mReactive: expected { AutoStep = true or false }"
+
+local ValidKey = func(key):
+    if Finite(key): return true
+    try:
+        string.length(key)
+        return true
+    catch invalid:
+        return false
+
+local CopyArray = func(items):
+    local record = false
+    try:
+        table.keys(items)
+        record = true
+    catch not_record:
+        pass
+    if record: throw "mReactive: For requires an array"
+    local count = table.count(items)
+    local copy = []
+    for index in range(count): copy.push(items[index])
+    return copy
+
+MakeScope = func(options, scheduler):
+    local auto_step = AutoStepOption(options)
+    local owner = mBind.Scope()
+    if scheduler == nil:
+        scheduler = { Motions = {}, PendingLists = {}, Step = nil, StartDriver = nil, GetError = nil, GetFrameCount = nil }
+    local motions = scheduler.Motions
+    local pending_lists = scheduler.PendingLists
+    local driver = nil
+    local driver_claims = 0
+    local step_claims = 0
+    local last_error = nil
+    local cleanup_failures = []
+    local ui = {}
+
+    local RequireAlive = func():
+        if owner.IsDestroyed(): throw "mReactive: scope is destroyed"
+
+    local OwnState = func(value):
+        local destroy = value.Destroy
+        local dispose = value.RequestDestroy
+        local registration = nil
+        try:
+            registration = owner.Add(func():
+                for failure in dispose(): cleanup_failures.push(failure)
+            )
+        catch failure:
+            dispose()
+            throw failure
+        value.Destroy = func():
+            local failures = destroy()
+            registration.Destroy()
+            return failures
+        value.RequestDestroy = func():
+            local failures = dispose()
+            registration.Destroy()
+            return failures
+        return value
+
+    local Step = func(delta):
+        RequireAlive()
+        if not Finite(delta) or delta < 0 or delta > 60:
+            throw "mReactive: Step requires finite seconds from 0 through 60"
+        local ticket = step_claims++
+        if ticket != 0: throw "mReactive: Step is busy"
+        local failures = []
+        try:
+            if table.count(motions) == 0 and table.count(pending_lists) == 0:
+                last_error = nil
+                return failures
+            for list in table.values(pending_lists):
+                table.remove(pending_lists, list)
+                if owner.IsDestroyed(): break
+                if not list.Live: continue
+                try: list.Refresh()
+                catch failure: failures.push(failure)
+            if table.count(motions) > 0:
+                local batch = table.values(motions)
+                local errors = mState.Batch(func():
+                    for entry in batch:
+                        if owner.IsDestroyed(): break
+                        if not entry.Live: continue
+                        try:
+                            entry.Advance(delta)
+                            entry.Error = nil
+                        catch failure:
+                            if entry.Live:
+                                entry.Error = failure
+                                failures.push(failure)
+                )
+                for failure in errors: failures.push(failure)
+            last_error = nil
+            if failures.length > 0: last_error = failures[0]
+        finally:
+            step_claims = 0
+        return failures
+
+    local StartDriver = func():
+        if not auto_step or driver != nil: return
+        local ticket = driver_claims++
+        if ticket != 0: return
+        local connection = nil
+        try:
+            RequireAlive()
+            connection = game.TimeSystem.FrameStepped.Connect(func(delta):
+                if owner.IsDestroyed() or step_claims != 0: return
+                if table.count(motions) == 0 and table.count(pending_lists) == 0: return
+                try:
+                    Step(math.min(delta, 60))
+                catch failure:
+                    if not owner.IsDestroyed(): last_error = failure
+            )
+            driver = owner.Add(func():
+                connection.Disconnect()
+                driver = nil
+            )
+        catch failure:
+            if connection != nil: connection.Disconnect()
+            throw failure
+        finally:
+            driver_claims = 0
+
+    if scheduler.Step == nil:
+        scheduler.Step = Step
+        scheduler.StartDriver = StartDriver
+        scheduler.GetError = expr(): last_error
+        scheduler.GetFrameCount = func():
+            if owner.IsDestroyed() or driver == nil: return 0
+            return 1
+    else:
+        Step = scheduler.Step
+        StartDriver = scheduler.StartDriver
+
+    local Motion = func(source, spring_options, duration, easing):
+        RequireAlive()
+        local initial = source.Get()
+        local kind = KindOf(initial)
+        local current = Axes(initial, kind)
+        local spring = nil
+        local ease = nil
+        if duration == nil:
+            spring = mSpring.New(Pack(current, kind), spring_options)
+        else:
+            if not Finite(duration) or duration < 0 or duration > 60:
+                throw "mReactive: tween duration must be finite seconds from 0 through 60"
+            ease = Easing(easing)
+        local position = mState.New(Pack(current, kind))
+        local dispose_position = position.RequestDestroy
+        local dispose_output = nil
+        local output = nil
+        local watch = nil
+        local registration = nil
+        local entry = { Live = true, Error = nil }
+        local target = { Axes = current }
+        local applied = target
+        local from = current
+        local elapsed = duration
+        local complete = true
+        local paused = false
+        local DestroyMotion = func():
+            entry.Live = false
+            table.remove(motions, entry)
+            try:
+                if watch != nil: watch.Destroy()
+            finally:
+                if dispose_output != nil:
+                    for failure in dispose_output(): cleanup_failures.push(failure)
+                for failure in dispose_position(): cleanup_failures.push(failure)
+        try:
+            output = mState.Derived([position], expr(values): values[0])
+            dispose_output = output.RequestDestroy
+            registration = owner.Add(DestroyMotion)
+            watch = owner.Watch(source, func(value):
+                local axes = Axes(value, kind)
+                if not SameAxes(axes, target.Axes): target = { Axes = axes }
+            )
+            entry.Advance = func(delta):
+                if paused: return
+                local next_target = target
+                if next_target != applied:
+                    if spring != nil:
+                        spring.SetTarget(Pack(next_target.Axes, kind))
+                    else:
+                        from = current
+                        elapsed = 0
+                    complete = false
+                    applied = next_target
+                local next_value = current
+                if spring != nil:
+                    if complete: return
+                    next_value = Axes(spring.Step(delta), kind)
+                    complete = delta > 0 and spring.IsResting()
+                else:
+                    if complete: return
+                    elapsed = math.min(duration, elapsed + delta)
+                    local alpha = 1
+                    if duration > 0: alpha = ease(elapsed / duration)
+                    next_value = []
+                    for index in range(kind):
+                        local value = applied.Axes[index]
+                        if elapsed < duration: value = from[index] * (1 - alpha) + value * alpha
+                        next_value.push(value)
+                    next_value = Axes(Pack(next_value, kind), kind)
+                    complete = elapsed >= duration
+                if not entry.Live or owner.IsDestroyed(): return
+                if not SameAxes(current, next_value):
+                    current = next_value
+                    position.Set(Pack(current, kind))
+            local destroy_output = output.Destroy
+            output.Destroy = func():
+                local failures = destroy_output()
+                registration.Destroy()
+                return failures
+            output.RequestDestroy = func():
+                local failures = dispose_output()
+                registration.Destroy()
+                return failures
+            output.GetError = func():
+                if entry.Error != nil: return entry.Error
+                return watch.GetError()
+            output.IsResting = func():
+                RequireAlive()
+                if not entry.Live: throw "mReactive: motion is destroyed"
+                if applied != target: return false
+                if spring != nil: return spring.IsResting()
+                return complete
+            output.SetPaused = func(value):
+                RequireAlive()
+                if not entry.Live: throw "mReactive: motion is destroyed"
+                if value != true and value != false: throw "mReactive: pause requires a boolean"
+                paused = value
+            output.IsPaused = func():
+                RequireAlive()
+                if not entry.Live: throw "mReactive: motion is destroyed"
+                return paused
+            motions[entry] = entry
+            if not entry.Live or owner.IsDestroyed(): throw "mReactive: scope was destroyed during motion construction"
+            StartDriver()
+            if not entry.Live or owner.IsDestroyed(): throw "mReactive: scope was destroyed during motion construction"
+            return output
+        catch failure:
+            try:
+                if registration != nil: registration.Destroy()
+            finally:
+                DestroyMotion()
+            throw failure
+
+    local For = func(parent, source, key, render):
+        RequireAlive()
+        if parent == nil or key == nil or render == nil:
+            throw "mReactive: For requires a parent, key callback and renderer"
+        local view = { Rows = [], ByKey = {} }
+        local owned_rows = {}
+        local disposed = false
+        local claims = 0
+        local watch = nil
+        local registration = nil
+        local error = nil
+        local list = {}
+        local ready = false
+        local generation = 0
+        local queued = { Live = true, Refresh = nil }
+        local DestroyRow = func(row):
+            table.remove(owned_rows, row)
+            local scope = row.Scope
+            local root = row.Root
+            local failures = scope.Destroy()
+            if root != nil:
+                try: root.Destroy()
+                catch failure: failures.push(failure)
+            return failures
+        local DestroyList = func():
+            disposed = true
+            queued.Live = false
+            table.remove(pending_lists, queued)
+            view = { Rows = [], ByKey = {} }
+            try:
+                if watch != nil: watch.Destroy()
+            finally:
+                for row in table.values(owned_rows):
+                    for failure in DestroyRow(row): cleanup_failures.push(failure)
+
+        local Apply = func(items):
+            if disposed: return
+            local ticket = claims++
+            if ticket != 0: throw "mReactive: For is busy"
+            local created = []
+            local committed = false
+            try:
+                local snapshot = CopyArray(items)
+                local previous_view = view
+                local planned = []
+                local seen = {}
+                local seen_roots = {}
+                local retained_roots = {}
+                for row in previous_view.Rows: retained_roots[row.Root] = true
+                local next_map = {}
+                for index in range(snapshot.length):
+                    local item = snapshot[index]
+                    local identity = key(item, index)
+                    if not ValidKey(identity): throw "mReactive: For keys must be strings or finite numbers"
+                    if seen[identity] != nil: throw "mReactive: For keys must be unique"
+                    seen[identity] = true
+                    planned.push({ Key = identity, Item = item, Index = index, Row = previous_view.ByKey[identity] })
+                for plan in planned:
+                    if disposed or owner.IsDestroyed(): throw "mReactive: For was destroyed during reconciliation"
+                    local row = plan.Row
+                    if row == nil:
+                        local scope = MakeScope({ AutoStep = auto_step }, scheduler)
+                        row = { Key = plan.Key, Scope = scope, Item = nil, Index = nil, Root = nil }
+                        created.push(row)
+                        owned_rows[row] = row
+                        if disposed or owner.IsDestroyed(): throw "mReactive: For was destroyed during reconciliation"
+                        row.Item = scope.Value(plan.Item)
+                        row.Index = scope.Value(plan.Index)
+                        local root = render(scope, row.Item, row.Index, plan.Key)
+                        if root == nil: throw "mReactive: For renderer must return a native root"
+                        if retained_roots[root] != nil or seen_roots[root] != nil:
+                            throw "mReactive: For rows must have distinct roots"
+                        if root.Parent != nil: throw "mReactive: For renderer must return an unparented root"
+                        row.Root = root
+                        scope.Own(row.Root)
+                    elif row.Root.Parent != parent:
+                        throw "mReactive: For root was reparented outside its list"
+                    if seen_roots[row.Root] != nil: throw "mReactive: For rows must have distinct roots"
+                    seen_roots[row.Root] = true
+                    plan.Row = row
+                    next_map[plan.Key] = row
+                if disposed or owner.IsDestroyed(): throw "mReactive: For was destroyed during reconciliation"
+                # Construction is staged before any retained row or its state changes.
+                try:
+                    local previous = nil
+                    for plan in planned:
+                        if disposed or owner.IsDestroyed(): throw "mReactive: For was destroyed during reconciliation"
+                        local root = plan.Row.Root
+                        if root.Parent == nil: root.Parent = parent
+                        if previous != nil: root.MoveAfter(previous)
+                        previous = root
+                catch failure:
+                    # Restore surviving rows' order if native parenting fails mid-update.
+                    local previous = nil
+                    for row in previous_view.Rows:
+                        if row.Root.Parent == parent:
+                            if previous != nil: row.Root.MoveAfter(previous)
+                            previous = row.Root
+                    throw failure
+                local old_rows = previous_view.Rows
+                local next_rows = []
+                for plan in planned: next_rows.push(plan.Row)
+                if disposed or owner.IsDestroyed(): throw "mReactive: For was destroyed during reconciliation"
+                view = { Rows = next_rows, ByKey = next_map }
+                if disposed or owner.IsDestroyed():
+                    DestroyList()
+                    throw "mReactive: For was destroyed during reconciliation"
+                committed = true
+                local teardown_errors = []
+                for row in old_rows:
+                    if next_map[row.Key] == nil:
+                        for failure in DestroyRow(row): teardown_errors.push(failure)
+                local failures = mState.Batch(func():
+                    for plan in planned:
+                        if disposed: break
+                        plan.Row.Item.Set(plan.Item)
+                        plan.Row.Index.Set(plan.Index)
+                )
+                if teardown_errors.length > 0:
+                    for index in range(1, teardown_errors.length): cleanup_failures.push(teardown_errors[index])
+                    for failure in failures: cleanup_failures.push(failure)
+                    throw teardown_errors[0]
+                if failures.length > 0: throw failures[0]
+                error = nil
+            catch failure:
+                error = failure
+                throw failure
+            finally:
+                if not committed:
+                    for row in created:
+                        for failure in DestroyRow(row): cleanup_failures.push(failure)
+                claims = 0
+        local Refresh = func():
+            if disposed: throw "mReactive: list is destroyed"
+            table.remove(pending_lists, queued)
+            try: Apply(source.Get())
+            catch failure:
+                error = failure
+                throw failure
+        queued.Refresh = Refresh
+        try:
+            registration = owner.Add(DestroyList)
+            watch = owner.Watch(source, func(items):
+                generation++
+                if ready and not disposed:
+                    pending_lists[queued] = queued
+                    if disposed or owner.IsDestroyed(): table.remove(pending_lists, queued)
+            )
+            local initial_generation = generation
+            Refresh()
+            ready = true
+            if generation != initial_generation: pending_lists[queued] = queued
+            if disposed or owner.IsDestroyed(): throw "mReactive: scope was destroyed during list construction"
+            StartDriver()
+            if disposed or owner.IsDestroyed(): throw "mReactive: scope was destroyed during list construction"
+        catch failure:
+            try:
+                if registration != nil: registration.Destroy()
+            finally:
+                DestroyList()
+            throw failure
+        list.Destroy = expr(): registration.Destroy()
+        list.Disconnect = list.Destroy
+        list.IsDestroyed = expr(): disposed
+        list.GetCount = func():
+            if disposed: return 0
+            return view.Rows.length
+        list.GetRoot = func(identity):
+            if disposed: return nil
+            local row = view.ByKey[identity]
+            if row != nil: return row.Root
+            return nil
+        list.GetError = expr(): error
+        list.Refresh = Refresh
+        return list
+
+    ui.New = owner.New
+    ui.Bind = owner.Bind
+    ui.Watch = owner.Watch
+    ui.On = owner.On
+    ui.Add = owner.Add
+    ui.Own = owner.Own
+    ui.IsDestroyed = owner.IsDestroyed
+    ui.Destroy = func():
+        local failures = owner.Destroy()
+        local nested = cleanup_failures
+        cleanup_failures = []
+        for failure in nested: failures.push(failure)
+        return failures
+    ui.GetCount = owner.GetCount
+    ui.Value = func(initial):
+        RequireAlive()
+        return OwnState(mState.New(initial))
+    ui.Computed = func(dependencies, compute):
+        RequireAlive()
+        return OwnState(mState.Derived(dependencies, compute))
+    ui.Observe = owner.Watch
+    ui.For = For
+    ui.Spring = expr(source, options): Motion(source, options, nil, nil)
+    ui.Tween = func(source, duration, easing):
+        if duration == nil: throw "mReactive: tween duration is required"
+        return Motion(source, nil, duration, easing)
+    ui.Step = func(delta):
+        RequireAlive()
+        return Step(delta)
+    ui.GetError = scheduler.GetError
+    ui.GetMotionCount = expr(): table.count(motions)
+    ui.GetPendingListCount = expr(): table.count(pending_lists)
+    ui.GetFrameConnectionCount = scheduler.GetFrameCount
+    ui.Child = func():
+        RequireAlive()
+        local child = MakeScope({ AutoStep = auto_step }, scheduler)
+        local destroy = child.Destroy
+        local registration = nil
+        try:
+            registration = owner.Add(func():
+                for failure in destroy(): cleanup_failures.push(failure)
+            )
+        catch failure:
+            destroy()
+            throw failure
+        child.Destroy = func():
+            local failures = destroy()
+            registration.Destroy()
+            return failures
+        return child
+    return ui
+
+Scope = expr(options): MakeScope(options, nil)
+
+return { Scope = Scope, Bind = mBind.Value, Batch = mState.Batch }

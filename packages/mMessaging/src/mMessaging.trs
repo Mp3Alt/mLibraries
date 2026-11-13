@@ -1,0 +1,225 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Bounded server messages over a polled data-store topic. Call Step explicitly.
+# local bus = import("/mLibraries/mMessaging").New({ Topic = "admin" }, nil)
+# bus.Subscribe(expr(message): print(message.Data.Kind))
+# bus.Step() # Establish the cursor before publishing or expecting new messages.
+
+local mStore = import("/mLibraries/mStore")
+local mSignal = import("/mLibraries/mSignal")
+local MAX_SEQUENCE = 1000000000000000
+local Ok = expr(value): { Ok = true, Value = value }
+local Fail = expr(code, message): { Ok = false, Code = code, Message = message }
+local Finite = func(value):
+    try: return (value >= 0 or value < 0) and not math.is_infinite(value)
+    catch invalid: return false
+local Whole = func(value, minimum, maximum):
+    if not Finite(value) or value < minimum or value > maximum: return false
+    local integer = math.floor(value)
+    return not (value < integer or value > integer)
+local TextLength = func(value):
+    try: return string.length(value)
+    catch invalid: return -1
+local Record = func(value):
+    try:
+        table.keys(value)
+        return true
+    catch invalid: return false
+local ArrayLength = func(value, maximum):
+    try:
+        if Record(value) or table.count(value) > maximum: return -1
+        local length = value.length
+        if Whole(length, 0, maximum): return length
+    catch invalid: pass
+    return -1
+local Fields = func(value, allowed, maximum):
+    if not Record(value) or table.count(value) > maximum: return false
+    for key in table.keys(value):
+        if allowed[key] != true: return false
+    return true
+local CopyValue = func(value, depth, budget, ancestors):
+    budget.Nodes += 1
+    if budget.Nodes > 128 or depth > 4: throw "mMessaging: message exceeds its structural limit."
+    if value == nil or value == true or value == false or Finite(value): return value
+    local size = TextLength(value)
+    if size >= 0:
+        budget.Text += size
+        if budget.Text > 2048: throw "mMessaging: message exceeds its text limit."
+        return value
+    if ancestors.contains(value): throw "mMessaging: cyclic message."
+    local record = Record(value)
+    local count = table.count(value)
+    if count > 128: throw "mMessaging: message exceeds its structural limit."
+    ancestors.push(value)
+    local copy = nil
+    if record:
+        copy = {}
+        for key in table.keys(value):
+            local length = TextLength(key)
+            if length < 1 or length > 64: throw "mMessaging: message keys must be short strings."
+            budget.Text += length
+            if budget.Text > 2048: throw "mMessaging: message exceeds its text limit."
+            copy[key] = CopyValue(value[key], depth + 1, budget, ancestors)
+    else:
+        local length = ArrayLength(value, 128)
+        if length < 0: throw "mMessaging: invalid message value."
+        copy = []
+        for index in range(length): copy.push(CopyValue(value[index], depth + 1, budget, ancestors))
+    ancestors.pop()
+    return copy
+local PayloadInfo = func(value):
+    if not Record(value): throw "mMessaging: message data must be a record."
+    local budget = { Nodes = 0, Text = 0 }
+    local data = CopyValue(value, 0, budget, [])
+    return { Data = data, Nodes = budget.Nodes, Text = budget.Text }
+local Payload = expr(value): PayloadInfo(value).Data
+local MessageCopy = expr(message): { Sequence = message.Sequence, SentAt = message.SentAt, Data = Payload(message.Data) }
+local Validate = func(value):
+    try:
+        if not Record(value) or table.count(value) != 2: return false
+        if not Whole(value.Sequence, 0, MAX_SEQUENCE): return false
+        if ArrayLength(value.Messages, 64) < 0: return false
+        local previous = 0
+        for message in value.Messages:
+            if not Record(message) or table.count(message) != 3: return false
+            if not Whole(message.Sequence, 1, value.Sequence) or message.Sequence <= previous: return false
+            if not Finite(message.SentAt) or message.SentAt < 0 or message.SentAt > 1e15: return false
+            Payload(message.Data)
+            previous = message.Sequence
+        if value.Messages.length > 0 and previous != value.Sequence: return false
+        return true
+    catch invalid: return false
+local Option = func(value, fallback, minimum, maximum, whole):
+    if value == nil: return fallback
+    if not Finite(value) or value < minimum or value > maximum: throw "mMessaging: invalid configuration."
+    if whole and not Whole(value, minimum, maximum): throw "mMessaging: invalid configuration."
+    return value
+
+local New = func(config, runtime):
+    if not Fields(config, { Name = true, Topic = true, PollSeconds = true, Capacity = true, MaxAge = true }, 5): throw "mMessaging: invalid configuration."
+    local topic = config.Topic
+    local topic_length = TextLength(topic)
+    if topic_length < 1 or topic_length > 32 or not string.match(topic, "^[A-Za-z][A-Za-z0-9_-]*$"): throw "mMessaging: invalid topic."
+    local name = config.Name
+    if name == nil: name = "mMessaging1"
+    local interval = Option(config.PollSeconds, 10, 5, 300, false)
+    local capacity = Option(config.Capacity, 32, 1, 64, true)
+    local max_age = Option(config.MaxAge, 120, 10, 3600, false)
+    local clock = expr(): host.time()
+    local store_runtime = nil
+    if runtime != nil:
+        if not Fields(runtime, { Store = true, Clock = true }, 2): throw "mMessaging: invalid runtime adapter."
+        if runtime.Clock != nil: clock = runtime.Clock
+        if runtime.Store != nil: store_runtime = { Store = runtime.Store }
+    local store = mStore.New({ Name = name, Key = "topic:" + topic, Defaults = { Sequence = 0, Messages = [] }, Validate = Validate }, store_runtime)
+    local signal = mSignal.New()
+    local destroyed = false
+    local cursor = nil
+    local next_poll = nil
+    local last_clock = nil
+    local stepping = 0
+    local publishing = 0
+    local Clock = func():
+        local now = clock()
+        if not Finite(now) or now < 0 or now > 1e15 - 3600: throw "mMessaging: invalid wall clock."
+        if last_clock != nil and now < last_clock: throw "mMessaging: wall clock moved backwards."
+        last_clock = now
+        return now
+    local Publish = func(value):
+        if destroyed: return Fail("Closed", "The message channel is closed.")
+        local claim = publishing++
+        if claim != 0: return Fail("Busy", "A publication is already running.")
+        try:
+            local payload = nil
+            try: payload = PayloadInfo(value)
+            catch invalid: return Fail("InvalidPayload", "Use a bounded plain-data message record.")
+            local sent = nil
+            try: sent = Clock()
+            catch invalid: return Fail("ClockError", "The message clock is unavailable.")
+            if destroyed: return Fail("Closed", "The message channel is closed.")
+            local result = store.Update(func(draft, revision):
+                if destroyed: return Fail("Closed", "The message channel is closed.")
+                if draft.Sequence >= MAX_SEQUENCE: return Fail("SequenceLimit", "The topic sequence is exhausted.")
+                local tail = []
+                local nodes = payload.Nodes + 6
+                local text = payload.Text + 34
+                for index in range(draft.Messages.length - 1, -1, -1):
+                    if tail.length + 1 >= capacity: break
+                    local message = draft.Messages[index]
+                    if message.SentAt < sent - max_age: continue
+                    local size = PayloadInfo(message.Data)
+                    if nodes + size.Nodes + 3 > 4096 or text + size.Text + 18 > 65536: break
+                    tail.push(message)
+                    nodes += size.Nodes + 3
+                    text += size.Text + 18
+                local retained = []
+                for index in range(tail.length - 1, -1, -1): retained.push(tail[index])
+                draft.Sequence += 1
+                retained.push({ Sequence = draft.Sequence, SentAt = sent, Data = payload.Data })
+                draft.Messages = retained
+                return Ok(draft)
+            )
+            if not result.Ok: return result
+            local messages = result.Value.Messages
+            return Ok(MessageCopy(messages[messages.length - 1]))
+        finally: publishing = 0
+    local Step = func():
+        if destroyed: return Fail("Closed", "The message channel is closed.")
+        local claim = stepping++
+        if claim != 0: return Fail("Busy", "A message poll is already running.")
+        try:
+            local now = nil
+            try: now = Clock()
+            catch invalid: return Fail("ClockError", "The message clock is unavailable.")
+            if destroyed: return Fail("Closed", "The message channel is closed.")
+            local report = { Initialized = false, Noop = false, Stale = false, Delivered = 0, Missed = 0, Expired = 0, ListenerErrors = 0, Stopped = false, Sequence = cursor }
+            if next_poll != nil and now < next_poll:
+                report.Noop = true
+                return Ok(report)
+            next_poll = now + interval
+            local result = store.Read(false)
+            if destroyed: return Fail("Closed", "The message channel is closed.")
+            if not result.Ok: return result
+            local data = result.Value
+            if cursor == nil:
+                cursor = data.Sequence
+                report.Initialized = true
+                report.Sequence = cursor
+                return Ok(report)
+            if data.Sequence < cursor:
+                report.Stale = true
+                report.Sequence = cursor
+                return Ok(report)
+            local expected = cursor + 1
+            for message in data.Messages:
+                if destroyed: break
+                if message.Sequence < expected: continue
+                report.Missed += message.Sequence - expected
+                expected = message.Sequence + 1
+                cursor = message.Sequence
+                if message.SentAt < now - max_age:
+                    report.Expired += 1
+                    continue
+                local failures = signal.Fire(message)
+                report.ListenerErrors += failures.length
+                report.Delivered += 1
+            if not destroyed:
+                if expected <= data.Sequence: report.Missed += data.Sequence - expected + 1
+                cursor = data.Sequence
+            report.Stopped = destroyed
+            report.Sequence = cursor
+            return Ok(report)
+        finally: stepping = 0
+    local Subscribe = func(handler):
+        if destroyed: throw "mMessaging: cannot subscribe to a closed channel."
+        if handler == nil: throw "mMessaging: a message handler is required."
+        if signal.GetListenerCount() >= 64: throw "mMessaging: subscriber capacity reached."
+        return signal.Connect(func(message): handler(MessageCopy(message)))
+    local Destroy = func():
+        if destroyed: return
+        destroyed = true
+        signal.Destroy()
+        store.Destroy()
+    return { Publish = Publish, Subscribe = Subscribe, Step = Step, Destroy = Destroy, IsDestroyed = expr(): destroyed }
+
+return { New = New }

@@ -1,0 +1,232 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mBind = import("/mLibraries/mBind")
+local mState = import("/mLibraries/mState")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local Run = func():
+    local suite = mTestKit.New("mBind")
+    suite.Test("independent children release parent registration", func():
+        local scope = mBind.Scope()
+        for index in range(0, 100): scope.Child().Destroy()
+        suite.Equal(scope.GetCount(), 0, "retired children do not accumulate")
+        scope.Destroy()
+    )
+    suite.Test("removable cleanup is idempotent", func():
+        local scope = mBind.Scope()
+        local calls = 0
+        local task = scope.Add(func(): calls += 1)
+        task.Disconnect()
+        task.Destroy()
+        suite.Equal(calls, 1, "single cleanup")
+        suite.Equal(scope.GetCount(), 0, "registration released")
+        scope.Destroy()
+    )
+    suite.Test("destroy closes before reverse cleanup and collects nested failures", func():
+        local scope = mBind.Scope()
+        local order = ""
+        scope.Add(func(): order += "A")
+        local child = scope.Child()
+        child.Add(func(): throw "nested failure")
+        scope.Add(func():
+            suite.Expect(scope.IsDestroyed(), "closed before callback")
+            order += "B"
+            scope.Destroy()
+        )
+        local failures = scope.Destroy()
+        suite.Equal(order, "BA", "reverse cleanup")
+        suite.Equal(failures.length, 1, "nested failure retained")
+        suite.Equal(scope.Destroy().length, 0, "repeat destroy is empty")
+        suite.Throws(expr(): scope.Add(expr(): nil), "closed scope rejects registration")
+    )
+    suite.Test("watch applies initial false zero and nil", func():
+        local scope = mBind.Scope()
+        local value = mState.New(false)
+        local received = []
+        local last = "unset"
+        local watch = scope.Watch(value, func(next):
+            last = next
+            received.push({ Value = next })
+        )
+        suite.Equal(last, false, "initial false")
+        value.Set(0)
+        suite.Equal(last, 0, "zero")
+        value.Set(nil)
+        suite.Equal(last, nil, "nil")
+        suite.Equal(received.length, 3, "all distinct writes")
+        watch.Destroy()
+        value.Set(4)
+        suite.Equal(received.length, 3, "detached")
+        scope.Destroy()
+        value.Destroy()
+    )
+    suite.Test("subscribe before reading avoids a lost initial update", func():
+        local scope = mBind.Scope()
+        local value = 0
+        local disconnected = 0
+        local source = {
+            Get = expr(): value,
+            Observe = func(callback):
+                value = 5
+                callback(5)
+                return { Disconnect = func(): disconnected += 1 }
+        }
+        local last = -1
+        scope.Watch(source, func(next): last = next)
+        suite.Equal(last, 5, "newest value")
+        scope.Destroy()
+        suite.Equal(disconnected, 1, "connection released")
+    )
+    suite.Test("reentrant updates settle on latest state", func():
+        local scope = mBind.Scope()
+        local value = mState.New(0)
+        local last = -1
+        scope.Watch(value, func(next):
+            last = next
+            if next == 0: value.Set(1)
+        )
+        suite.Equal(last, 1, "initial feedback drained")
+        scope.Destroy()
+        value.Destroy()
+    )
+    suite.Test("update failure can recover without losing subscription", func():
+        local scope = mBind.Scope()
+        local value = mState.New(1)
+        local last = 0
+        local watch = scope.Watch(value, func(next):
+            if next == 2: throw "bad update"
+            last = next
+        )
+        value.Set(2)
+        suite.Equal(last, 1, "last successful apply retained")
+        suite.Equal(watch.GetError(), "bad update", "failure visible")
+        value.Set(3)
+        suite.Equal(last, 3, "recovered")
+        suite.Equal(watch.GetError(), nil, "error cleared")
+        scope.Destroy()
+        value.Destroy()
+    )
+    suite.Test("initial failure releases subscription and registration", func():
+        local scope = mBind.Scope()
+        local value = mState.New(0)
+        suite.Throws(expr(): scope.Watch(value, func(next): throw "initial"), "initial apply throws")
+        suite.Equal(scope.GetCount(), 0, "failed registration removed")
+        suite.Equal(value.Set(1).length, 0, "failed observer disconnected")
+        scope.Destroy()
+        value.Destroy()
+    )
+    suite.Test("invalid source protocols are rejected without ownership leaks", func():
+        local scope = mBind.Scope()
+        suite.Throws(expr(): scope.Watch({}, expr(value): nil), "missing protocol")
+        suite.Throws(expr(): scope.Watch({ Get = expr(): 1, Observe = expr(callback): nil }, expr(value): nil), "invalid connection")
+        suite.Equal(scope.GetCount(), 0, "no leaked registrations")
+        scope.Destroy()
+    )
+    suite.Test("owner destruction during subscription disconnects the returned handle", func():
+        local scope = mBind.Scope()
+        local disconnected = 0
+        local source = {
+            Get = expr(): 1,
+            Observe = func(callback):
+                scope.Destroy()
+                return { Disconnect = func(): disconnected += 1 }
+        }
+        suite.Throws(expr(): scope.Watch(source, expr(value): nil), "closed during subscribe")
+        suite.Equal(disconnected, 1, "returned connection disconnected")
+        suite.Equal(scope.GetCount(), 0, "no retained resource")
+    )
+    suite.Test("owner destruction during first application cancels construction", func():
+        local scope = mBind.Scope()
+        local value = mState.New(1)
+        suite.Throws(expr(): scope.Watch(value, func(next): scope.Destroy()), "initial disposal throws")
+        suite.Equal(scope.GetCount(), 0, "disposed registration released")
+        suite.Equal(value.Set(2).length, 0, "no old observer")
+        value.Destroy()
+    )
+    suite.Test("closed scopes reject native construction before factory allocation", func():
+        local scope = mBind.Scope()
+        scope.Destroy()
+        suite.Throws(expr(): scope.New("UIPanel"), "destroyed")
+        suite.Throws(expr(): scope.Child(), "child rejected")
+    )
+    suite.Test("class property and event catalogues return independent arrays", func():
+        local classes = mBind.GetClasses()
+        suite.Expect(classes.contains("UIGridLayout"), "grid factory")
+        classes.push("Fake")
+        suite.Expect(not mBind.GetClasses().contains("Fake"), "catalogue copied")
+        suite.Expect(mBind.GetProperties().contains("Text"), "text property")
+        suite.Expect(mBind.GetEvents().contains("TextChanged"), "input event")
+    )
+    return suite.Report()
+
+local RunNative = func():
+    local suite = mTestKit.New("mBind native")
+    suite.Test("native construction binds before Parent and keeps false values", func():
+        local scope = mBind.Scope()
+        local text = mState.New("ready")
+        local visible = mState.New(false)
+        local panel = scope.New("UITextPanel", { Text = mBind.Value(text), Visible = mBind.Value(visible) })
+        suite.Equal(panel.Text, "ready", "initial text")
+        suite.Equal(panel.Visible, false, "initial false")
+        text.Set("changed")
+        suite.Equal(panel.Text, "changed", "updated")
+        scope.Destroy()
+        suite.Equal(text.Set("detached").length, 0, "destroyed target disconnected")
+        text.Destroy()
+        visible.Destroy()
+    )
+    suite.Test("one property writer is enforced and released", func():
+        local scope = mBind.Scope()
+        local value = mState.New("first")
+        local panel = scope.New("UITextPanel")
+        local binding = scope.Bind(panel, "Text", value)
+        suite.Throws(expr(): scope.Bind(panel, "Text", value), "duplicate writer")
+        binding.Destroy()
+        local replacement = scope.Bind(panel, "Text", value)
+        value.Set("second")
+        suite.Equal(panel.Text, "second", "replacement writer")
+        replacement.Destroy()
+        scope.Destroy()
+        value.Destroy()
+    )
+    suite.Test("failed native binding releases its writer claim", func():
+        local scope = mBind.Scope()
+        local value = mState.New(1)
+        local panel = scope.New("UITextPanel")
+        suite.Throws(expr(): scope.Bind(panel, "Text", value, func(next): throw "map"), "initial mapping rejected")
+        scope.Bind(panel, "Text", value, expr(next): "Value " + next)
+        suite.Equal(panel.Text, "Value 1", "writer claim released")
+        scope.Destroy()
+        value.Destroy()
+    )
+    suite.Test("failed construction restores borrowed children and owner count", func():
+        local scope = mBind.Scope()
+        local previous = scope.New("UIPanel")
+        local child = scope.New("UIPanel", { Parent = previous })
+        local before = scope.GetCount()
+        suite.Throws(expr(): scope.New("UIPanel", { Children = [child], Parent = child }), "parent cycle rejected")
+        suite.Equal(child.Parent, previous, "borrowed child restored")
+        suite.Equal(scope.GetCount(), before, "failed child scope removed")
+        suite.Throws(expr(): scope.New("UIPanel", { Text = "wrong class" }), "incompatible property")
+        suite.Throws(expr(): scope.New("UIPanel", { Events = { Pressed = expr(): nil } }), "incompatible event")
+        suite.Equal(scope.GetCount(), before, "invalid config removed")
+        scope.Destroy()
+    )
+    suite.Test("disposing from a mapping callback prevents a stale property write", func():
+        local scope = mBind.Scope()
+        local value = mState.New(1)
+        local panel = scope.New("UITextPanel")
+        local binding = nil
+        binding = scope.Bind(panel, "Text", value, func(next):
+            if next == 2: binding.Destroy()
+            return tostring(next)
+        )
+        value.Set(2)
+        suite.Equal(panel.Text, "1", "disposed update did not write")
+        scope.Destroy()
+        value.Destroy()
+    )
+    return suite.Report()
+
+return { Run = Run, RunNative = RunNative }

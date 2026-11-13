@@ -1,0 +1,219 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Fixed-schema native arrays, not a byte buffer. Use trusted local schemas.
+# local codec = import("/mLibraries/mPacket").New({ Id = 7, Fields = [{ Name = "Ready", Type = "boolean" }] })
+# local packet = codec.Encode([{ Ready = false }])
+
+local Fail = expr(code, message): { Ok = false, Code = code, Message = message }
+local Ok = expr(value): { Ok = true, Value = value }
+
+local Finite = func(value):
+    try:
+        # Mixed-type ordering throws; NaN satisfies neither comparison.
+        return (value < 0 or value >= 0) and not math.is_infinite(value)
+    catch invalid:
+        return false
+
+local Whole = func(value, minimum, maximum):
+    if not Finite(value) or value < minimum or value > maximum:
+        return false
+    local integer = math.floor(value)
+    return not (value < integer or value > integer)
+
+# Capture primitive limits here, outside the caller's schema-building scope.
+local MakeValueCheck = func(kind, minimum, maximum, max_length):
+    if kind == "boolean":
+        return func(value):
+            if value == true or value == false: return 0
+            return -1
+    if kind == "string":
+        return func(value):
+            try:
+                local length = string.length(value)
+                if length <= max_length: return length
+            catch invalid:
+                pass
+            return -1
+    if kind == "integer":
+        return func(value):
+            if Whole(value, minimum, maximum): return 0
+            return -1
+    return func(value):
+        if not Finite(value) or value < minimum or value > maximum:
+            return -1
+        return 0
+
+local OnlyFields = func(value, allowed, maximum):
+    try:
+        local count = table.count(value)
+        if count > maximum:
+            return -1
+        for key in table.keys(value):
+            if allowed[key] != true:
+                return -1
+        return count
+    catch invalid:
+        return -1
+
+local ArrayLength = func(value, maximum):
+    try:
+        if table.count(value) > maximum:
+            return -1
+        local record = false
+        try:
+            table.keys(value)
+            record = true
+        catch not_record:
+            pass
+        if record:
+            return -1
+        local length = value.length
+        if length < 0 or length > maximum:
+            return -1
+        return length
+    catch invalid:
+        return -1
+
+local CopyField = func(field):
+    if field.Type == "integer" or field.Type == "number":
+        return { Name = field.Name, Type = field.Type, Min = field.Min, Max = field.Max }
+    if field.Type == "string":
+        return { Name = field.Name, Type = field.Type, MaxLength = field.MaxLength }
+    return { Name = field.Name, Type = field.Type }
+
+local CopySchema = func(schema):
+    local fields = []
+    for field in schema.Fields:
+        fields.push(CopyField(field))
+    return { Id = schema.Id, Version = schema.Version, MaxRecords = schema.MaxRecords, MaxTextLength = schema.MaxTextLength, Fields = fields }
+
+local BuildSchema = func(config):
+    if OnlyFields(config, { Id = true, Version = true, MaxRecords = true, MaxTextLength = true, Fields = true }, 5) < 0:
+        return nil
+    local id = config.Id
+    local version = config.Version
+    local maximum = config.MaxRecords
+    local text_limit = config.MaxTextLength
+    if version == nil: version = 1
+    if maximum == nil: maximum = 64
+    if text_limit == nil: text_limit = 1024
+    if not Whole(id, 1, 65535) or not Whole(version, 1, 255) or not Whole(maximum, 1, 64) or not Whole(text_limit, 0, 4096):
+        return nil
+    local supplied = config.Fields
+    local count = ArrayLength(supplied, 8)
+    if count < 1:
+        return nil
+    local fields = []
+    local names = {}
+    for index in range(count):
+        local field = supplied[index]
+        if OnlyFields(field, { Name = true, Type = true, Min = true, Max = true, MaxLength = true }, 5) < 0:
+            return nil
+        local name = field.Name
+        local kind = field.Type
+        local length = string.length(name)
+        if length < 1 or length > 32 or not string.match(name, "^[A-Za-z]") or string.match(name, "[^A-Za-z0-9_]") or names[name] == true:
+            return nil
+        local copied = nil
+        if kind == "integer" or kind == "number":
+            local minimum = field.Min
+            local upper = field.Max
+            if OnlyFields(field, { Name = true, Type = true, Min = true, Max = true }, 4) < 0 or not Finite(minimum) or not Finite(upper) or minimum > upper:
+                return nil
+            if kind == "integer" and (not Whole(minimum, minimum, upper) or not Whole(upper, minimum, upper)):
+                return nil
+            copied = { Name = name, Type = kind, Min = minimum, Max = upper }
+        elif kind == "string":
+            local limit = field.MaxLength
+            if OnlyFields(field, { Name = true, Type = true, MaxLength = true }, 3) < 0 or not Whole(limit, 1, 256):
+                return nil
+            copied = { Name = name, Type = kind, MaxLength = limit }
+        elif kind == "boolean":
+            if OnlyFields(field, { Name = true, Type = true }, 2) < 0:
+                return nil
+            copied = { Name = name, Type = kind }
+        else:
+            return nil
+        copied.Check = MakeValueCheck(kind, copied.Min, copied.Max, copied.MaxLength)
+        names[name] = true
+        fields.push(copied)
+    return { Id = id, Version = version, MaxRecords = maximum, MaxTextLength = text_limit, Fields = fields }
+
+local New = func(config):
+    local schema = nil
+    try:
+        schema = BuildSchema(config)
+    catch invalid:
+        schema = nil
+    config = nil
+    if schema == nil:
+        throw "Invalid mPacket schema."
+    local field_count = schema.Fields.length
+    local packet_limit = 3 + schema.MaxRecords * field_count
+    local names = {}
+    for field in schema.Fields:
+        names[field.Name] = true
+    local codec = {}
+
+    codec.Encode = func(records):
+        local count = ArrayLength(records, schema.MaxRecords)
+        if count < 0:
+            return Fail("InvalidRecords", "Packet records must be a bounded array.")
+        local flat = [schema.Id, schema.Version, count]
+        local text_length = 0
+        try:
+            for index in range(count):
+                local record = records[index]
+                if OnlyFields(record, names, field_count) != field_count:
+                    return Fail("InvalidRecord", "Packet record fields do not match the schema.")
+                for field in schema.Fields:
+                    local value = record[field.Name]
+                    local length = field.Check(value)
+                    if length < 0:
+                        return Fail("InvalidValue", "A packet field is invalid.")
+                    text_length += length
+                    if text_length > schema.MaxTextLength:
+                        return Fail("TextLimit", "Packet text exceeds its total limit.")
+                    flat.push(value)
+        catch invalid:
+            return Fail("InvalidRecord", "Packet records could not be read.")
+        return Ok(flat)
+
+    codec.Decode = func(flat):
+        local length = ArrayLength(flat, packet_limit)
+        if length < 3:
+            return Fail("InvalidPacket", "Packet shape or length is invalid.")
+        local id = flat[0]
+        local version = flat[1]
+        local count = flat[2]
+        if not Whole(id, 1, 65535) or not Whole(version, 1, 255) or not Whole(count, 0, schema.MaxRecords):
+            return Fail("InvalidPacket", "Packet header is invalid.")
+        if id != schema.Id or version != schema.Version:
+            return Fail("SchemaMismatch", "Packet schema or version does not match.")
+        if length != 3 + count * field_count:
+            return Fail("InvalidPacket", "Packet length does not match its count.")
+        local records = []
+        local offset = 3
+        local text_length = 0
+        try:
+            for index in range(count):
+                local record = {}
+                for field in schema.Fields:
+                    local value = flat[offset]
+                    local size = field.Check(value)
+                    if size < 0:
+                        return Fail("InvalidValue", "A packet field is invalid.")
+                    text_length += size
+                    if text_length > schema.MaxTextLength:
+                        return Fail("TextLimit", "Packet text exceeds its total limit.")
+                    record[field.Name] = value
+                    offset += 1
+                records.push(record)
+        catch invalid:
+            return Fail("InvalidPacket", "Packet values could not be read.")
+        return Ok(records)
+
+    codec.Describe = expr(): CopySchema(schema)
+    return codec
+
+return { New = New }

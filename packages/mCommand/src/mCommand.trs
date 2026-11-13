@@ -1,0 +1,305 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Bounded command parsing and authorized dispatch. No engine or network work.
+# Example:
+# local commands = import("/mLibraries/mCommand").New()
+# commands.Register({ Name = "ping", Run = func(context, args): return "pong" })
+# local context = { Authorize = expr(command): true }
+# local result = commands.Execute(context, "ping")
+
+local Success = expr(value): { Ok = true, Value = value }
+local Failure = expr(code, message): { Ok = false, Code = code, Message = message }
+
+local IsText = func(value):
+    try:
+        string.length(value)
+        return true
+    catch problem:
+        return false
+
+local IsRecord = func(value):
+    try:
+        table.keys(value)
+        return true
+    catch problem:
+        return false
+
+local HasFields = func(value, fields):
+    try:
+        if table.count(value) > table.count(fields):
+            return false
+        for key in table.keys(value):
+            if fields[key] != true:
+                return false
+        return true
+    catch problem:
+        return false
+
+local ArrayLength = func(value, limit):
+    try:
+        # Native count accepts arrays and records; keys accepts only records.
+        # Reject records before reading any caller-supplied member or method.
+        if table.count(value) > limit or IsRecord(value):
+            return -1
+        local count = value.length
+        if count < 0 or count > limit:
+            return -1
+        return count
+    catch problem:
+        return -1
+
+local NormalizeName = func(value):
+    if not IsText(value):
+        return nil
+    local length = string.length(value)
+    if length < 1 or length > 32:
+        return nil
+    if not string.match(value, "^[A-Za-z]") or string.match(value, "[^A-Za-z0-9_-]"):
+        return nil
+    return string.lower(value)
+
+local DescribeCommand = func(command):
+    local aliases = []
+    local arguments = []
+    for alias in command.Aliases:
+        aliases.push(alias)
+    for argument in command.Arguments:
+        arguments.push({ Name = argument.Name, Type = argument.Type })
+    return {
+        Name = command.Name,
+        Aliases = aliases,
+        Description = command.Description,
+        Arguments = arguments
+    }
+
+local IsSpace = expr(character): character == " " or character == "\t"
+
+local ParseText = func(text):
+    if not IsText(text):
+        return Failure("InvalidInput", "Command text must be a string.")
+    local length = string.length(text)
+    if length > 512:
+        return Failure("InvalidInput", "Command text exceeds 512 characters.")
+    if string.match(text, "[\\x00-\\x08\\x0A-\\x1F\\x7F-\\x9F\\u2028\\u2029;]"):
+        return Failure("InvalidSyntax", "Use one command without semicolons or line breaks.")
+
+    local tokens = []
+    local index = 0
+    while index < length:
+        local character = string.substring(text, index, 1)
+        if IsSpace(character):
+            index += 1
+            continue
+
+        local token = ""
+        if character == "\"":
+            index += 1
+            local closed = false
+            while index < length:
+                character = string.substring(text, index, 1)
+                if character == "\"":
+                    closed = true
+                    index += 1
+                    break
+                if character == "\\":
+                    index += 1
+                    if index >= length:
+                        return Failure("InvalidSyntax", "A quoted escape is incomplete.")
+                    character = string.substring(text, index, 1)
+                    if character != "\"" and character != "\\":
+                        return Failure("InvalidSyntax", "Only quote and backslash escapes are supported.")
+                token += character
+                index += 1
+            if not closed:
+                return Failure("InvalidSyntax", "A quoted argument is not closed.")
+            if index < length and not IsSpace(string.substring(text, index, 1)):
+                return Failure("InvalidSyntax", "Separate quoted arguments with whitespace.")
+        else:
+            while index < length:
+                character = string.substring(text, index, 1)
+                if IsSpace(character):
+                    break
+                if character == "|" or character == "&":
+                    return Failure("InvalidSyntax", "Command chaining is not supported.")
+                if character == "\"" or character == "\\":
+                    return Failure("InvalidSyntax", "Quote the whole argument before using escapes.")
+                token += character
+                index += 1
+
+        tokens.push(token)
+        if tokens.length > 16:
+            return Failure("TooManyTokens", "Use at most 16 command tokens.")
+
+    if tokens.length == 0:
+        return Failure("EmptyInput", "Enter a command.")
+    local name = NormalizeName(tokens[0])
+    if name == nil:
+        return Failure("InvalidSyntax", "The command name is invalid.")
+    local arguments = []
+    for position in range(1, tokens.length):
+        arguments.push(tokens[position])
+    return Success({ Name = name, Tokens = arguments })
+
+local ConvertArgument = func(specification, text):
+    if specification.Type == "string":
+        return Success(text)
+    if specification.Type == "boolean":
+        if string.match(text, "[^A-Za-z]"):
+            return Failure("InvalidArgument", "Argument " + specification.Name + " must be true or false.")
+        local value = string.lower(text)
+        if value == "true":
+            return Success(true)
+        if value == "false":
+            return Success(false)
+        return Failure("InvalidArgument", "Argument " + specification.Name + " must be true or false.")
+
+    if not string.match(text, "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"):
+        return Failure("InvalidArgument", "Argument " + specification.Name + " must be a finite number.")
+    local number = tonumber(text)
+    if math.is_nan(number) or math.is_infinite(number):
+        return Failure("InvalidArgument", "Argument " + specification.Name + " must be a finite number.")
+    return Success(number)
+
+local New = func():
+    local state = { Commands = [], Names = {} }
+    local registering = 0
+    local commands = {}
+
+    commands.Register = func(definition):
+        local ticket = registering++
+        if ticket != 0:
+            return Failure("RegistrationBusy", "Another command registration is in progress.")
+        try:
+            local fields = { Name = true, Aliases = true, Description = true, Arguments = true, Run = true }
+            if not HasFields(definition, fields):
+                return Failure("InvalidDefinition", "Command definition fields are invalid.")
+            local handler = definition.Run
+            local name = NormalizeName(definition.Name)
+            if name == nil or handler == nil:
+                return Failure("InvalidDefinition", "A command needs a valid name and handler.")
+            local description = definition.Description
+            if description == nil:
+                description = ""
+            if not IsText(description) or string.length(description) > 160:
+                return Failure("InvalidDefinition", "Command description must contain at most 160 characters.")
+
+            local supplied_aliases = definition.Aliases
+            if supplied_aliases == nil:
+                supplied_aliases = []
+            local alias_count = ArrayLength(supplied_aliases, 8)
+            if alias_count < 0:
+                return Failure("InvalidDefinition", "Command aliases must be an array of at most eight names.")
+            local aliases = []
+            local used_names = {}
+            used_names[name] = true
+            for index in range(alias_count):
+                local alias = NormalizeName(supplied_aliases[index])
+                if alias == nil:
+                    return Failure("InvalidDefinition", "A command alias is invalid.")
+                if used_names[alias] == true:
+                    return Failure("DuplicateName", "Command names and aliases must be distinct.")
+                used_names[alias] = true
+                aliases.push(alias)
+
+            local supplied_arguments = definition.Arguments
+            if supplied_arguments == nil:
+                supplied_arguments = []
+            local argument_count = ArrayLength(supplied_arguments, 15)
+            if argument_count < 0:
+                return Failure("InvalidDefinition", "Command arguments must be an array of at most 15 definitions.")
+            local arguments = []
+            local used_arguments = {}
+            for index in range(argument_count):
+                local argument = supplied_arguments[index]
+                if not HasFields(argument, { Name = true, Type = true }):
+                    return Failure("InvalidDefinition", "Argument definition fields are invalid.")
+                local argument_name = NormalizeName(argument.Name)
+                local kind = argument.Type
+                if argument_name == nil or (kind != "string" and kind != "number" and kind != "boolean"):
+                    return Failure("InvalidDefinition", "Arguments need a valid name and a supported type.")
+                if used_arguments[argument_name] == true:
+                    return Failure("InvalidDefinition", "Argument names must be distinct.")
+                used_arguments[argument_name] = true
+                arguments.push({ Name = argument_name, Type = kind })
+
+            local snapshot = state
+            if snapshot.Commands.length >= 64:
+                return Failure("RegistryFull", "The command registry contains 64 commands.")
+            for candidate in table.keys(used_names):
+                if snapshot.Names[candidate] != nil:
+                    return Failure("DuplicateName", "A command name or alias is already registered.")
+
+            local record = {
+                Name = name,
+                Aliases = aliases,
+                Description = description,
+                Arguments = arguments,
+                Run = handler
+            }
+            local next_commands = []
+            local next_names = {}
+            for command in snapshot.Commands:
+                next_commands.push(command)
+            for key in table.keys(snapshot.Names):
+                next_names[key] = snapshot.Names[key]
+            next_commands.push(record)
+            for candidate in table.keys(used_names):
+                next_names[candidate] = record
+            state = { Commands = next_commands, Names = next_names }
+            return Success(DescribeCommand(record))
+        catch problem:
+            return Failure("InvalidDefinition", "Command definition could not be registered.")
+        finally:
+            registering = 0
+
+    commands.Parse = func(text):
+        try:
+            return ParseText(text)
+        catch problem:
+            return Failure("InvalidInput", "Command text could not be parsed.")
+
+    commands.Execute = func(context, text):
+        local parsed = commands.Parse(text)
+        if not parsed.Ok:
+            return parsed
+        local command = state.Names[parsed.Value.Name]
+        if command == nil:
+            return Failure("UnknownCommand", "Unknown command.")
+
+        if not IsRecord(context):
+            return Failure("Unauthorized", "Command is not allowed.")
+        local authorize = context.Authorize
+        if authorize == nil:
+            return Failure("Unauthorized", "Command is not allowed.")
+        local allowed = false
+        try:
+            allowed = authorize(DescribeCommand(command))
+        catch problem:
+            return Failure("AuthorizationFailed", "Command authorization failed.")
+        if allowed != true:
+            return Failure("Unauthorized", "Command is not allowed.")
+
+        if parsed.Value.Tokens.length != command.Arguments.length:
+            return Failure("ArgumentCount", "Command argument count is incorrect.")
+        local arguments = {}
+        for index in range(command.Arguments.length):
+            local specification = command.Arguments[index]
+            local converted = ConvertArgument(specification, parsed.Value.Tokens[index])
+            if not converted.Ok:
+                return converted
+            arguments[specification.Name] = converted.Value
+        try:
+            return Success(command.Run(context, arguments))
+        catch problem:
+            return Failure("CommandFailed", "Command execution failed.")
+
+    commands.Describe = func():
+        local snapshot = state
+        local descriptions = []
+        for command in snapshot.Commands:
+            descriptions.push(DescribeCommand(command))
+        return Success(descriptions)
+
+    return commands
+
+return { New = New }

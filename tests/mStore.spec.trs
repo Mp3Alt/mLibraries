@@ -1,0 +1,408 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Shared-record contracts use isolated stores and controlled conflict replays.
+local module = import("/mLibraries/mStore")
+local kit = import("/mLibraries/mTestKit")
+
+local Envelope = func(data, revision, schema):
+    if schema == nil: schema = 1
+    return { Format = "mStore/1", Schema = schema, Revision = revision, Data = data }
+local Harness = func():
+    local state = { Rows = {}, Reads = 0, Updates = 0, Writes = 0, BeforeFailures = 0, AfterFailures = 0, Before = nil, After = nil, Replay = nil, Cached = nil }
+    state.GetAsync = func(key):
+        state.Reads += 1
+        if state.BeforeFailures > 0:
+            state.BeforeFailures -= 1
+            throw "read unavailable"
+        local hook = state.Before
+        state.Before = nil
+        if hook != nil: hook()
+        if state.Cached != nil: return state.Cached
+        return state.Rows[key]
+    state.UpdateAsync = func(key, transform):
+        state.Updates += 1
+        if state.BeforeFailures > 0:
+            state.BeforeFailures -= 1
+            throw "write unavailable"
+        local hook = state.Before
+        state.Before = nil
+        if hook != nil: hook()
+        local next = transform(state.Rows[key])
+        local replay = state.Replay
+        state.Replay = nil
+        if replay != nil:
+            replay()
+            next = transform(state.Rows[key])
+        if next != nil:
+            state.Rows[key] = next
+            state.Writes += 1
+        hook = state.After
+        state.After = nil
+        if hook != nil: hook()
+        if state.AfterFailures > 0:
+            state.AfterFailures -= 1
+            throw "reply lost after commit"
+        return next
+    local New = func(config):
+        if config == nil: config = { Name = "Tests", Key = "policy", Defaults = { Count = 0, Open = false, Items = [] } }
+        return module.New(config, { Store = state })
+    return { Store = state, New = New }
+local Accept = expr(data, revision): { Ok = true, Value = data }
+
+local Run = func():
+    local suite = kit.New("mStore")
+    suite.Test("construction and missing reads do not create records", func():
+        local h = Harness()
+        local store = h.New(nil)
+        suite.Equal(h.Store.Reads + h.Store.Updates, 0, "no I/O during construction")
+        local cached = store.Read()
+        suite.Expect(cached.Ok, "cached read succeeds")
+        suite.Equal(cached.Revision, 0, "initial revision")
+        suite.Equal(cached.Value.Count, 0, "zero default")
+        suite.Equal(cached.Value.Open, false, "false default")
+        local fresh = store.Read(true)
+        suite.Expect(fresh.Ok, "fresh absent read succeeds")
+        suite.Equal(fresh.Revision, 0, "fresh absent revision")
+        suite.Equal(h.Store.Writes, 0, "reads never initialize storage")
+        suite.Equal(h.Store.Rows.policy, nil, "missing key remains missing")
+    )
+    suite.Test("defaults and read results have detached ownership", func():
+        local h = Harness()
+        local defaults = { Count = 0, Items = [] }
+        local store = h.New({ Name = "Tests", Key = "policy", Defaults = defaults })
+        defaults.Count = 99
+        defaults.Items.push("outside")
+        local first = store.Read()
+        first.Value.Count = 77
+        first.Value.Items.push("retained")
+        local second = store.Read(true)
+        suite.Equal(second.Value.Count, 0, "configured copy retained")
+        suite.Equal(second.Value.Items.length, 0, "default arrays isolated")
+    )
+    suite.Test("successful updates increment revision and detach their draft", func():
+        local h = Harness()
+        local store = h.New(nil)
+        local retained = nil
+        local result = store.Update(func(data, revision):
+            suite.Equal(revision, 0, "callback receives current revision")
+            data.Count = 7
+            retained = data
+            return { Ok = true, Value = data }
+        )
+        suite.Expect(result.Ok, "update confirmed")
+        suite.Equal(result.Revision, 1, "first committed revision")
+        retained.Count = 88
+        result.Value.Count = 99
+        suite.Equal(h.Store.Rows.policy.Data.Count, 7, "stored data owned separately")
+        suite.Equal(store.Read(true).Value.Count, 7, "later read has committed value")
+    )
+    suite.Test("fresh reads cancel their native transform without writing", func():
+        local h = Harness()
+        local row = Envelope({ Count = 4, Open = false, Items = [] }, 9, nil)
+        h.Store.Rows.policy = row
+        local store = h.New(nil)
+        local result = store.Read(true)
+        suite.Expect(result.Ok, "fresh snapshot read")
+        suite.Equal(result.Value.Count, 4, "actual record returned")
+        suite.Equal(result.Revision, 9, "stored revision returned")
+        suite.Equal(h.Store.Reads, 0, "no cached GetAsync")
+        suite.Equal(h.Store.Updates, 1, "one cancellation read")
+        suite.Equal(h.Store.Writes, 0, "no write")
+        suite.Equal(h.Store.Rows.policy, row, "stored identity unchanged")
+    )
+    suite.Test("cached and fresh reads keep their explicit semantics", func():
+        local h = Harness()
+        h.Store.Cached = Envelope({ Count = 1 }, 1, nil)
+        h.Store.Rows.policy = Envelope({ Count = 3 }, 3, nil)
+        local store = h.New(nil)
+        suite.Equal(store.Read(false).Value.Count, 1, "normal read may be cached")
+        suite.Equal(store.Read(true).Value.Count, 3, "fresh read observes backend current")
+        suite.Equal(h.Store.Writes, 0, "neither path writes")
+    )
+    suite.Test("native conflict replay merges the latest committed record", func():
+        local h = Harness()
+        local first = h.New(nil)
+        local second = h.New(nil)
+        local calls = 0
+        h.Store.Replay = func():
+            local saved = second.Update(func(data, revision):
+                data.Open = true
+                return { Ok = true, Value = data }
+            )
+            suite.Expect(saved.Ok, "competing server commit")
+        local saved = first.Update(func(data, revision):
+            calls += 1
+            data.Count += 1
+            return { Ok = true, Value = data }
+        )
+        suite.Expect(saved.Ok, "replayed edit confirmed")
+        suite.Equal(calls, 2, "native callback replay")
+        suite.Equal(saved.Value.Count, 1, "increment applies once")
+        suite.Equal(saved.Value.Open, true, "other server's field retained")
+        suite.Equal(saved.Revision, 2, "both commits counted")
+    )
+    suite.Test("a replay can reject after a competing permission change", func():
+        local h = Harness()
+        h.Store.Rows.policy = Envelope({ Allowed = true, Count = 0 }, 4, nil)
+        local actor = h.New(nil)
+        local owner = h.New(nil)
+        h.Store.Replay = func():
+            owner.Update(func(data, revision):
+                data.Allowed = false
+                return { Ok = true, Value = data }
+            )
+        local result = actor.Update(func(data, revision):
+            if not data.Allowed: return { Ok = false, Code = "Denied", Message = "Access was removed." }
+            data.Count += 1
+            return { Ok = true, Value = data }
+        )
+        suite.Equal(result.Code, "Denied", "latest policy rejects mutation")
+        suite.Equal(h.Store.Rows.policy.Data.Count, 0, "discarded candidate never committed")
+        suite.Equal(h.Store.Rows.policy.Revision, 5, "only permission change committed")
+    )
+    suite.Test("application rejection returns a copied bounded failure", func():
+        local h = Harness()
+        local store = h.New(nil)
+        local proposal = { Ok = false, Code = "Protected", Message = "This account is protected." }
+        local result = store.Update(func(data, revision):
+            data.Count = 99
+            return proposal
+        )
+        proposal.Message = "changed"
+        suite.Equal(result.Code, "Protected", "application code retained")
+        suite.Equal(result.Message, "This account is protected.", "application result copied")
+        suite.Equal(h.Store.Writes, 0, "no rejected write")
+        suite.Equal(h.Store.Rows.policy, nil, "no partial initialization")
+    )
+    suite.Test("lost write acknowledgements are not replayed", func():
+        local h = Harness()
+        local store = h.New(nil)
+        h.Store.AfterFailures = 1
+        local result = store.Update(func(data, revision):
+            data.Count += 1
+            return { Ok = true, Value = data }
+        )
+        suite.Equal(result.Code, "StoreError", "unconfirmed outcome is explicit")
+        suite.Equal(result.Value, nil, "no confirmed value returned")
+        suite.Equal(h.Store.Updates, 1, "no outer retry")
+        suite.Equal(h.Store.Rows.policy.Data.Count, 1, "backend may have committed")
+        suite.Equal(store.Read(true).Value.Count, 1, "caller can reconcile using a fresh read")
+    )
+    suite.Test("storage failure does not return captured fresh data", func():
+        local h = Harness()
+        h.Store.Rows.policy = Envelope({ Count = 3 }, 2, nil)
+        h.Store.AfterFailures = 1
+        local result = h.New(nil).Read(true)
+        suite.Equal(result.Code, "StoreError", "failed outer read is not accepted")
+        suite.Equal(result.Value, nil, "captured callback value not published")
+        suite.Equal(h.Store.Writes, 0, "cancelled read has no write")
+    )
+    suite.Test("failed reads never replace stored data with defaults", func():
+        local h = Harness()
+        local row = Envelope({ Count = 12 }, 8, nil)
+        h.Store.Rows.policy = row
+        h.Store.BeforeFailures = 1
+        local store = h.New(nil)
+        suite.Equal(store.Read().Code, "StoreError", "read fails")
+        suite.Equal(h.Store.Rows.policy, row, "prior stored record preserved")
+        suite.Equal(h.Store.Writes, 0, "no default save")
+        suite.Equal(store.Read(true).Value.Count, 12, "operation gate recovers")
+    )
+    suite.Test("malformed envelopes cannot be overwritten", func():
+        local h = Harness()
+        local store = h.New(nil)
+        local callback_calls = 0
+        for row in [false, 7, [], { Count = 10 }, Envelope({ Count = 2 }, -1, nil), Envelope({ Count = 2 }, 0.5, nil), { Format = "mStore/1", Schema = 1, Revision = 0, Data = {}, Extra = true }]:
+            h.Store.Rows.policy = row
+            suite.Equal(store.Read(true).Code, "Corrupt", "malformed data rejected")
+            local result = store.Update(func(data, revision):
+                callback_calls += 1
+                return { Ok = true, Value = data }
+            )
+            suite.Equal(result.Code, "Corrupt", "no corrupt update")
+            suite.Equal(h.Store.Rows.policy, row, "bad source untouched")
+        suite.Equal(callback_calls, 0, "application never sees malformed source")
+        suite.Equal(h.Store.Writes, 0, "no repairs by overwriting")
+    )
+    suite.Test("schema mismatch requires an explicit migration", func():
+        local h = Harness()
+        local store = h.New({ Name = "Tests", Key = "policy", Defaults = {}, Version = 2 })
+        for schema in [1, 3]:
+            local row = Envelope({}, 4, schema)
+            h.Store.Rows.policy = row
+            local expected = schema == 1 and "SchemaMismatch" or "NewerSchema"
+            suite.Equal(store.Read(true).Code, expected, "schema read rejected")
+            suite.Equal(store.Update(Accept).Code, expected, "schema write rejected")
+            suite.Equal(h.Store.Rows.policy, row, "schema source retained")
+        suite.Equal(h.Store.Writes, 0, "no implicit migration")
+    )
+    suite.Test("stored values are validated without aliasing the backend", func():
+        local h = Harness()
+        h.Store.Rows.policy = Envelope({ Count = 3, Items = [] }, 1, nil)
+        local result = h.New(nil).Read()
+        result.Value.Items.push("outside")
+        result.Value.Count = 99
+        suite.Equal(h.Store.Rows.policy.Data.Items.length, 0, "array detached")
+        suite.Equal(h.Store.Rows.policy.Data.Count, 3, "record detached")
+        h.Store.Rows.policy.Data.Bad = func(): pass
+        suite.Equal(h.New(nil).Read(true).Code, "Corrupt", "unsupported stored value refused")
+    )
+    suite.Test("invalid proposals leave no partial state", func():
+        local h = Harness()
+        local store = h.New(nil)
+        for proposal in [nil, false, {}, { Ok = true }, { Ok = true, Value = [] }, { Ok = true, Value = {}, Extra = true }, { Ok = false, Code = "", Message = "bad" }, { Ok = false, Code = "Denied", Message = string.repeat("x", 257) }]:
+            local result = store.Update(func(data, revision): return proposal)
+            suite.Expect(not result.Ok, "proposal refused")
+        suite.Equal(h.Store.Writes, 0, "no malformed proposal writes")
+        suite.Equal(store.Update(Accept).Revision, 1, "gate released after bad proposals")
+    )
+    suite.Test("callback failures cancel and release admission", func():
+        local h = Harness()
+        local store = h.New(nil)
+        local result = store.Update(func(data, revision):
+            data.Count = 8
+            throw "failure"
+        )
+        suite.Equal(result.Code, "Transform", "callback error is structured")
+        suite.Equal(h.Store.Writes, 0, "no partial write")
+        suite.Equal(store.Update(Accept).Revision, 1, "subsequent update admitted")
+    )
+    suite.Test("validators can assert or return false without mutating data", func():
+        local h = Harness()
+        local retained = nil
+        local store = h.New({ Name = "Tests", Key = "policy", Defaults = { Count = 0 }, Validate = func(data):
+            retained = data
+            if data.Count < 0: return false
+            data.Count = 999
+        })
+        suite.Equal(store.Read().Value.Count, 0, "validator copy is disposable")
+        local saved = store.Update(expr(data, revision): { Ok = true, Value = { Count = 3 } })
+        retained.Count = 777
+        suite.Equal(saved.Value.Count, 3, "validated proposal remains unchanged")
+        suite.Equal(store.Update(expr(data, revision): { Ok = true, Value = { Count = -1 } }).Code, "InvalidData", "false rejects proposal")
+        suite.Equal(h.Store.Rows.policy.Data.Count, 3, "last valid value retained")
+        h.Store.Rows.policy = Envelope({ Count = -1 }, 2, nil)
+        suite.Equal(store.Read(true).Code, "Corrupt", "false rejects stored data")
+        suite.Throws(func(): h.New({ Name = "Tests", Key = "other", Defaults = {}, Validate = func(data): throw "invalid" }), "throwing validator rejects defaults")
+    )
+    suite.Test("same-instance callback reentry is busy", func():
+        local h = Harness()
+        local store = h.New(nil)
+        local read = nil
+        local write = nil
+        local result = store.Update(func(data, revision):
+            read = store.Read(true)
+            write = store.Update(Accept)
+            return { Ok = true, Value = data }
+        )
+        suite.Expect(result.Ok, "outer operation commits")
+        suite.Equal(read.Code, "Busy", "nested read refused")
+        suite.Equal(write.Code, "Busy", "nested write refused")
+        suite.Equal(h.Store.Updates, 1, "nested I/O never starts")
+        suite.Expect(store.Read(true).Ok, "outer admission released")
+    )
+    suite.Test("native adapter overlap cannot bypass admission", func():
+        local h = Harness()
+        local store = h.New(nil)
+        local nested = nil
+        h.Store.Before = func(): nested = store.Update(Accept)
+        suite.Expect(store.Read(true).Ok, "outer fresh read")
+        suite.Equal(nested.Code, "Busy", "backend hook reentry refused")
+        suite.Equal(h.Store.Updates, 1, "one underlying operation")
+        suite.Expect(store.Update(Accept).Ok, "later edit admitted")
+    )
+    suite.Test("destroy before or during work prevents local confirmation", func():
+        local h = Harness()
+        local store = h.New(nil)
+        local result = store.Update(func(data, revision):
+            store.Destroy()
+            return { Ok = true, Value = data }
+        )
+        suite.Equal(result.Code, "Closed", "mid-callback close refuses candidate")
+        suite.Equal(h.Store.Writes, 0, "no closed write")
+        suite.Equal(store.Read(true).Code, "Closed", "later read closed")
+        suite.Equal(store.Update(Accept).Code, "Closed", "later edit closed")
+        suite.Expect(store.IsDestroyed(), "closed flag")
+        store.Destroy()
+        local other = h.New(nil)
+        h.Store.After = other.Destroy
+        result = other.Update(Accept)
+        suite.Equal(result.Code, "Closed", "close after native commit is not confirmed locally")
+        suite.Equal(result.Value, nil, "no owned result after close")
+        suite.Equal(h.Store.Writes, 1, "started native write may have completed")
+    )
+    suite.Test("closure during validation refuses proposals and confirmation", func():
+        for phase in [
+            { Existing = true, CloseAt = 2, Writes = 0, Transforms = 0 },
+            { Existing = false, CloseAt = 2, Writes = 0, Transforms = 1 },
+            { Existing = false, CloseAt = 3, Writes = 1, Transforms = 1 }
+        ]:
+            local h = Harness()
+            if phase.Existing: h.Store.Rows.policy = Envelope({ Count = 0 }, 1, nil)
+            local store = nil
+            local checks = 0
+            local transforms = 0
+            store = h.New({ Name = "Tests", Key = "policy", Defaults = { Count = 0 }, Validate = func(data):
+                checks += 1
+                if checks == phase.CloseAt: store.Destroy()
+                return true
+            })
+            local result = store.Update(func(data, revision):
+                transforms += 1
+                return { Ok = true, Value = { Count = 1 } }
+            )
+            suite.Equal(result.Code, "Closed", "closed validation cannot confirm an update")
+            suite.Equal(result.Value, nil, "closed update exposes no owned result")
+            suite.Equal(h.Store.Writes, phase.Writes, "only an already committed write may remain")
+            suite.Equal(transforms, phase.Transforms, "closed current data does not reach the caller transform")
+    )
+    suite.Test("safe integer revision exhaustion never wraps", func():
+        local h = Harness()
+        h.Store.Rows.policy = Envelope({}, 9007199254740991, nil)
+        local store = h.New(nil)
+        suite.Equal(store.Read(true).Revision, 9007199254740991, "maximum revision readable")
+        suite.Equal(store.Update(Accept).Code, "RevisionLimit", "new revision refused")
+        suite.Equal(h.Store.Writes, 0, "no overflow write")
+    )
+    suite.Test("cycles depth limits and unsupported values are rejected", func():
+        local h = Harness()
+        local store = h.New(nil)
+        local cycle = {}
+        cycle.Self = cycle
+        local deep = {}
+        local node = deep
+        for index in range(17):
+            node.Next = {}
+            node = node.Next
+        for value in [cycle, deep, { Bad = 0 / 0 }, { Bad = 1 / 0 }, { Bad = func(): pass }, { Bad = new Vector2(1, 2) }]:
+            suite.Equal(store.Update(expr(data, revision): { Ok = true, Value = value }).Code, "InvalidData", "invalid structure refused")
+        local bad_key = {}
+        bad_key[{}] = true
+        suite.Equal(store.Update(expr(data, revision): { Ok = true, Value = bad_key }).Code, "InvalidData", "non-string table key refused")
+        suite.Equal(h.Store.Writes, 0, "no invalid writes")
+    )
+    suite.Test("copy budgets include keys and the complete data structure", func():
+        local h = Harness()
+        local store = h.New(nil)
+        local text = string.repeat("x", 65532)
+        suite.Expect(store.Update(expr(data, revision): { Ok = true, Value = { Text = text } }).Ok, "text exactly at budget accepted")
+        suite.Equal(store.Update(expr(data, revision): { Ok = true, Value = { Text = text + "x" } }).Code, "InvalidData", "key bytes included in text budget")
+        local nodes = []
+        for index in range(4094): nodes.push(index)
+        suite.Expect(store.Update(expr(data, revision): { Ok = true, Value = { Items = nodes } }).Ok, "node budget boundary accepted")
+        nodes.push(0)
+        suite.Equal(store.Update(expr(data, revision): { Ok = true, Value = { Items = nodes } }).Code, "InvalidData", "one excess node rejected")
+    )
+    suite.Test("invalid configuration and arguments fail explicitly", func():
+        local h = Harness()
+        for config in [nil, {}, { Name = "", Key = "one", Defaults = {} }, { Name = "Tests", Key = "", Defaults = {} }, { Name = "Tests", Key = "one", Defaults = [] }, { Name = "Tests", Key = "one", Defaults = {}, Version = 0 }, { Name = "Tests", Key = "one", Defaults = {}, Extra = true }]:
+            suite.Throws(func(): module.New(config, { Store = h.Store }), "bad configuration rejected")
+        suite.Throws(func(): module.New({ Name = "Tests", Key = "one", Defaults = {} }, { Store = {} }), "incomplete backend rejected")
+        local store = h.New(nil)
+        suite.Equal(store.Read("fresh").Code, "InvalidInput", "bad freshness argument")
+        suite.Equal(store.Update(nil).Code, "InvalidInput", "missing callback")
+        suite.Equal(h.Store.Updates + h.Store.Reads, 0, "invalid arguments do not call storage")
+    )
+    return suite.Report()
+
+return { Run = Run }

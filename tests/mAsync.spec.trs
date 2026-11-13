@@ -301,4 +301,233 @@ local Run = func():
 
     return suite.Report()
 
-return { Run = Run }
+# Native-script contention tests. Run separately from the pure contract suite.
+local RunConcurrent = func():
+    local suite = mTestKit.New("mAsyncConcurrent")
+    local All = func(flags):
+        for flag in flags:
+            if not flag:
+                return false
+        return true
+    local WaitUntil = func(predicate):
+        for turn in range(600):
+            if predicate():
+                return true
+            wait(0)
+        return false
+    local NativeRuntime = func(done):
+        local next_index = 0
+        local runtime = {}
+        runtime.Spawn = func(task):
+            local index = next_index++
+            spawn(func():
+                try:
+                    task()
+                finally:
+                    done[index] = true
+            )
+        runtime.Wait = func(seconds): return wait(seconds)
+        return runtime
+
+    suite.Test("competing cancellation requests settle each active job once", func():
+        local done = []
+        local accepted = [[], []]
+        local jobs = []
+        local worker_done = [false, false, false]
+        local errors = []
+        local gate = { Open = false, Stop = false }
+        for index in range(128):
+            done.push(false)
+            accepted[0].push(false)
+            accepted[1].push(false)
+        local tasks = mAsync.New(NativeRuntime(done))
+        local work = func(token, payload):
+            while not gate.Open and not gate.Stop:
+                wait(0)
+            token.Checkpoint()
+            return payload
+        for index in range(128):
+            jobs.push(tasks.Run(work, index))
+
+        for worker in range(2):
+            spawn(func():
+                try:
+                    for index in range(jobs.length):
+                        if gate.Stop:
+                            return
+                        accepted[worker][index] = jobs[index].Cancel()
+                        if index % 4 == 0:
+                            wait(0)
+                catch failure:
+                    errors.push(failure)
+                finally:
+                    worker_done[worker] = true
+            )
+        spawn(func():
+            try:
+                for turn in range(600):
+                    if gate.Stop or (worker_done[0] and worker_done[1]):
+                        return
+                    for job in jobs:
+                        local result = job.GetOutcome()
+                        if result.Status == "Cancelled":
+                            if not result.CancellationRequested or result.Value != nil or result.Error != nil:
+                                errors.push("cancelled snapshot was incomplete")
+                                return
+                        elif result.Status != "Pending" and result.Status != "Running":
+                            errors.push("held job settled before its release")
+                            return
+                    wait(0)
+                errors.push("cancellation reader limit reached")
+            catch failure:
+                errors.push(failure)
+            finally:
+                worker_done[2] = true
+        )
+
+        local requests_finished = false
+        try:
+            requests_finished = WaitUntil(expr(): worker_done[0] and worker_done[1])
+        finally:
+            gate.Open = true
+            if not requests_finished:
+                gate.Stop = true
+        local runners_finished = WaitUntil(expr(): All(done) and All(worker_done))
+        gate.Stop = true
+        suite.Expect(requests_finished, "both cancellation workers completed")
+        suite.Expect(runners_finished, "native runners and reader exited")
+        suite.Equal(errors.length, 0, "contention workers had no failures")
+        for index in range(jobs.length):
+            local count = 0
+            if accepted[0][index]:
+                count += 1
+            if accepted[1][index]:
+                count += 1
+            suite.Equal(count, 1, "exactly one request was accepted per held job")
+            local result = jobs[index].GetOutcome()
+            suite.Equal(result.Status, "Cancelled", "held work settles cancelled")
+            suite.Equal(result.CancellationRequested, true, "request flag is retained")
+            suite.Equal(result.Value, nil, "cancelled result has no value")
+            suite.Equal(result.Error, nil, "private sentinel is not exposed")
+    )
+
+    suite.Test("completion and cancellation readers retain coherent terminal results", func():
+        local done = []
+        local started = []
+        local tokens = []
+        local accepted = [[], []]
+        local jobs = []
+        local observed = []
+        local worker_done = [false, false, false]
+        local errors = []
+        local gate = { Open = false, ReleaseHeld = false, Stop = false }
+        for index in range(128):
+            done.push(false)
+            started.push(false)
+            tokens.push(nil)
+            accepted[0].push(false)
+            accepted[1].push(false)
+            observed.push(nil)
+        local tasks = mAsync.New(NativeRuntime(done))
+        local work = func(token, payload):
+            tokens[payload] = token
+            started[payload] = true
+            if payload == 1:
+                while not gate.ReleaseHeld and not gate.Stop:
+                    wait(0)
+            elif payload != 0:
+                while not gate.Open and not gate.Stop:
+                    wait(0)
+                for turn in range(payload % 3):
+                    wait(0)
+            # Ignore requests intentionally: every callback has already started.
+            return 1000 + payload
+        for index in range(128):
+            jobs.push(tasks.Run(work, index))
+
+        local all_started = WaitUntil(expr(): All(started) and done[0])
+        if not all_started:
+            gate.Open = true
+            gate.ReleaseHeld = true
+            gate.Stop = true
+            WaitUntil(expr(): All(done))
+        suite.Expect(all_started, "all callbacks started and the completed anchor settled")
+
+        for worker in range(2):
+            spawn(func():
+                try:
+                    for index in range(jobs.length):
+                        if gate.Stop:
+                            return
+                        accepted[worker][index] = jobs[index].Cancel()
+                        if index % 4 == 0:
+                            wait(0)
+                catch failure:
+                    errors.push(failure)
+                finally:
+                    worker_done[worker] = true
+            )
+        spawn(func():
+            try:
+                for turn in range(600):
+                    if gate.Stop:
+                        return
+                    for index in range(jobs.length):
+                        local result = jobs[index].GetOutcome()
+                        if result.Status == "Succeeded":
+                            if result.Value != 1000 + index or result.Error != nil:
+                                errors.push("terminal snapshot mixed result fields")
+                                return
+                            local previous = observed[index]
+                            if previous != nil and previous.CancellationRequested != result.CancellationRequested:
+                                errors.push("terminal request flag changed")
+                                return
+                            observed[index] = result
+                        elif result.Status != "Pending" and result.Status != "Running":
+                            errors.push("started work unexpectedly failed or was force-cancelled")
+                            return
+                    if All(done) and worker_done[0] and worker_done[1]:
+                        return
+                    wait(0)
+                errors.push("completion reader limit reached")
+            catch failure:
+                errors.push(failure)
+            finally:
+                worker_done[2] = true
+        )
+
+        gate.Open = true
+        local requests_finished = false
+        try:
+            requests_finished = WaitUntil(expr(): worker_done[0] and worker_done[1])
+        finally:
+            gate.ReleaseHeld = true
+            if not requests_finished:
+                gate.Stop = true
+        local runners_finished = WaitUntil(expr(): All(done) and All(worker_done))
+        gate.Stop = true
+        suite.Expect(requests_finished, "completion contenders finished")
+        suite.Expect(runners_finished, "native runners and terminal reader exited")
+        suite.Equal(errors.length, 0, "completion contention had no failures")
+        for index in range(jobs.length):
+            local count = 0
+            if accepted[0][index]:
+                count += 1
+            if accepted[1][index]:
+                count += 1
+            suite.Expect(count <= 1, "at most one request is accepted")
+            if index == 0:
+                suite.Equal(count, 0, "completed anchor rejects both requests")
+            if index == 1:
+                suite.Equal(count, 1, "held running anchor accepts one request")
+            local result = jobs[index].GetOutcome()
+            suite.Equal(result.Status, "Succeeded", "ignored cancellation still succeeds")
+            suite.Equal(result.Value, 1000 + index, "matching terminal value")
+            suite.Equal(result.CancellationRequested, count == 1, "terminal flag matches accepted requests")
+            suite.Equal(jobs[index].Cancel(), false, "late request is rejected")
+            suite.Equal(tokens[index].IsCancellationRequested(), count == 1, "retained token ignores late rejected requests")
+    )
+
+    return suite.Report()
+
+return { Run = Run, RunConcurrent = RunConcurrent }

@@ -1,0 +1,358 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Storage failures and interleavings use an injected UpdateAsync backend.
+local mData = import("/mLibraries/mData")
+local kit = import("/mLibraries/mTestKit")
+
+local Harness = func():
+    local clock = { Now = 100, Hook = nil }
+    local store = { Rows = {}, Calls = 0, BeforeFailures = 0, AfterFailures = 0, Hook = nil }
+    store.UpdateAsync = func(key, transform):
+        store.Calls += 1
+        if store.BeforeFailures > 0:
+            store.BeforeFailures -= 1
+            throw "offline"
+        local hook = store.Hook
+        store.Hook = nil
+        if hook != nil: hook()
+        local next = transform(store.Rows[key])
+        if next != nil: store.Rows[key] = next
+        if store.AfterFailures > 0:
+            store.AfterFailures -= 1
+            throw "reply lost after commit"
+        return next
+    local Runtime = func(id):
+        local ReadClock = func():
+            local hook = clock.Hook
+            clock.Hook = nil
+            if hook != nil: hook()
+            return clock.Now
+        return {
+            Store = store, Clock = ReadClock,
+            Wait = func(seconds): clock.Now += seconds,
+            Spawn = func(work): work(), SessionId = id
+        }
+    local New = func(id, options):
+        if options == nil: options = { Name = "Tests", Defaults = { Coins = 0, Enabled = false, Items = [] } }
+        return mData.New(options, Runtime(id))
+    return { Store = store, Clock = clock, New = New }
+
+local Run = func():
+    local suite = kit.New("mData")
+    suite.Test("new keys load detached defaults", func():
+        local h = Harness()
+        local service = h.New("A", nil)
+        local loaded = service.Load("one")
+        suite.Expect(loaded.Ok, "load succeeds")
+        suite.Equal(loaded.Profile.Get().Coins, 0, "zero preserved")
+        suite.Equal(loaded.Profile.Get().Enabled, false, "false preserved")
+        suite.Equal(service.GetCount(), 1, "registered")
+        loaded.Profile.Release()
+        suite.Equal(service.GetCount(), 0, "dynamic key erased")
+    )
+    suite.Test("profile snapshots cannot mutate stored or active data", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        local snapshot = profile.Get()
+        snapshot.Coins = 999
+        snapshot.Items.push("forged")
+        suite.Equal(profile.Get().Coins, 0, "active primitive isolated")
+        suite.Equal(profile.Get().Items.length, 0, "active nested array isolated")
+        suite.Equal(h.Store.Rows.one.Data.Items.length, 0, "backend isolated")
+    )
+    suite.Test("Update publishes a validated detached record once", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        local retained = nil
+        profile.Update(func(data):
+            data.Coins = 7
+            retained = data
+        )
+        retained.Coins = 99
+        suite.Equal(profile.Get().Coins, 7, "callback draft no longer owns profile")
+        suite.Expect(profile.GetStatus().Dirty, "changes unsaved")
+        suite.Expect(profile.Save().Ok, "save accepted")
+        suite.Equal(h.Store.Rows.one.Data.Coins, 7, "snapshot persisted")
+        suite.Expect(not profile.GetStatus().Dirty, "revision acknowledged")
+    )
+    suite.Test("callback failure leaves the prior record usable", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        suite.Throws(func(): profile.Update(func(data):
+            data.Coins = 8
+            throw "failed"
+        ), "failure propagates")
+        suite.Equal(profile.Get().Coins, 0, "no partial publish")
+        profile.Update(func(data): data.Coins = 3)
+        suite.Equal(profile.Get().Coins, 3, "edit gate released")
+    )
+    suite.Test("malformed update values never reach storage", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        local calls = h.Store.Calls
+        for value in [1, false, [], { Bad = 0 / 0 }, { Bad = func(): pass }, { Bad = new Vector2(1, 2) }]:
+            suite.Throws(func(): profile.Update(func(data): return value), "unsupported profile rejected")
+        suite.Equal(h.Store.Calls, calls, "validation is local")
+        suite.Equal(profile.Get().Coins, 0, "prior data retained")
+    )
+    suite.Test("cyclic deep and excessive text updates are rejected", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        local cycle = {}
+        cycle.Self = cycle
+        suite.Throws(func(): profile.Update(func(data): return cycle), "cycle rejected")
+        suite.Throws(func(): profile.Update(func(data): data.Text = string.repeat("x", 65537)), "text bound")
+        local root = {}
+        local node = root
+        for index in range(18):
+            node.Next = {}
+            node = node.Next
+        suite.Throws(func(): profile.Update(func(data): return root), "depth bound")
+    )
+    suite.Test("load failure does not publish defaults or a savable profile", func():
+        local h = Harness()
+        h.Store.Rows.one = { Existing = 10 }
+        h.Store.BeforeFailures = 3
+        local service = h.New("A", nil)
+        local loaded = service.Load("one")
+        suite.Expect(not loaded.Ok and loaded.Profile == nil, "no profile on failed read/claim")
+        suite.Equal(service.GetCount(), 0, "failed registration removed")
+        suite.Equal(h.Store.Rows.one.Existing, 10, "existing value untouched")
+        suite.Equal(h.Store.Calls, 3, "bounded retries")
+    )
+    suite.Test("unknown formats and newer schemas are never overwritten", func():
+        local h = Harness()
+        h.Store.Rows.raw = { Coins = 90 }
+        suite.Equal(h.New("A", nil).Load("raw").Code, "Corrupt", "raw records need explicit migration outside this store")
+        local service = h.New("A", nil)
+        local profile = service.Load("one").Profile
+        profile.Release()
+        h.Store.Rows.one.Schema = 2
+        suite.Equal(h.New("B", nil).Load("one").Code, "NewerSchema", "older code cannot claim newer data")
+        suite.Equal(h.Store.Rows.one.Schema, 2, "newer schema retained")
+    )
+    suite.Test("two sessions cannot hold the same live lease", func():
+        local h = Harness()
+        local first = h.New("A", nil).Load("one").Profile
+        local second = h.New("B", nil)
+        suite.Equal(second.Load("one").Code, "Locked", "second claimant denied")
+        suite.Expect(first.IsActive(), "first remains active")
+        first.Release()
+        suite.Expect(second.Load("one").Ok, "release allows another session")
+    )
+    suite.Test("expired owners cannot save over a new session", func():
+        local h = Harness()
+        local first = h.New("A", nil).Load("one").Profile
+        first.Update(func(data): data.Coins = 99)
+        h.Clock.Now += 121
+        local second = h.New("B", nil).Load("one").Profile
+        second.Update(func(data): data.Coins = 7)
+        second.Save()
+        suite.Expect(not first.Save().Ok, "stale save rejected")
+        suite.Equal(h.Store.Rows.one.Data.Coins, 7, "new session wins")
+    )
+    suite.Test("fences reject a different generation even with the same token", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        h.Store.Rows.one.Fence += 1
+        suite.Equal(profile.Save().Code, "Lost", "generation checked")
+        suite.Expect(not profile.IsActive(), "lost session retired")
+    )
+    suite.Test("commit then load-response failure does not acquire twice", func():
+        local h = Harness()
+        h.Store.AfterFailures = 1
+        local loaded = h.New("A", nil).Load("one")
+        suite.Expect(loaded.Ok, "same claim recovered")
+        suite.Equal(h.Store.Rows.one.Fence, 1, "generation not incremented twice")
+        suite.Equal(h.Store.Calls, 2, "one retry")
+    )
+    suite.Test("commit then release-response failure can be confirmed", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        profile.Update(func(data): data.Coins = 4)
+        h.Store.AfterFailures = 1
+        suite.Expect(profile.Release().Ok, "release receipt recovered")
+        suite.Equal(h.Store.Rows.one.Data.Coins, 4, "data saved")
+        suite.Expect(h.Store.Rows.one.Lock == nil, "lease released")
+    )
+    suite.Test("updates during a save keep their newer dirty revision", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        profile.Update(func(data): data.Coins = 1)
+        h.Store.Hook = func(): profile.Update(func(data): data.Coins = 2)
+        suite.Expect(profile.Save().Ok, "old snapshot saved")
+        suite.Equal(h.Store.Rows.one.Data.Coins, 1, "stable IO snapshot")
+        suite.Equal(profile.Get().Coins, 2, "new local value retained")
+        suite.Expect(profile.GetStatus().Dirty, "new revision remains dirty")
+        profile.Save()
+        suite.Equal(h.Store.Rows.one.Data.Coins, 2, "next save includes new revision")
+    )
+    suite.Test("overlapping saves reject rather than duplicating IO", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        local nested = nil
+        h.Store.Hook = func(): nested = profile.Save()
+        suite.Expect(profile.Save().Ok, "outer save succeeds")
+        suite.Equal(nested.Code, "Busy", "nested save rejected")
+    )
+    suite.Test("failed saves keep data and permit a later retry", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        profile.Update(func(data): data.Coins = 9)
+        h.Store.BeforeFailures = 3
+        suite.Equal(profile.Save().Code, "StoreError", "failure reported")
+        suite.Equal(profile.Get().Coins, 9, "unsaved state retained")
+        suite.Expect(profile.Save().Ok, "retry succeeds")
+    )
+    suite.Test("schema migrations and defaults preserve falsy values", func():
+        local h = Harness()
+        h.New("A", nil).Load("one").Profile.Release()
+        local options = { Name = "Tests", Version = 2, Defaults = { Coins = 100, Enabled = true, Added = 5 }, Migrate = func(data, old, next): data.Migrated = old < next }
+        local profile = h.New("B", options).Load("one").Profile
+        suite.Equal(profile.Get().Coins, 0, "zero is existing data")
+        suite.Equal(profile.Get().Enabled, false, "false is existing data")
+        suite.Equal(profile.Get().Added, 5, "missing default added")
+        suite.Expect(profile.Get().Migrated, "migration ran")
+        profile.Save()
+        suite.Equal(h.Store.Rows.one.Schema, 2, "new schema persisted")
+    )
+    suite.Test("migration failure releases unchanged data", func():
+        local h = Harness()
+        h.New("A", nil).Load("one").Profile.Release()
+        local before = h.Store.Rows.one.Data
+        local migrate = func(data, old, next):
+            data.Coins = 99
+            throw "bad migration"
+        local options = { Name = "Tests", Version = 2, Defaults = {}, Migrate = migrate }
+        suite.Equal(h.New("B", options).Load("one").Code, "Migration", "failed migration reported")
+        suite.Equal(h.Store.Rows.one.Data.Coins, before.Coins, "stored progress untouched")
+        suite.Equal(h.Store.Rows.one.Schema, 1, "stored version unchanged")
+        suite.Expect(h.Store.Rows.one.Lock == nil, "claim released")
+    )
+    suite.Test("autosave ticks are bounded and renew leases", func():
+        local h = Harness()
+        local service = h.New("A", nil)
+        local a = service.Load("a").Profile
+        local b = service.Load("b").Profile
+        a.Update(func(data): data.Coins = 3)
+        h.Clock.Now += 40
+        suite.Equal(service.Step(1).Value.length, 1, "one save cap")
+        suite.Equal(service.Step(1).Value.length, 1, "remaining due profile saved")
+        suite.Equal(h.Store.Rows.a.Data.Coins, 3, "value autosaved")
+        suite.Equal(service.Step(1).Value.length, 0, "nothing due now")
+    )
+    suite.Test("closed signals observe invalidation and isolate errors", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        local calls = 0
+        local observed_active = true
+        profile.Closed.Connect(func(reason):
+            observed_active = profile.IsActive()
+            throw "observer error"
+        )
+        profile.Closed.Connect(func(reason): calls += 1)
+        suite.Expect(profile.Release().Ok, "release survives observer error")
+        suite.Equal(observed_active, false, "inactive before observers")
+        suite.Equal(calls, 1, "later observer ran")
+        suite.Throws(func(): profile.Get(), "closed profile cannot read active data")
+        suite.Equal(profile.Save().Code, "Inactive", "closed profile cannot save")
+    )
+    suite.Test("close drains independent profiles and rejects future loads", func():
+        local h = Harness()
+        local service = h.New("A", nil)
+        service.Load("a")
+        service.Load("b")
+        local report = service.Close(1)
+        suite.Expect(report.Ok, "all released")
+        suite.Equal(report.Released, 2, "two releases")
+        suite.Equal(service.GetCount(), 0, "registry empty")
+        suite.Equal(service.Load("c").Code, "Closed", "new loads refused")
+        suite.Expect(service.Close(1).Ok, "close idempotent")
+    )
+    suite.Test("key and capacity bounds reject before touching storage", func():
+        local h = Harness()
+        local service = h.New("A", { Name = "Tests", Defaults = {}, MaxProfiles = 1 })
+        for key in [nil, false, 1, "", string.repeat("x", 51), "bad\nkey"]:
+            suite.Equal(service.Load(key).Code, "InvalidKey", "bad key rejected")
+        suite.Equal(h.Store.Calls, 0, "no requests for bad keys")
+        service.Load("a")
+        suite.Equal(service.Load("b").Code, "Capacity", "capacity bound")
+        suite.Equal(service.Load("a").Code, "AlreadyLoaded", "duplicate key")
+    )
+    suite.Test("invalid config cannot open a profile", func():
+        local h = Harness()
+        for options in [{ Name = "Tests", Defaults = [] }, { Name = "Tests", Defaults = {}, LeaseSeconds = 10 }, { Name = "Tests", Defaults = {}, LeaseSeconds = 30, AutosaveSeconds = 20 }, { Name = "Tests", Defaults = {}, Version = 1 + 1e-12 }]:
+            suite.Throws(func(): h.New("A", options), "invalid config rejected")
+        suite.Equal(h.Store.Calls, 0, "no storage work")
+    )
+    suite.Test("round-robin autosave does not starve later profiles", func():
+        local h = Harness()
+        local service = h.New("A", { Name = "Tests", Defaults = {}, LeaseSeconds = 30, AutosaveSeconds = 5 })
+        for index in range(12): service.Load("p" + index)
+        h.Clock.Now += 10
+        for index in range(12):
+            service.Step(1)
+            h.Clock.Now += 1
+        for index in range(12):
+            suite.Expect(h.Store.Rows["p" + index].Commit != "", "every due profile receives a turn")
+    )
+    suite.Test("close from an update callback rejects without deadlocking", func():
+        local h = Harness()
+        local service = h.New("A", nil)
+        local profile = service.Load("one").Profile
+        local outcome = nil
+        profile.Update(func(data):
+            outcome = service.Close(1)
+            data.Coins = 2
+        )
+        suite.Equal(outcome.Code, "Busy", "callback close rejected")
+        suite.Expect(not service.IsClosed(), "store remains usable")
+        suite.Equal(profile.Get().Coins, 2, "update finished")
+    )
+    suite.Test("a clock callback cannot leave Get reading a retired slot", func():
+        local h = Harness()
+        local profile = h.New("A", nil).Load("one").Profile
+        h.Clock.Hook = func(): profile.Release()
+        suite.Throws(func(): profile.Get(), "read rejects reentrant release")
+        suite.Expect(not profile.IsActive(), "profile remains closed")
+        suite.Equal(profile.GetStatus().State, "Released", "closed status is readable")
+    )
+    suite.Test("a clock callback cannot leave Update holding a disposed edit gate", func():
+        local h = Harness()
+        local service = h.New("A", nil)
+        local profile = service.Load("one").Profile
+        h.Clock.Hook = func(): profile.Release()
+        suite.Throws(func(): profile.Update(func(data): data.Coins = 5), "mutation rejects reentrant release")
+        suite.Equal(profile.Save().Code, "Inactive", "no write after release")
+        suite.Expect(service.Load("one").Ok, "new session can acquire the key")
+    )
+    suite.Test("closing from the preparation clock cannot publish a profile", func():
+        local h = Harness()
+        local original = h.New("seed", nil).Load("one").Profile
+        original.Update(func(data): data.Coins = 9)
+        original.Release()
+        local service = nil
+        service = h.New("next", { Name = "Tests", Defaults = {}, Version = 2, Migrate = func(data, from, to):
+            h.Clock.Hook = func(): service.Close(0)
+        })
+        local result = service.Load("one")
+        suite.Expect(not result.Ok and result.Profile == nil, "closed load has no handle")
+        suite.Expect(service.IsClosed(), "close remains terminal")
+        suite.Equal(service.GetCount(), 0, "loading entry retired")
+        suite.Equal(h.Store.Rows.one.Data.Coins, 9, "prior data preserved")
+        suite.Expect(h.Store.Rows.one.Lock == nil, "failed preparation released its claim")
+    )
+    suite.Test("the clock cannot create an out-of-range stored lease", func():
+        local h = Harness()
+        h.Clock.Now = 1e15
+        suite.Throws(func(): h.New("A", nil), "clock must leave room for the lease")
+        suite.Equal(h.Store.Calls, 0, "invalid clock makes no storage request")
+        h.Clock.Now = 1e15 - 120
+        local profile = h.New("B", nil).Load("edge").Profile
+        suite.Equal(h.Store.Rows.edge.Lock.ExpiresAt, 1e15, "valid endpoint expiration")
+        suite.Expect(profile.Save().Ok, "boundary lease remains valid metadata")
+        suite.Expect(profile.Release().Ok, "boundary lease can release")
+    )
+    return suite.Report()
+
+return { Run = Run }

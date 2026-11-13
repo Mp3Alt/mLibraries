@@ -1,0 +1,861 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Native controls with explicit ownership and silent setters.
+# local ui = import("/mLibraries/mControls").New({ Parent = screen })
+# ui.Button({ Text = "Continue", OnPressed = func(): print("continue") })
+# ui.Destroy()
+
+local mBind = import("/mLibraries/mBind")
+
+local colors = ["Background", "Surface", "Raised", "Accent", "Text", "Muted", "Border", "Disabled"]
+local numbers = {
+    Radius = [0, 64], Spacing = [0, 128], Padding = [0, 128],
+    Height = [16, 200], TextSize = [4, 80], BorderWidth = [0, 8],
+    AnimationSpeed = [0, 60]
+}
+
+local Finite = func(value):
+    try:
+        return (value < 0 or value >= 0) and not math.is_infinite(value)
+    catch invalid:
+        return false
+
+local Boolean = func(value):
+    if value != true and value != false: throw "mControls requires a boolean."
+    return value
+
+local TextValue = func(value):
+    try:
+        string.substring(value, 0, 0)
+        return value
+    catch invalid:
+        throw "mControls requires text."
+
+local Default = func(value, fallback):
+    if value == nil: return fallback
+    return value
+
+local CopyColor = func(value):
+    try:
+        local channels = [value.R, value.G, value.B, value.A]
+        for channel in channels:
+            if not Finite(channel) or channel < 0 or channel > 1: throw "invalid"
+        return new Color4(channels[0], channels[1], channels[2], channels[3])
+    catch invalid:
+        throw "mControls theme colors require Color4 values."
+
+local CopyOverrides = func(overrides):
+    local copy = {}
+    if overrides == nil: return copy
+    for name in table.keys(overrides):
+        local value = overrides[name]
+        if numbers[name] != nil:
+            local bounds = numbers[name]
+            if not Finite(value) or value < bounds[0] or value > bounds[1]:
+                throw "Invalid mControls theme number: " + name
+            copy[name] = value
+        else:
+            local known = false
+            for color in colors:
+                if name == color: known = true
+            if not known: throw "Unknown mControls theme token: " + tostring(name)
+            copy[name] = CopyColor(value)
+    return copy
+
+local Theme = func(overrides):
+    local theme = {
+        Background = new Color4(0.07, 0.075, 0.085),
+        Surface = new Color4(0.12, 0.125, 0.14),
+        Raised = new Color4(0.18, 0.185, 0.20),
+        Accent = new Color4(0.33, 0.47, 0.96),
+        Text = new Color4(0.94, 0.945, 0.96),
+        Muted = new Color4(0.61, 0.63, 0.68),
+        Border = new Color4(0.26, 0.27, 0.30),
+        Disabled = new Color4(0.18, 0.19, 0.21),
+        Radius = 7, Spacing = 8, Padding = 12, Height = 36,
+        TextSize = 15, BorderWidth = 1, AnimationSpeed = 20
+    }
+    local copy = CopyOverrides(overrides)
+    for name in table.keys(copy): theme[name] = copy[name]
+    return theme
+
+local MergeTheme = func(base, overrides):
+    local theme = Theme(base)
+    for name in table.keys(overrides):
+        local value = overrides[name]
+        if numbers[name] != nil: theme[name] = value
+        else: theme[name] = CopyColor(value)
+    return theme
+
+local Options = func(options):
+    if options == nil: return []
+    local result = []
+    if options.length > 256: throw "mControls Dropdown supports at most 256 options."
+    for option in options:
+        TextValue(option)
+        for previous in result:
+            if previous == option: throw "mControls Dropdown options must be unique."
+        result.push(option)
+    return result
+
+local New = func(config):
+    if config == nil or config.Parent == nil: throw "mControls.New requires Parent."
+    local theme = Theme(config.Theme)
+    local auto_step = Boolean(Default(config.AutoStep, true))
+    local scope = mBind.Scope()
+    local entries = {}
+    local overlays = {}
+    local active = nil
+    local frame = nil
+    local hovered = nil
+    local claims = 0
+    local kit = { Scope = scope, Parent = config.Parent, Theme = Theme(theme) }
+
+    local RequireAlive = func():
+        if scope.IsDestroyed(): throw "mControls kit is destroyed."
+
+    local RemoveActive = func(entry):
+        if not entry.Active: return
+        if entry.Previous != nil: entry.Previous.Next = entry.Next
+        else: active = entry.Next
+        if entry.Next != nil: entry.Next.Previous = entry.Previous
+        entry.Active = false
+        entry.Previous = nil
+        entry.Next = nil
+
+    local StopFrame = func():
+        if active == nil and table.count(overlays) == 0 and frame != nil:
+            local connection = frame
+            frame = nil
+            connection.Disconnect()
+
+    local Step = func(delta):
+        RequireAlive()
+        if not Finite(delta) or delta < 0: throw "mControls.Step requires a finite nonnegative delta."
+        local ticket = claims++
+        if ticket != 0: throw "mControls.Step is busy."
+        try:
+            local current = active
+            while current != nil:
+                local next_entry = current.Next
+                if current.Scope.IsDestroyed():
+                    RemoveActive(current)
+                else:
+                    local next_value = current.Target
+                    if current.Theme.AnimationSpeed > 0:
+                        next_value = current.Visual + (current.Target - current.Visual) * (1 - math.exp(-current.Theme.AnimationSpeed * delta))
+                    if math.abs(next_value - current.Target) < 0.001:
+                        next_value = current.Target
+                        RemoveActive(current)
+                    current.Visual = next_value
+                    current.Render(next_value)
+                current = next_entry
+            if table.count(overlays) > 0:
+                for overlay in table.values(overlays):
+                    if overlay.Scope.IsDestroyed(): table.remove(overlays, overlay)
+                    else: overlay.Place()
+            StopFrame()
+        finally:
+            claims = 0
+
+    local StartFrame = func():
+        if auto_step and frame == nil:
+            frame = game.TimeSystem.FrameStepped.Connect(func(delta):
+                if not scope.IsDestroyed(): Step(delta)
+            )
+
+    local Animate = func(entry, target):
+        entry.Target = target
+        if entry.Theme.AnimationSpeed <= 0:
+            RemoveActive(entry)
+            entry.Visual = target
+            entry.Render(target)
+            StopFrame()
+            return
+        if math.abs(entry.Visual - target) < 0.001:
+            entry.Visual = target
+            entry.Render(target)
+            return
+        if not entry.Active:
+            entry.Active = true
+            entry.Previous = nil
+            entry.Next = active
+            if active != nil: active.Previous = entry
+            active = entry
+        StartFrame()
+
+    local CanUse = func(entry):
+        if entry.Scope.IsDestroyed() or entry.Disabled: return false
+        local current = entry.Root
+        if not current.IsInDataModel: return false
+        while current != nil:
+            if current.IsA("VisualInstance") and not current.Visible: return false
+            current = current.Parent
+        return true
+
+    local LocalPoint = func(root, point):
+        local current = root
+        while current != nil:
+            if current.IsA("ScreenUI"): return current.ViewportToLocal(point)
+            if current.IsA("UIObject"):
+                local scale = current.Scale
+                if current.Rotation != 0 or scale.X != 1 or scale.Y != 1:
+                    throw "mControls pointer drags require untransformed UIObject ancestors."
+            current = current.Parent
+        return point
+
+    local Common = func(cfg, width, height):
+        local size = Default(cfg.Size, new Vector2(width, height))
+        local properties = {
+            Name = Default(cfg.Name, "mControl"),
+            Size = size, MinSize = Default(cfg.MinSize, size),
+            Position = Default(cfg.Position, new Vector2()),
+            Pivot = Default(cfg.Pivot, new Vector2()),
+            AnchorLeft = Default(cfg.AnchorLeft, 0), AnchorRight = Default(cfg.AnchorRight, 0),
+            AnchorTop = Default(cfg.AnchorTop, 0), AnchorBottom = Default(cfg.AnchorBottom, 0),
+            Visible = Boolean(Default(cfg.Visible, true)),
+            FlexRatio = Default(cfg.FlexRatio, 0), FitContents = Default(cfg.FitContents, UIContentFit.None),
+            ZIndex = Default(cfg.ZIndex, 0),
+            Parent = Default(cfg.Parent, kit.Parent)
+        }
+        return properties
+
+    local Make = func(cfg, build):
+        RequireAlive()
+        if cfg == nil: cfg = {}
+        local own_theme = CopyOverrides(cfg.Theme)
+        local disabled = Boolean(Default(cfg.Disabled, false))
+        local component_scope = scope.Child()
+        local entry = {
+            Scope = component_scope, Disabled = disabled,
+            Theme = MergeTheme(theme, own_theme), Overrides = own_theme,
+            Active = false, Next = nil, Previous = nil,
+            Cancel = func(): pass
+        }
+        local handle = { Scope = component_scope }
+        entry.Handle = handle
+        local Check = func():
+            RequireAlive()
+            if component_scope.IsDestroyed(): throw "mControls component is destroyed."
+        handle.IsDestroyed = expr(): component_scope.IsDestroyed()
+        handle.Destroy = func():
+            if component_scope.IsDestroyed(): return
+            entry.Cancel()
+            RemoveActive(entry)
+            if hovered == entry: hovered = nil
+            table.remove(entries, handle)
+            component_scope.Destroy()
+            StopFrame()
+        handle.SetVisible = func(value):
+            Check()
+            entry.Root.Visible = Boolean(value)
+            if not value:
+                entry.Cancel()
+                if hovered == entry: hovered = nil
+        handle.SetDisabled = func(value):
+            Check()
+            entry.Disabled = Boolean(value)
+            if value: entry.Cancel()
+            entry.Refresh()
+        handle.GetDisabled = expr(): entry.Disabled
+        handle.SetTheme = func(overrides):
+            Check()
+            local copy = CopyOverrides(overrides)
+            local next_theme = MergeTheme(theme, copy)
+            entry.Overrides = copy
+            entry.Theme = next_theme
+            entry.Refresh()
+        handle.GetTheme = expr(): Theme(entry.Theme)
+        try:
+            build(entry, handle, cfg, Check)
+            handle.Root = entry.Root
+            component_scope.On(entry.Root, "Destroyed", func(): component_scope.Destroy())
+            entry.Refresh()
+            entries[handle] = entry
+            component_scope.Add(func():
+                RemoveActive(entry)
+                table.remove(overlays, entry)
+                if hovered == entry: hovered = nil
+                table.remove(entries, handle)
+                StopFrame()
+            )
+            return handle
+        catch failure:
+            component_scope.Destroy()
+            throw failure
+
+    local WireHover = func(entry):
+        entry.Scope.On(entry.Root, "PointerEnter", func():
+            if CanUse(entry): hovered = entry
+        )
+        entry.Scope.On(entry.Root, "PointerExit", func():
+            if hovered == entry: hovered = nil
+        )
+
+    local PaintPanel = func(root, tokens, color):
+        root.Color = color
+        root.BorderColor = tokens.Border
+        root.BorderWidth = tokens.BorderWidth
+        root.Roundness = tokens.Radius
+
+    local PaintText = func(root, tokens, disabled):
+        root.TextSize = tokens.TextSize
+        root.TextColor = tokens.Text
+        if disabled: root.TextColor = tokens.Muted
+
+    local MakeButton = func(cfg, image):
+        return Make(cfg, func(entry, handle, options, check):
+            local p = Common(options, 240, entry.Theme.Height)
+            p.Text = TextValue(Default(options.Text, ""))
+            p.FontName = FontName.OpenSans
+            p.TextAlignment = UITextAlignment.Center
+            p.TextVerticalAlignment = UITextVerticalAlignment.Center
+            p.AutoTintColor = true
+            local root = entry.Scope.New("UIButton", p)
+            entry.Root = root
+            if image:
+                local image_id = TextValue(Default(options.ImageId, ""))
+                if image_id == "": throw "mControls.IconButton requires ImageId."
+                root.Text = ""
+                local icon = entry.Scope.New("UIPanel", { Name = "Icon", Size = new Vector2(20, 20), AnchorLeft = 0.5, AnchorRight = 0.5, AnchorTop = 0.5, AnchorBottom = 0.5, Pivot = new Vector2(0.5, 0.5), BlocksPointer = false, Parent = root })
+                entry.Scope.New("UIBackgroundImage", { ImageId = image_id, Fit = UIImageFit.Stretch, Parent = icon })
+                handle.Icon = icon
+            entry.Refresh = func():
+                PaintPanel(root, entry.Theme, entry.Theme.Raised)
+                PaintText(root, entry.Theme, entry.Disabled)
+                root.Disabled = entry.Disabled
+                if image: handle.Icon.Color = entry.Theme.Text
+            handle.SetText = func(value):
+                check()
+                root.Text = TextValue(value)
+            handle.Activate = func():
+                if not CanUse(entry): return false
+                if options.OnPressed != nil: options.OnPressed()
+                return true
+            entry.Key = func(key):
+                if key == KeyName.Space or key == KeyName.Enter: handle.Activate()
+            entry.Scope.On(root, "Pressed", handle.Activate)
+            WireHover(entry)
+        )
+
+    kit.Button = expr(cfg): MakeButton(cfg, false)
+    kit.IconButton = expr(cfg): MakeButton(cfg, true)
+
+    kit.Panel = func(cfg):
+        return Make(cfg, func(entry, handle, options, check):
+            entry.Root = entry.Scope.New("UIPanel", Common(options, 240, 160))
+            entry.Root.ClipsChildren = Boolean(Default(options.ClipsChildren, false))
+            entry.Refresh = func(): PaintPanel(entry.Root, entry.Theme, entry.Theme.Surface)
+            handle.Content = entry.Root
+        )
+
+    kit.Text = func(cfg):
+        return Make(cfg, func(entry, handle, options, check):
+            local p = Common(options, 240, entry.Theme.Height)
+            p.Text = TextValue(Default(options.Text, ""))
+            p.FontName = FontName.OpenSans
+            p.TextAlignment = Default(options.TextAlignment, UITextAlignment.Left)
+            p.TextVerticalAlignment = UITextVerticalAlignment.Center
+            p.WrapText = Boolean(Default(options.WrapText, false))
+            p.BlocksPointer = false
+            entry.Root = entry.Scope.New("UITextPanel", p)
+            entry.Refresh = func():
+                entry.Root.Color = new Color4(0, 0, 0, 0)
+                PaintText(entry.Root, entry.Theme, entry.Disabled)
+            handle.SetText = func(value):
+                check()
+                entry.Root.Text = TextValue(value)
+        )
+
+    kit.Input = func(cfg):
+        return Make(cfg, func(entry, handle, options, check):
+            local value = TextValue(Default(options.Value, ""))
+            local p = Common(options, 240, entry.Theme.Height)
+            p.Text = value
+            p.Placeholder = TextValue(Default(options.Placeholder, ""))
+            p.FontName = FontName.OpenSans
+            p.MaxLength = Default(options.MaxLength, 1024)
+            p.BlurOnSubmit = Boolean(Default(options.BlurOnSubmit, true))
+            p.SelectAllOnFocus = Boolean(Default(options.SelectAllOnFocus, false))
+            local root = entry.Scope.New("UITextInput", p)
+            entry.Root = root
+            value = root.Text
+            local silent = 0
+            entry.Cancel = func(): root.Blur()
+            entry.Refresh = func():
+                PaintPanel(root, entry.Theme, entry.Theme.Raised)
+                PaintText(root, entry.Theme, entry.Disabled)
+                root.Padding = new Vector2(entry.Theme.Padding, math.max(0, (root.Size.Y - entry.Theme.TextSize * 1.4) / 2))
+                root.PlaceholderColor = entry.Theme.Muted
+                root.CaretColor = entry.Theme.Text
+                root.SelectionColor = entry.Theme.Accent
+                root.Editable = not entry.Disabled
+            handle.GetValue = expr(): value
+            handle.SetValue = func(next_value):
+                check()
+                local text = TextValue(next_value)
+                if text == value: return
+                silent++
+                try:
+                    root.Text = text
+                    value = root.Text
+                finally:
+                    silent--
+            handle.SetPlaceholder = func(text):
+                check()
+                root.Placeholder = TextValue(text)
+            entry.Scope.On(root, "TextChanged", func(next_value):
+                if entry.Scope.IsDestroyed() or silent > 0: return
+                if not CanUse(entry):
+                    if root.Text != value: root.Text = value
+                    return
+                if next_value != root.Text or next_value == value: return
+                value = next_value
+                if options.OnChanged != nil: options.OnChanged(value)
+            )
+            entry.Scope.On(root, "Submitted", func(next_value):
+                if CanUse(entry) and options.OnSubmitted != nil: options.OnSubmitted(value)
+            )
+        )
+
+    local MakeBoolean = func(cfg, toggle):
+        return Make(cfg, func(entry, handle, options, check):
+            local value = Boolean(Default(options.Value, false))
+            local p = Common(options, 240, entry.Theme.Height)
+            p.Text = ""
+            p.AutoTintColor = true
+            local root = entry.Scope.New("UIButton", p)
+            entry.Root = root
+            local label = entry.Scope.New("UITextPanel", { Name = "Label", Text = TextValue(Default(options.Text, "")), FontName = FontName.OpenSans, Position = new Vector2(12, 0), AnchorRight = 1, AnchorBottom = 1, Size = new Vector2(-76, 0), TextVerticalAlignment = UITextVerticalAlignment.Center, Color = new Color4(0, 0, 0, 0), BlocksPointer = false, Parent = root })
+            local track = entry.Scope.New("UIPanel", { Name = "Track", AnchorLeft = 1, AnchorRight = 1, AnchorTop = 0.5, AnchorBottom = 0.5, Position = new Vector2(-12, 0), Pivot = new Vector2(1, 0.5), Size = new Vector2(22, 22), BlocksPointer = false, Parent = root })
+            local thumb = nil
+            if toggle:
+                track.Size = new Vector2(40, 22)
+                thumb = entry.Scope.New("UICircle", { Name = "Thumb", Size = new Vector2(16, 16), Position = new Vector2(3, 3), BlocksPointer = false, Parent = track })
+            else:
+                thumb = entry.Scope.New("UIPanel", { Name = "Mark", Size = new Vector2(10, 10), Position = new Vector2(6, 6), Roundness = 2, BlocksPointer = false, Parent = track })
+            entry.Visual = 0
+            if value: entry.Visual = 1
+            entry.Target = entry.Visual
+            entry.Render = func(amount):
+                if entry.Scope.IsDestroyed(): return
+                if toggle: thumb.Position = new Vector2(3 + 18 * amount, 3)
+                else: thumb.Transparency = 1 - amount
+            entry.Refresh = func():
+                PaintPanel(root, entry.Theme, entry.Theme.Surface)
+                root.Disabled = entry.Disabled
+                PaintText(label, entry.Theme, entry.Disabled)
+                PaintPanel(track, entry.Theme, entry.Theme.Raised)
+                track.Roundness = 4
+                if toggle: track.Roundness = 11
+                if value: track.Color = entry.Theme.Accent
+                if entry.Disabled: track.Color = entry.Theme.Disabled
+                thumb.Color = entry.Theme.Text
+                entry.Render(entry.Visual)
+            handle.GetValue = expr(): value
+            handle.SetValue = func(next_value):
+                check()
+                value = Boolean(next_value)
+                entry.Refresh()
+                local target = 0
+                if value: target = 1
+                Animate(entry, target)
+            handle.SetText = func(text):
+                check()
+                label.Text = TextValue(text)
+            handle.Activate = func():
+                if not CanUse(entry): return false
+                handle.SetValue(not value)
+                if options.OnChanged != nil: options.OnChanged(value)
+                return true
+            entry.Key = func(key):
+                if key == KeyName.Space or key == KeyName.Enter: handle.Activate()
+            entry.Scope.On(root, "Pressed", handle.Activate)
+            WireHover(entry)
+        )
+
+    kit.Checkbox = expr(cfg): MakeBoolean(cfg, false)
+    kit.Toggle = expr(cfg): MakeBoolean(cfg, true)
+    kit.Switch = kit.Toggle
+
+    local MakeRange = func(cfg, interactive):
+        return Make(cfg, func(entry, handle, options, check):
+            local minimum = Default(options.Min, 0)
+            local maximum = Default(options.Max, 1)
+            local increment = Default(options.Step, 0)
+            if not Finite(minimum) or not Finite(maximum) or maximum <= minimum or not Finite(maximum - minimum):
+                throw "mControls range requires finite Min < Max."
+            if not Finite(increment) or increment < 0: throw "mControls range Step must be finite and nonnegative."
+            local Normalize = func(next_value):
+                if not Finite(next_value): throw "mControls range requires a finite value."
+                local result = math.clamp(next_value, minimum, maximum)
+                if increment > 0:
+                    local steps = (result - minimum) / increment
+                    if not math.is_infinite(steps):
+                        result = minimum + math.round(steps) * increment
+                return math.clamp(result, minimum, maximum)
+            local value = Normalize(Default(options.Value, minimum))
+            local p = Common(options, 240, entry.Theme.Height)
+            p.Text = ""
+            p.AutoTintColor = false
+            local root = entry.Scope.New("UIButton", p)
+            entry.Root = root
+            local track = entry.Scope.New("UIPanel", { Name = "Track", Position = new Vector2(12, -3), AnchorTop = 0.5, AnchorBottom = 0.5, AnchorRight = 1, Size = new Vector2(-24, 6), Roundness = 3, BlocksPointer = false, Parent = root })
+            local fill = entry.Scope.New("UIPanel", { Name = "Fill", AnchorBottom = 1, Size = new Vector2(), Roundness = 3, BlocksPointer = false, Parent = track })
+            local thumb = nil
+            if interactive:
+                thumb = entry.Scope.New("UICircle", { Name = "Thumb", AnchorTop = 0.5, AnchorBottom = 0.5, Pivot = new Vector2(0.5, 0.5), Size = new Vector2(16, 16), BlocksPointer = false, Parent = track })
+            entry.Visual = (value - minimum) / (maximum - minimum)
+            entry.Target = entry.Visual
+            entry.Render = func(amount):
+                if entry.Scope.IsDestroyed(): return
+                fill.AnchorRight = amount
+                if thumb != nil:
+                    thumb.AnchorLeft = amount
+                    thumb.AnchorRight = amount
+            entry.Refresh = func():
+                root.Color = entry.Theme.Surface
+                root.Roundness = entry.Theme.Radius
+                root.Disabled = entry.Disabled or not interactive
+                track.Color = entry.Theme.Raised
+                fill.Color = entry.Theme.Accent
+                if entry.Disabled: fill.Color = entry.Theme.Muted
+                if thumb != nil: thumb.Color = entry.Theme.Text
+                entry.Render(entry.Visual)
+            local dragging = false
+            local origin = value
+            entry.Cancel = func(): dragging = false
+            handle.GetValue = expr(): value
+            handle.SetValue = func(next_value):
+                check()
+                local normalized = Normalize(next_value)
+                if not (normalized < value or normalized > value): return
+                value = normalized
+                Animate(entry, (value - minimum) / (maximum - minimum))
+            local Request = func(next_value):
+                if not CanUse(entry): return false
+                local normalized = Normalize(next_value)
+                if not (normalized < value or normalized > value): return false
+                value = normalized
+                Animate(entry, (value - minimum) / (maximum - minimum))
+                if options.OnChanged != nil: options.OnChanged(value)
+                return true
+            local AtPoint = func(point):
+                local size = track.AbsoluteSize.X
+                if size <= 0: return
+                local local_point = LocalPoint(track, point)
+                Request(minimum + math.clamp((local_point.X - track.AbsolutePosition.X) / size, 0, 1) * (maximum - minimum))
+            if interactive:
+                entry.Key = func(key):
+                    local step = increment
+                    if step <= 0: step = (maximum - minimum) / 100
+                    if key == KeyName.Left or key == KeyName.Down: Request(value - step)
+                    elif key == KeyName.Right or key == KeyName.Up: Request(value + step)
+                    elif key == KeyName.Home: Request(minimum)
+                    elif key == KeyName.End: Request(maximum)
+                entry.Scope.On(root, "Pressed", func():
+                    if CanUse(entry): AtPoint(game.InputSystem.Mouse.Position)
+                )
+                entry.Scope.On(root, "DragStarted", func(drag):
+                    if not CanUse(entry): return
+                    origin = value
+                    dragging = true
+                    AtPoint(drag.Position)
+                )
+                entry.Scope.On(root, "Dragged", func(drag):
+                    if dragging and CanUse(entry): AtPoint(drag.Position)
+                )
+                entry.Scope.On(root, "DragEnded", func(drag):
+                    if not dragging: return
+                    dragging = false
+                    if drag.Cancelled: Request(origin)
+                    elif CanUse(entry): AtPoint(drag.Position)
+                )
+                WireHover(entry)
+        )
+
+    kit.Slider = expr(cfg): MakeRange(cfg, true)
+    kit.Progress = expr(cfg): MakeRange(cfg, false)
+
+    kit.Dropdown = func(cfg):
+        return Make(cfg, func(entry, handle, options, check):
+            local choices = Options(options.Options)
+            local value = nil
+            local open = false
+            local p = Common(options, 240, entry.Theme.Height)
+            p.Text = ""
+            p.FontName = FontName.OpenSans
+            p.TextVerticalAlignment = UITextVerticalAlignment.Center
+            p.TextAlignment = UITextAlignment.Left
+            local root = entry.Scope.New("UIButton", p)
+            entry.Root = root
+            local portal = entry.Scope.New("ScreenUI", { Name = "mDropdownPortal", Visible = false, UseSafeArea = false, Scale = 1, MobileScale = 1, Parent = game.UICanvas })
+            local popup = entry.Scope.New("UIScrollPanel", { Name = "Options", Size = new Vector2(240, math.min(240, choices.length * entry.Theme.Height + 8)), Visible = false, ScrollX = false, ScrollY = true, ScrollbarWidth = 4, Parent = portal })
+            local column = entry.Scope.New("UIVerticalLayout", { AnchorRight = 1, Size = new Vector2(), Padding = new Vector2(4, 4), FitContents = UIContentFit.Y, Parent = popup })
+            local buttons = []
+            local RefreshText = func():
+                if value == nil: root.Text = TextValue(Default(options.Placeholder, "Select"))
+                else: root.Text = value
+            local SetValue = func(next_value):
+                check()
+                if next_value != nil:
+                    local found = false
+                    for choice in choices:
+                        if choice == next_value: found = true
+                    if not found: throw "mControls Dropdown value is not an option."
+                value = next_value
+                RefreshText()
+            local Select = func(choice):
+                if not CanUse(entry): return false
+                local changed = choice != value
+                SetValue(choice)
+                entry.Cancel()
+                if changed and options.OnChanged != nil: options.OnChanged(value)
+                return changed
+            entry.Cancel = func():
+                open = false
+                popup.Visible = false
+                portal.Visible = false
+                table.remove(overlays, entry)
+                StopFrame()
+            entry.Place = func():
+                if not open: return
+                if not CanUse(entry):
+                    entry.Cancel()
+                    return
+                local current = root.Parent
+                local source_screen = nil
+                local position = root.AbsolutePosition
+                local size = root.AbsoluteSize
+                if size.X <= 0 or size.Y <= 0:
+                    entry.Cancel()
+                    return
+                while current != nil:
+                    if current.IsA("ScreenUI"):
+                        source_screen = current
+                        break
+                    if current.IsA("UIObject") and (current.IsA("UIScrollPanel") or current.ClipsChildren):
+                        local clip_position = current.AbsolutePosition
+                        local clip_size = current.AbsoluteSize
+                        if position.X < clip_position.X or position.Y < clip_position.Y or position.X + size.X > clip_position.X + clip_size.X or position.Y + size.Y > clip_position.Y + clip_size.Y:
+                            entry.Cancel()
+                            return
+                    current = current.Parent
+                if source_screen == nil:
+                    entry.Cancel()
+                    return
+                # Screen scaling is supported; UIObject transforms are not part
+                # of the engine's AbsolutePosition/AbsoluteSize coordinates.
+                LocalPoint(root, new Vector2())
+                portal.Scale = source_screen.Scale
+                portal.MobileScale = source_screen.MobileScale
+                portal.DisplayOrder = source_screen.DisplayOrder + 1
+                local point = portal.ViewportToLocal(source_screen.LocalToViewport(position))
+                local extent = portal.ViewportToLocal(source_screen.LocalToViewport(size))
+                local viewport = portal.ViewportToLocal(game.UICanvas.ViewportSize)
+                if point.X + extent.X <= 0 or point.Y + extent.Y <= 0 or point.X >= viewport.X or point.Y >= viewport.Y:
+                    entry.Cancel()
+                    return
+                local height = math.min(240, choices.length * entry.Theme.Height + 8)
+                local below = math.max(0, viewport.Y - point.Y - extent.Y - 4)
+                local above = math.max(0, point.Y - 4)
+                local y = point.Y + extent.Y + 4
+                if below < height and above > below:
+                    height = math.min(height, above)
+                    y = point.Y - height - 4
+                else: height = math.min(height, below)
+                if height <= 0:
+                    entry.Cancel()
+                    return
+                popup.Position = new Vector2(math.clamp(point.X, 0, math.max(0, viewport.X - extent.X)), y)
+                popup.Size = new Vector2(math.min(extent.X, viewport.X), height)
+                portal.Visible = true
+                popup.Visible = true
+            for choice in choices:
+                local selected = choice
+                local button = entry.Scope.New("UIButton", { Name = "Option", Text = choice, MinSize = new Vector2(0, entry.Theme.Height), FontName = FontName.OpenSans, TextVerticalAlignment = UITextVerticalAlignment.Center, TextAlignment = UITextAlignment.Left, Parent = column })
+                buttons.push(button)
+                entry.Scope.On(button, "Pressed", func(): Select(selected))
+            entry.Refresh = func():
+                PaintPanel(root, entry.Theme, entry.Theme.Raised)
+                PaintText(root, entry.Theme, entry.Disabled)
+                root.Padding = new Vector2(entry.Theme.Padding, 0)
+                root.Disabled = entry.Disabled
+                PaintPanel(popup, entry.Theme, entry.Theme.Background)
+                popup.ScrollbarColor = entry.Theme.Muted
+                popup.ScrollbarTrackColor = new Color4(0, 0, 0, 0)
+                for button in buttons:
+                    PaintPanel(button, entry.Theme, entry.Theme.Surface)
+                    PaintText(button, entry.Theme, entry.Disabled)
+                    button.Padding = new Vector2(entry.Theme.Padding, 0)
+                    button.Disabled = entry.Disabled
+            handle.GetValue = expr(): value
+            handle.SetValue = SetValue
+            handle.Activate = func():
+                if not CanUse(entry): return false
+                handle.SetOpen(not open)
+                return true
+            handle.SetOpen = func(next_open):
+                check()
+                if not Boolean(next_open) or not CanUse(entry):
+                    entry.Cancel()
+                    return
+                open = true
+                try:
+                    entry.Place()
+                    if open:
+                        overlays[entry] = entry
+                        StartFrame()
+                catch failure:
+                    entry.Cancel()
+                    throw failure
+            handle.GetOpen = expr(): open
+            handle.Popup = popup
+            handle.Portal = portal
+            entry.Key = func(key):
+                if key == KeyName.Escape: entry.Cancel()
+                elif key == KeyName.Enter or key == KeyName.Space: handle.Activate()
+                elif choices.length > 0 and (key == KeyName.Up or key == KeyName.Down):
+                    local index = -1
+                    for at in range(choices.length):
+                        if choices[at] == value: index = at
+                    if key == KeyName.Up: index = math.max(0, index - 1)
+                    else: index = math.min(choices.length - 1, index + 1)
+                    Select(choices[index])
+            SetValue(options.Value)
+            entry.Scope.On(root, "Pressed", handle.Activate)
+            WireHover(entry)
+        )
+
+    kit.Separator = func(cfg):
+        return Make(cfg, func(entry, handle, options, check):
+            entry.Root = entry.Scope.New("UIPanel", Common(options, 240, 1))
+            entry.Root.BlocksPointer = false
+            entry.Refresh = func(): entry.Root.Color = entry.Theme.Border
+        )
+
+    kit.Scroll = func(cfg):
+        return Make(cfg, func(entry, handle, options, check):
+            local p = Common(options, 240, 200)
+            p.ScrollX = Boolean(Default(options.ScrollX, false))
+            p.ScrollY = Boolean(Default(options.ScrollY, true))
+            p.ScrollbarWidth = 4
+            entry.Root = entry.Scope.New("UIScrollPanel", p)
+            handle.Content = entry.Root
+            entry.Refresh = func():
+                PaintPanel(entry.Root, entry.Theme, entry.Theme.Surface)
+                entry.Root.ScrollbarColor = entry.Theme.Muted
+                entry.Root.ScrollbarTrackColor = new Color4(0, 0, 0, 0)
+                entry.Root.ScrollEnabled = not entry.Disabled
+        )
+
+    local MakeLayout = func(cfg, vertical):
+        return Make(cfg, func(entry, handle, options, check):
+            local p = Common(options, 240, entry.Theme.Height)
+            p.Spacing = Default(options.Spacing, entry.Theme.Spacing)
+            p.Padding = Default(options.Padding, new Vector2())
+            p.MainAlign = Default(options.MainAlign, UIMainAlignment.Start)
+            p.CrossAlign = Default(options.CrossAlign, UICrossAlignment.Stretch)
+            local class_name = "UIHorizontalLayout"
+            if vertical: class_name = "UIVerticalLayout"
+            entry.Root = entry.Scope.New(class_name, p)
+            handle.Content = entry.Root
+            entry.Refresh = func():
+                entry.Root.Spacing = Default(options.Spacing, entry.Theme.Spacing)
+        )
+
+    kit.Row = expr(cfg): MakeLayout(cfg, false)
+    kit.Column = expr(cfg): MakeLayout(cfg, true)
+
+    kit.Window = func(cfg):
+        return Make(cfg, func(entry, handle, options, check):
+            local root = entry.Scope.New("UIPanel", Common(options, 360, 260))
+            entry.Root = root
+            root.Modal = Boolean(Default(options.Modal, false))
+            local titlebar = entry.Scope.New("UIPanel", { Name = "Titlebar", AnchorRight = 1, Size = new Vector2(0, 40), Parent = root })
+            local title = entry.Scope.New("UITextPanel", { Name = "Title", Text = TextValue(Default(options.Text, "Window")), FontName = FontName.OpenSansBold, Position = new Vector2(12, 0), AnchorRight = 1, Size = new Vector2(-92, 40), TextVerticalAlignment = UITextVerticalAlignment.Center, Color = new Color4(0, 0, 0, 0), BlocksPointer = false, Parent = titlebar })
+            local close = entry.Scope.New("UIButton", { Name = "Close", Text = "Close", FontName = FontName.OpenSans, Position = new Vector2(-8, 8), AnchorLeft = 1, AnchorRight = 1, Pivot = new Vector2(1, 0), Size = new Vector2(64, 24), TextVerticalAlignment = UITextVerticalAlignment.Center, Parent = titlebar })
+            handle.Content = entry.Scope.New("UIPanel", { Name = "Content", Position = new Vector2(0, 40), AnchorRight = 1, AnchorBottom = 1, Size = new Vector2(0, -40), Color = new Color4(0, 0, 0, 0), Parent = root })
+            local dragging = false
+            local grabbed = new Vector2()
+            local start = new Vector2()
+            entry.Cancel = func(): dragging = false
+            entry.Refresh = func():
+                PaintPanel(root, entry.Theme, entry.Theme.Background)
+                PaintPanel(titlebar, entry.Theme, entry.Theme.Surface)
+                PaintPanel(close, entry.Theme, entry.Theme.Raised)
+                PaintText(title, entry.Theme, entry.Disabled)
+                PaintText(close, entry.Theme, entry.Disabled)
+                close.Disabled = entry.Disabled
+            handle.SetText = func(text):
+                check()
+                title.Text = TextValue(text)
+            handle.Close = func():
+                if not CanUse(entry): return false
+                handle.SetVisible(false)
+                if options.OnClosed != nil: options.OnClosed()
+                return true
+            entry.Scope.On(close, "Pressed", handle.Close)
+            if Boolean(Default(options.Draggable, true)):
+                entry.Scope.On(titlebar, "DragStarted", func(drag):
+                    if not CanUse(entry) or root.IsLayoutDriven: return
+                    grabbed = root.Position
+                    start = LocalPoint(root, drag.StartPosition)
+                    dragging = true
+                    root.Position = grabbed + LocalPoint(root, drag.Position) - start
+                )
+                entry.Scope.On(titlebar, "Dragged", func(drag):
+                    if dragging and CanUse(entry): root.Position = grabbed + LocalPoint(root, drag.Position) - start
+                )
+                entry.Scope.On(titlebar, "DragEnded", func(drag):
+                    if not dragging: return
+                    dragging = false
+                    if drag.Cancelled: root.Position = grabbed
+                    elif CanUse(entry): root.Position = grabbed + LocalPoint(root, drag.Position) - start
+                )
+        )
+
+    kit.Step = Step
+    kit.SetTheme = func(overrides):
+        RequireAlive()
+        local next_theme = Theme(overrides)
+        theme = next_theme
+        kit.Theme = Theme(theme)
+        for entry in table.values(entries):
+            if not entry.Scope.IsDestroyed():
+                entry.Theme = MergeTheme(theme, entry.Overrides)
+                entry.Refresh()
+    kit.Destroy = func(): scope.Destroy()
+    kit.IsDestroyed = expr(): scope.IsDestroyed()
+    kit.GetCount = expr(): table.count(entries)
+    kit.GetActiveCount = func():
+        local count = 0
+        local entry = active
+        while entry != nil:
+            count += 1
+            entry = entry.Next
+        return count
+    kit.GetOverlayCount = expr(): table.count(overlays)
+    scope.Add(func():
+        if frame != nil:
+            frame.Disconnect()
+            frame = nil
+        active = nil
+        table.clear(overlays)
+        hovered = nil
+        table.clear(entries)
+    )
+    try:
+        local keys = game.InputSystem.KeyPressed.Connect(func(key):
+            local entry = hovered
+            if entry == nil or scope.IsDestroyed(): return
+            if game.UiFocus.Focused != nil or not CanUse(entry): return
+            if entry.Key != nil: entry.Key(key)
+        )
+        scope.Add(func(): keys.Disconnect())
+    catch failure:
+        scope.Destroy()
+        throw failure
+    return kit
+
+return { New = New, Theme = Theme }

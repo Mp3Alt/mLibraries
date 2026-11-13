@@ -1,0 +1,154 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Reactive themed components over mReactive and mControls.
+# local ui = import("/mLibraries/mWidgets").New({ Parent = screen })
+# local enabled = ui.Scope.Value(false)
+# ui.Toggle({ Text = "Music", Value = enabled, OnChanged = enabled.Set })
+# ui.Destroy()
+
+local mReactive = import("/mLibraries/mReactive")
+local mControls = import("/mLibraries/mControls")
+
+local names = ["Panel", "Text", "Button", "IconButton", "Input", "Checkbox", "Toggle", "Switch", "Slider", "Dropdown", "Progress", "Separator", "Scroll", "Row", "Column", "Window"]
+local fields = ["Text", "Value", "Visible", "Disabled", "Theme", "Placeholder"]
+
+local IsSource = func(value):
+    if value == nil: return false
+    try:
+        return value.Get != nil and value.Observe != nil
+    catch invalid:
+        return false
+
+local Read = func(value):
+    if IsSource(value): return value.Get()
+    return value
+
+local New = func(config):
+    if config == nil or config.Parent == nil: throw "mWidgets.New requires Parent."
+    local automatic = config.AutoStep
+    if automatic == nil: automatic = true
+    if automatic != true and automatic != false: throw "mWidgets AutoStep requires a boolean."
+    local initial_theme = Read(config.Theme)
+    local theme_source = nil
+    if IsSource(config.Theme): theme_source = config.Theme
+    local scope = mReactive.Scope({ AutoStep = false })
+    local controls = nil
+    local entries = {}
+    local kit = { Scope = scope, Parent = config.Parent }
+    local Check = func():
+        if scope.IsDestroyed(): throw "mWidgets kit is destroyed."
+    try:
+        controls = mControls.New({ Parent = config.Parent, Theme = initial_theme, AutoStep = false })
+        scope.Add(controls.Destroy)
+        kit.Theme = controls.Theme
+        if theme_source != nil:
+            scope.Observe(theme_source, func(next_theme):
+                controls.SetTheme(next_theme)
+                kit.Theme = controls.Theme
+            )
+
+        local Component = func(name, options):
+            Check()
+            if options == nil: options = {}
+            local sources = {}
+            local initial = {}
+            for key in table.keys(options): initial[key] = options[key]
+            for field in fields:
+                local value = options[field]
+                if IsSource(value):
+                    sources[field] = value
+                    initial[field] = value.Get()
+            local component_scope = scope.Child()
+            local control = nil
+            local handle = nil
+            local bindings = {}
+            try:
+                local change = options.OnChanged
+                initial.OnChanged = func(value):
+                    if component_scope.IsDestroyed(): return
+                    try:
+                        if change != nil: change(value)
+                    finally:
+                        # A readable value can be computed or readonly. Only the
+                        # caller decides whether a requested change is committed.
+                        if sources.Value != nil and not component_scope.IsDestroyed():
+                            control.SetValue(sources.Value.Get())
+                initial.OnClosed = func():
+                    if component_scope.IsDestroyed(): return
+                    try:
+                        if options.OnClosed != nil: options.OnClosed()
+                    finally:
+                        if sources.Visible != nil and not component_scope.IsDestroyed():
+                            control.SetVisible(sources.Visible.Get())
+                control = controls[name](initial)
+                component_scope.Add(control.Destroy)
+                component_scope.On(control.Root, "Destroyed", func(): component_scope.Destroy())
+                handle = {}
+                for field in table.keys(control): handle[field] = control[field]
+                handle.Scope = component_scope
+                handle.Control = control
+                handle.Destroy = func(): component_scope.Destroy()
+                handle.IsDestroyed = expr(): component_scope.IsDestroyed()
+                local setters = {
+                    Text = control.SetText, Value = control.SetValue,
+                    Visible = control.SetVisible, Disabled = control.SetDisabled,
+                    Theme = control.SetTheme, Placeholder = control.SetPlaceholder
+                }
+                for field in fields:
+                    local source = sources[field]
+                    if source != nil:
+                        local apply = setters[field]
+                        if apply == nil: throw "mWidgets " + name + " does not support " + field + "."
+                        bindings[field] = component_scope.Observe(source, apply)
+                local GuardSetter = func(field, setter):
+                    if setter == nil: return nil
+                    return func(value):
+                        if component_scope.IsDestroyed(): throw "mWidgets component is destroyed."
+                        if sources[field] != nil:
+                            throw "mWidgets " + field + " is controlled by its readable source."
+                        setter(value)
+                handle.SetText = GuardSetter("Text", control.SetText)
+                handle.SetValue = GuardSetter("Value", control.SetValue)
+                handle.SetVisible = GuardSetter("Visible", control.SetVisible)
+                handle.SetDisabled = GuardSetter("Disabled", control.SetDisabled)
+                handle.SetTheme = GuardSetter("Theme", control.SetTheme)
+                handle.SetPlaceholder = GuardSetter("Placeholder", control.SetPlaceholder)
+                handle.GetBindingError = func(field):
+                    local binding = bindings[field]
+                    if binding == nil: return nil
+                    return binding.GetError()
+                entries[handle] = true
+                component_scope.Add(func(): table.remove(entries, handle))
+                return handle
+            catch failure:
+                component_scope.Destroy()
+                throw failure
+
+        for name in names:
+            local component_name = name
+            kit[name] = expr(options): Component(component_name, options)
+        kit.Step = func(delta):
+            Check()
+            scope.Step(delta)
+            controls.Step(delta)
+        kit.SetTheme = func(next_theme):
+            Check()
+            if theme_source != nil: throw "mWidgets Theme is controlled by its readable source."
+            controls.SetTheme(next_theme)
+            kit.Theme = controls.Theme
+        kit.Destroy = func(): scope.Destroy()
+        kit.IsDestroyed = expr(): scope.IsDestroyed()
+        kit.GetCount = expr(): table.count(entries)
+        if automatic:
+            local frame = game.TimeSystem.FrameStepped.Connect(func(delta):
+                if scope.IsDestroyed(): return
+                if controls.GetActiveCount() > 0 or controls.GetOverlayCount() > 0 or scope.GetMotionCount() > 0 or scope.GetPendingListCount() > 0:
+                    kit.Step(delta)
+            )
+            scope.Add(func(): frame.Disconnect())
+        return kit
+    catch failure:
+        scope.Destroy()
+        throw failure
+
+return { New = New, Theme = mControls.Theme, IsSource = IsSource }

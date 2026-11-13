@@ -1,0 +1,501 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Bounded data messages and request/reply. Transport adapters are trusted code.
+# local server = import("/mLibraries/mNet").NewServer({ Remote = remote })
+# Route Authorize runs before Validate; call client.Step() to expire requests.
+
+local next_epoch = 0
+local messages = {
+    InvalidInput = "Invalid network input.", InvalidPayload = "Network data exceeds its allowed shape.",
+    UnknownRoute = "Unknown network route.", Denied = "Request is not allowed.",
+    ValidationError = "Request validation failed.", HandlerError = "Request handler failed.",
+    InvalidResponse = "Response data is invalid.", Busy = "Network capacity is busy.",
+    Limit = "Too many pending requests.", TransportError = "Network transport failed.",
+    ClockError = "Network clock is unavailable.", Timeout = "Request timed out.",
+    Cancelled = "Request was cancelled.", Destroyed = "Network endpoint is destroyed."
+}
+local Fail = expr(code): { Ok = false, Code = code, Message = messages[code] }
+local Ok = expr(value): { Ok = true, Value = value }
+local Gate = func():
+    local claims = 0
+    return { Take = expr(): claims++ == 0, Release = func(): claims = 0 }
+
+local Finite = func(value):
+    try:
+        return (value < 0 or value >= 0) and not math.is_infinite(value)
+    catch invalid:
+        return false
+local Whole = func(value, minimum, maximum):
+    if not Finite(value) or value < minimum or value > maximum: return false
+    local integer = math.floor(value)
+    return not (value < integer or value > integer)
+local TextLength = func(value):
+    try: return string.length(value)
+    catch invalid: return -1
+local Name = func(value):
+    local length = TextLength(value)
+    return length > 0 and length <= 32 and string.match(value, "^[A-Za-z]") and not string.match(value, "[^A-Za-z0-9_-]")
+local IsRecord = func(value):
+    try:
+        table.keys(value)
+        return true
+    catch invalid: return false
+local ArrayLength = func(value, maximum):
+    try:
+        if table.count(value) > maximum or IsRecord(value): return -1
+        local length = value.length
+        if length < 0 or length > maximum: return -1
+        return length
+    catch invalid: return -1
+local Option = func(value, fallback, minimum, maximum, whole):
+    if value == nil: return fallback
+    if not Finite(value) or value < minimum or value > maximum: throw "mNet: invalid option"
+    if whole and not Whole(value, minimum, maximum): throw "mNet: invalid option"
+    return value
+local FixedSlots = func(count):
+    local result = []
+    for index in range(count): result.push(nil)
+    return result
+
+# Data only: bounded primitives, arrays and string-keyed records. No objects/code.
+local CheckData = nil
+CheckData = func(value, depth, budget):
+    budget.Nodes += 1
+    if budget.Nodes > 1024: return false
+    if value == nil or value == true or value == false or Finite(value): return true
+    local length = TextLength(value)
+    if length >= 0:
+        budget.Text += length
+        return budget.Text <= 4096
+    if depth >= 4: return false
+    try:
+        local count = table.count(value)
+        if count > 1024: return false
+        if IsRecord(value):
+            if count > 64: return false
+            for key in table.keys(value):
+                local size = TextLength(key)
+                if size < 1 or size > 64: return false
+                budget.Text += size
+                if budget.Text > 4096 or not CheckData(value[key], depth + 1, budget): return false
+        else:
+            local size = ArrayLength(value, 1024)
+            if size < 0: return false
+            for index in range(size):
+                if not CheckData(value[index], depth + 1, budget): return false
+        return true
+    catch invalid: return false
+local Data = expr(value): CheckData(value, 0, { Nodes = 0, Text = 0 })
+local ReadClock = func(state):
+    local now = state.Clock()
+    if not Finite(now) or now < 0 or (state.LastClock != nil and now < state.LastClock):
+        throw "mNet: invalid clock"
+    state.LastClock = now
+    return now
+local DefaultClock = expr(): host.time()
+local Disconnect = func(connection):
+    if connection != nil:
+        try: connection.Disconnect()
+        catch failed: pass
+
+local Transport = func(options, server):
+    if options.Remote != nil:
+        if options.Connect != nil or options.Send != nil: throw "mNet: choose Remote or an adapter"
+        local remote = options.Remote
+        options = nil
+        if server:
+            return { Connect = func(receive):
+                return remote.Connect(func(peer, wire):
+                    if peer.IsConnected: receive(peer, wire)
+                )
+            , Send = func(peer, wire): remote.FireTo(peer, wire) }
+        return { Connect = expr(receive): remote.Connect(receive), Send = func(wire): remote.Fire(wire) }
+    if options.Connect == nil or options.Send == nil: throw "mNet: transport is required"
+    return { Connect = options.Connect, Send = options.Send }
+local Active = func(state, session):
+    return not state.Destroyed and session.Active and state.Peers[session.Slot] == session
+local Context = func(state, session):
+    return { Sender = session.Peer, IsActive = expr(): Active(state, session) }
+local Reply = func(state, session, epoch, id, code, value):
+    if not Active(state, session): return false
+    local wire = [2, epoch, id, code == nil, value]
+    if code != nil: wire[4] = code
+    try:
+        state.Send(session.Peer, wire)
+        return true
+    catch failed: return false
+local Header = func(wire):
+    if ArrayLength(wire, 5) != 5: return nil
+    local kind = wire[0]
+    local epoch = wire[1]
+    local id = wire[2]
+    local route = wire[3]
+    if not Whole(kind, 0, 1) or not Name(route): return nil
+    if kind == 0:
+        if not Whole(epoch, 0, 0) or not Whole(id, 0, 0): return nil
+    elif not Whole(epoch, 1, 2147483647) or not Whole(id, 1, 2147483647): return nil
+    return { Kind = kind, Epoch = epoch, Id = id, Route = route, Payload = wire[4] }
+
+local ReceiveServer = func(state, peer, wire):
+    if state.Destroyed or peer == nil or not state.Gate.Take(): return
+    local session = nil
+    local header = nil
+    local work = nil
+    local error = nil
+    try:
+        local free = -1
+        for index in range(state.Peers.length):
+            local candidate = state.Peers[index]
+            if candidate == nil or not candidate.Active:
+                if free < 0: free = index
+            elif candidate.Peer == peer:
+                session = candidate
+        if session == nil:
+            if free < 0: return
+            session = { Peer = peer, Slot = free, Active = true, Tokens = state.Burst, Last = nil }
+            state.Peers[free] = session
+        if state.Destroyed:
+            session.Active = false
+            state.Peers[session.Slot] = nil
+            return
+        local now = nil
+        try: now = ReadClock(state)
+        catch bad_clock: error = "ClockError"
+        if now == nil:
+            now = state.LastClock
+            if now == nil: now = 0
+        local tokens = session.Tokens
+        if session.Last != nil: tokens = math.min(state.Burst, tokens + (now - session.Last) * state.Rate)
+        session.Last = now
+        if tokens < 1:
+            session.Tokens = tokens
+            return
+        session.Tokens = tokens - 1
+        header = Header(wire)
+        if header == nil: return
+        if error == nil:
+            local slot = -1
+            local count = 0
+            for index in range(state.Work.length):
+                local current = state.Work[index]
+                if current == nil:
+                    if slot < 0: slot = index
+                elif current.Session == session: count += 1
+            if slot < 0 or count >= state.PerPeer:
+                error = "Busy"
+            else:
+                work = { Session = session, Slot = slot }
+                state.Work[slot] = work
+    catch invalid:
+        error = "InvalidInput"
+    finally:
+        state.Gate.Release()
+    if header == nil or session == nil: return
+    if error != nil:
+        if header.Kind == 1: Reply(state, session, header.Epoch, header.Id, error, nil)
+        return
+    try:
+        if not Active(state, session): return
+        local route = state.Routes[header.Route]
+        local value = nil
+        if not Data(header.Payload):
+            error = "InvalidPayload"
+        elif route == nil or (header.Kind == 0 and route.Kind != "Event") or (header.Kind == 1 and route.Kind != "Request"):
+            error = "UnknownRoute"
+        else:
+            local context = Context(state, session)
+            local allowed = false
+            try: allowed = route.Authorize(context)
+            catch denied: error = "Denied"
+            if error == nil and allowed != true: error = "Denied"
+            local validated = nil
+            if error == nil and Active(state, session):
+                try: validated = route.Validate(header.Payload)
+                catch invalid: error = "ValidationError"
+                if error == nil and (not IsRecord(validated) or validated.Ok != true): error = "ValidationError"
+            if error == nil and Active(state, session):
+                try: value = route.Run(context, validated.Value)
+                catch failed: error = "HandlerError"
+        if header.Kind == 1 and Active(state, session):
+            if error == nil and not Data(value): error = "InvalidResponse"
+            Reply(state, session, header.Epoch, header.Id, error, value)
+    finally:
+        state.Work[work.Slot] = nil
+
+local DestroyServer = func(state):
+    if state.Destroyed: return
+    state.Destroyed = true
+    for index in range(state.Peers.length):
+        local session = state.Peers[index]
+        if session != nil:
+            session.Active = false
+            session.Peer = nil
+            state.Peers[index] = nil
+    local connection = state.Connection
+    state.Connection = nil
+    state.Routes = {}
+    state.Send = nil
+    state.Clock = nil
+    Disconnect(connection)
+local ServerHandle = func(state):
+    return {
+        Register = func(definition):
+            if state.Destroyed: throw "mNet: server is destroyed"
+            if not state.Gate.Take(): throw "mNet: registration is busy"
+            try:
+                if not IsRecord(definition) or not Name(definition.Name) or (definition.Kind != "Event" and definition.Kind != "Request") or definition.Authorize == nil or definition.Validate == nil or definition.Run == nil:
+                    throw "mNet: invalid route"
+                local name = definition.Name
+                if state.Routes[name] != nil or table.count(state.Routes) >= 32: throw "mNet: route name or capacity is unavailable"
+                local route = { Kind = definition.Kind, Authorize = definition.Authorize, Validate = definition.Validate, Run = definition.Run }
+                if state.Destroyed: throw "mNet: server is destroyed"
+                state.Routes[name] = route
+                return true
+            finally: state.Gate.Release()
+        ,
+        RemovePeer = func(peer):
+            local removed = false
+            for session in state.Peers:
+                if session != nil and session.Peer == peer and session.Active:
+                    session.Active = false
+                    session.Peer = nil
+                    removed = true
+            return removed
+        ,
+        Send = func(peer, name, payload):
+            if state.Destroyed: return Fail("Destroyed")
+            if peer == nil or not Name(name): return Fail("InvalidInput")
+            if not Data(payload): return Fail("InvalidPayload")
+            try:
+                state.Send(peer, [4, 0, 0, name, payload])
+                return Ok(nil)
+            catch failed: return Fail("TransportError")
+        ,
+        IsDestroyed = expr(): state.Destroyed,
+        Destroy = expr(): DestroyServer(state)
+    }
+local ServerReceiver = func(state):
+    return func(peer, wire): ReceiveServer(state, peer, wire)
+
+local Outcome = func(status, result):
+    return { Status = status, Ok = result.Ok, Value = result.Value, Code = result.Code, Message = result.Message }
+local CopyOutcome = expr(value): { Status = value.Status, Ok = value.Ok, Value = value.Value, Code = value.Code, Message = value.Message }
+local Complete = func(state, record, status, result):
+    if not record.Claim.Take(): return false
+    local outcome = Outcome(status, result)
+    record.Outcome = outcome
+    if record.Slot >= 0: state.Slots[record.Slot] = nil
+    local callback = record.Callback
+    record.Callback = nil
+    if callback != nil:
+        try: callback(CopyOutcome(outcome))
+        catch failed: pass
+    return true
+local CallHandle = func(state, record):
+    return { Cancel = expr(): Complete(state, record, "Cancelled", Fail("Cancelled")), GetOutcome = func():
+        local outcome = record.Outcome
+        return CopyOutcome(outcome)
+    }
+local NewRecord = expr(callback): { Slot = -1, Id = 0, Deadline = 0, Callback = callback, Claim = Gate(), Outcome = { Status = "Pending", Ok = false } }
+local DisconnectEvent = func(state, record):
+    if not record.Off.Take(): return
+    record.Entry = nil
+    state.Events[record.Slot] = nil
+
+local EventConnection = func(state, record):
+    return { Disconnect = expr(): DisconnectEvent(state, record) }
+
+local On = func(state, name, handler):
+    if state.Destroyed: throw "mNet: client is destroyed"
+    if not Name(name) or handler == nil: throw "mNet: event name and handler are required"
+    if not state.Gate.Take(): throw "mNet: listener registration is busy"
+    try:
+        local free = -1
+        local names = {}
+        for index in range(state.Events.length):
+            local current = state.Events[index]
+            if current == nil:
+                if free < 0: free = index
+            elif current.Entry != nil:
+                names[current.Name] = true
+        if free < 0 or (names[name] != true and table.count(names) >= 32): throw "mNet: listener capacity reached"
+        local record = { Name = name, Slot = free, Entry = { Handler = handler }, Off = Gate() }
+        if state.Destroyed: throw "mNet: client is destroyed"
+        state.Events[free] = record
+        if state.Destroyed:
+            DisconnectEvent(state, record)
+            throw "mNet: client is destroyed"
+        return EventConnection(state, record)
+    finally: state.Gate.Release()
+
+local DispatchEvent = func(state, name, value):
+    local snapshot = []
+    for current in state.Events:
+        local record = current
+        if record != nil and record.Name == name: snapshot.push(record)
+    for record in snapshot:
+        if state.Destroyed: return
+        local entry = record.Entry
+        if entry != nil:
+            try: entry.Handler(value)
+            catch failed: pass
+
+local ReceiveClient = func(state, wire):
+    if state.Destroyed or ArrayLength(wire, 5) != 5: return
+    local kind = wire[0]
+    local epoch = wire[1]
+    local id = wire[2]
+    local ok = wire[3]
+    local value = wire[4]
+    if Whole(kind, 4, 4):
+        if Whole(epoch, 0, 0) and Whole(id, 0, 0) and Name(ok) and Data(value): DispatchEvent(state, ok, value)
+        return
+    if not Whole(kind, 2, 2) or not Whole(epoch, 1, 2147483647) or epoch != state.Epoch or not Whole(id, 1, 2147483647) or (ok != true and ok != false): return
+    if ok:
+        if not Data(value): return
+    else:
+        local length = TextLength(value)
+        if length < 1 or length > 32 or messages[value] == nil: return
+    for candidate in state.Slots:
+        local record = candidate
+        if record != nil and record.Id == id:
+            if ok: Complete(state, record, "Succeeded", Ok(value))
+            else: Complete(state, record, "Failed", Fail(value))
+            return
+local Request = func(state, name, payload, callback, timeout):
+    local record = NewRecord(callback)
+    local call = CallHandle(state, record)
+    local error = nil
+    if state.Destroyed: error = "Destroyed"
+    elif not Name(name): error = "InvalidInput"
+    elif not Data(payload): error = "InvalidPayload"
+    elif not state.Gate.Take(): error = "Busy"
+    else:
+        try:
+            local now = nil
+            try: now = ReadClock(state)
+            catch bad_clock: error = "ClockError"
+            if timeout == nil: timeout = state.Timeout
+            if not Finite(timeout) or timeout < 0.01 or timeout > 120: error = "InvalidInput"
+            local slot = -1
+            for index in range(state.Slots.length):
+                if state.Slots[index] == nil and slot < 0: slot = index
+            if slot < 0 or state.NextId >= 2147483647: error = "Limit"
+            if state.Destroyed: error = "Destroyed"
+            if error == nil:
+                state.NextId += 1
+                record.Id = state.NextId
+                record.Deadline = now + timeout
+                record.Slot = slot
+                state.Slots[slot] = record
+        finally: state.Gate.Release()
+    if error != nil:
+        Complete(state, record, "Failed", Fail(error))
+        return call
+    if state.Destroyed:
+        Complete(state, record, "Failed", Fail("Destroyed"))
+        return call
+    try: state.Send([1, state.Epoch, record.Id, name, payload])
+    catch failed: Complete(state, record, "Failed", Fail("TransportError"))
+    return call
+local Step = func(state):
+    if state.Destroyed or not state.Gate.Take(): return 0
+    local records = []
+    local now = nil
+    local error = nil
+    try:
+        for candidate in state.Slots:
+            if candidate != nil: records.push(candidate)
+        if records.length == 0: return 0
+        try: now = ReadClock(state)
+        catch bad_clock: error = "ClockError"
+    finally: state.Gate.Release()
+    local count = 0
+    for record in records:
+        if error != nil:
+            if Complete(state, record, "Failed", Fail(error)): count += 1
+        elif now >= record.Deadline:
+            if Complete(state, record, "TimedOut", Fail("Timeout")): count += 1
+    return count
+local DestroyClient = func(state):
+    if state.Destroyed: return
+    state.Destroyed = true
+    local connection = state.Connection
+    state.Connection = nil
+    Disconnect(connection)
+    for candidate in state.Events:
+        local record = candidate
+        if record != nil: DisconnectEvent(state, record)
+    for candidate in state.Slots:
+        local record = candidate
+        if record != nil: Complete(state, record, "Failed", Fail("Destroyed"))
+    state.Send = nil
+    state.Clock = nil
+local ClientHandle = func(state):
+    return {
+        On = expr(name, handler): On(state, name, handler),
+        Send = func(name, payload):
+            if state.Destroyed: return Fail("Destroyed")
+            if not Name(name): return Fail("InvalidInput")
+            if not Data(payload): return Fail("InvalidPayload")
+            try:
+                state.Send([0, 0, 0, name, payload])
+                return Ok(nil)
+            catch failed: return Fail("TransportError")
+        ,
+        Request = expr(name, payload, callback, timeout): Request(state, name, payload, callback, timeout),
+        Step = expr(): Step(state),
+        IsDestroyed = expr(): state.Destroyed,
+        Destroy = expr(): DestroyClient(state)
+    }
+local ClientReceiver = func(state):
+    return func(wire): ReceiveClient(state, wire)
+
+local NewServer = func(options):
+    if not IsRecord(options): throw "mNet: server options are required"
+    local transport = Transport(options, true)
+    local clock = options.Clock
+    if clock == nil: clock = DefaultClock
+    local state = {
+        Destroyed = false, Connection = nil, Send = transport.Send, Clock = clock, LastClock = nil,
+        Routes = {}, Gate = Gate(), Burst = Option(options.Burst, 8, 1, 64, true), Rate = Option(options.Rate, 4, 0, 100, false),
+        PerPeer = Option(options.PerPeerInFlight, 2, 1, 8, true), Peers = FixedSlots(Option(options.MaxPeers, 128, 1, 256, true)),
+        Work = FixedSlots(Option(options.MaxInFlight, 32, 1, 64, true))
+    }
+    local handle = ServerHandle(state)
+    options = nil
+    try:
+        state.Connection = transport.Connect(ServerReceiver(state))
+        if state.Connection == nil: throw "mNet: adapter must return a connection"
+    catch failed:
+        DestroyServer(state)
+        throw "mNet: could not connect server transport"
+    return handle
+
+local NewClient = func(options):
+    if not IsRecord(options): throw "mNet: client options are required"
+    local transport = Transport(options, false)
+    local clock = options.Clock
+    if clock == nil: clock = DefaultClock
+    local epoch = next_epoch++ + 1
+    if epoch > 2147483647: throw "mNet: client epoch space exhausted"
+    local state = {
+        Destroyed = false, Connection = nil, Send = transport.Send, Clock = clock, LastClock = nil,
+        Epoch = epoch, NextId = 0, Gate = Gate(), Timeout = Option(options.Timeout, 5, 0.01, 120, false),
+        Slots = FixedSlots(Option(options.MaxPending, 32, 1, 64, true)), Events = FixedSlots(64)
+    }
+    local handle = ClientHandle(state)
+    options = nil
+    try:
+        state.Connection = transport.Connect(ClientReceiver(state))
+        if state.Connection == nil: throw "mNet: adapter must return a connection"
+    catch failed:
+        DestroyClient(state)
+        throw "mNet: could not connect client transport"
+    return handle
+
+local NoPayload = func(value):
+    if value == nil: return Ok(nil)
+    return Fail("InvalidPayload")
+
+return { NewServer = NewServer, NewClient = NewClient, NoPayload = NoPayload }

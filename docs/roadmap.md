@@ -1,29 +1,22 @@
 # mLibraries roadmap
 
-mLibraries starts with events, resource cleanup and cooperative jobs. Each module has its own source, API documentation and tests.
+Current source version: **0.12.2-dev**. The package has 18 reusable TruScript
+libraries. The [README](../README.md) lists their purposes and dependencies.
 
-## Foundation
+The core utilities, commands, networking, state, player lifetimes, data helpers,
+springs, topbar and native UI stack are implemented. Their contracts, examples
+and optional test fixtures live beside the source.
 
-1. [mSignal](api/mSignal.md): ordered synchronous events, connections, one-shot listeners and teardown.
-2. [mCleanup](api/mCleanup.md): callback, connection and instance cleanup in reverse registration order.
-3. [mAsync](api/mAsync.md): background jobs, delays and cooperative cancellation, with an injected scheduler for deterministic tests.
+## Next checks
 
-The **0.1.0-dev** baseline passed 52 contract tests, 9 native checks and 4 concurrency checks on both server and client in Creator **2026.43.7**. The [verification record](verification/2026-11-11.md) describes the workloads; [testing instructions](testing.md) explain how to repeat them.
+- Run storage and messaging tests in an isolated published environment with
+  distinct server IDs. Creator multiplayer alone is not a cross-server test.
+- Check real server shutdown and storage failures separately from local restart tests.
+- Extend longer-session memory and sustained-load measurements.
+- Test supported physical devices and additional Creator versions.
+- Recheck topbar geometry and motion when the native HUD changes.
+- Keep adding small regression cases for reproduced failures.
 
-## Work before a stable release
-
-- Repeat installation in a fresh project using only the published package and instructions.
-- Test long-running use and resource cleanup in more projects and supported Creator versions.
-- Keep failure, cancellation and reentrancy tests with each API change.
-- Record the engine version, hardware and workload for any performance measurements.
-
-Document breaking changes and migration steps when an API changes.
-
-## Possible next modules
-
-- **Promise composition:** chaining and small combinators, with explicit settlement and cancellation rules.
-- **Data helpers:** result records, collection operations and runtime validation where they remove repeated application code.
-- **Networking helpers:** server-side validation and request handling after testing remote direction, serialization and failure behavior.
-- **UI and state utilities:** small observers or components drawn from working examples.
-
-Choose the next module from concrete use cases and bug reports. Keep each package usable without importing unrelated systems.
+Keep changes simple and preserve public contracts. Record source versions,
+workloads and raw measurements before claiming a speed or memory improvement.
+A passing correctness test is not a performance result.

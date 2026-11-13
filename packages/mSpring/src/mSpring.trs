@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# local spring = import("/mLibraries/mSpring").New(0, nil)
+# spring.SetTarget(10)
+# local value = spring.Step(1 / 60)
+
+local zero2 = new Vector2()
+local zero3 = new Vector3()
+local Finite = func(value):
+    try:
+        return (value < 0 or value >= 0) and not math.is_infinite(value)
+    catch invalid:
+        return false
+
+local KindOf = func(value):
+    if Finite(value): return 1
+    try:
+        zero2.Dot(value)
+        return 2
+    catch invalid:
+        pass
+    try:
+        zero3.Dot(value)
+        return 3
+    catch invalid:
+        return 0
+
+local Components = func(value, kind):
+    try:
+        if kind == 1:
+            if Finite(value): return [value]
+        elif kind == 2:
+            zero2.Dot(value)
+            local x = value.X
+            local y = value.Y
+            if Finite(x) and Finite(y): return [x, y]
+        elif kind == 3:
+            zero3.Dot(value)
+            local x = value.X
+            local y = value.Y
+            local z = value.Z
+            if Finite(x) and Finite(y) and Finite(z): return [x, y, z]
+    catch invalid:
+        pass
+    throw "mSpring requires a finite value of its original numeric type."
+
+local Pack = func(axes, kind):
+    if kind == 1: return axes[0]
+    if kind == 2: return new Vector2(axes[0], axes[1])
+    return new Vector3(axes[0], axes[1], axes[2])
+
+local Zero = func(kind):
+    local axes = []
+    for index in range(kind): axes.push(0)
+    return axes
+
+local Config = func(options):
+    if options == nil: options = {}
+    try:
+        if table.count(options) > 4: throw "invalid"
+        for key in table.keys(options):
+            if key != "Frequency" and key != "Damping" and key != "PositionTolerance" and key != "VelocityTolerance":
+                throw "invalid"
+        local frequency = options.Frequency
+        local damping = options.Damping
+        local position = options.PositionTolerance
+        local velocity = options.VelocityTolerance
+        if frequency == nil: frequency = 4
+        if damping == nil: damping = 1
+        if position == nil: position = 0.0001
+        if velocity == nil: velocity = 0.0001
+        if not Finite(frequency) or frequency < 0.001 or frequency > 60: throw "invalid"
+        if not Finite(damping) or damping < 0 or damping > 4: throw "invalid"
+        if not Finite(position) or position < 0 or position > 1000000: throw "invalid"
+        if not Finite(velocity) or velocity < 0 or velocity > 1000000: throw "invalid"
+        return { Omega = 2 * math.pi * frequency, Damping = damping, Position = position, Velocity = velocity }
+    catch invalid:
+        throw "Invalid mSpring options."
+
+# Closed-form transition for y'' + 2*damping*omega*y' + omega^2*y = 0.
+local Coefficients = func(dt, config):
+    local omega = config.Omega
+    local alpha = config.Damping * omega
+    local difference = 1 - config.Damping * config.Damping
+    local rate = omega * math.sqrt(math.abs(difference))
+    local phase = rate * dt
+    if difference < 0 and phase >= 0.001:
+        local root = math.sqrt(-difference)
+        local slow = -omega / (config.Damping + root)
+        local fast = -omega * (config.Damping + root)
+        local first = math.exp(slow * dt)
+        local second = math.exp(fast * dt)
+        local gap = slow - fast
+        local b = (first - second) / gap
+        return [(-fast * first + slow * second) / gap, b, -omega * omega * b, (slow * first - fast * second) / gap]
+    local cosine = 1
+    local sine = dt
+    if phase < 0.001:
+        local squared = phase * phase
+        local fourth = squared * squared
+        local sixth = fourth * squared
+        if difference < 0:
+            cosine = 1 + squared / 2 + fourth / 24 + sixth / 720
+            sine = dt * (1 + squared / 6 + fourth / 120 + sixth / 5040)
+        else:
+            cosine = 1 - squared / 2 + fourth / 24 - sixth / 720
+            sine = dt * (1 - squared / 6 + fourth / 120 - sixth / 5040)
+    else:
+        cosine = math.cos(phase)
+        sine = math.sin(phase) / rate
+    local decay = math.exp(-alpha * dt)
+    local b = decay * sine
+    return [decay * (cosine + alpha * sine), b, -omega * omega * b, decay * (cosine - alpha * sine)]
+
+local Resting = func(state, config, kind):
+    for index in range(kind):
+        if math.abs(state.Value[index] - state.Target[index]) > config.Position or math.abs(state.Velocity[index]) > config.Velocity:
+            return false
+    return true
+
+local StepState = func(state, dt, config, kind):
+    if not Finite(dt) or dt < 0 or dt > 60:
+        throw "mSpring.Step requires finite seconds from 0 through 60."
+    if not (dt > 0): return state
+    local coefficients = Coefficients(dt, config)
+    local value = []
+    local velocity = []
+    for index in range(kind):
+        local offset = state.Value[index] - state.Target[index]
+        local next_value = state.Target[index] + offset * coefficients[0] + state.Velocity[index] * coefficients[1]
+        local next_velocity = offset * coefficients[2] + state.Velocity[index] * coefficients[3]
+        if not Finite(next_value) or not Finite(next_velocity):
+            throw "mSpring step exceeded finite numeric range."
+        value.push(next_value)
+        velocity.push(next_velocity)
+    # Round through the host representation and reject vector overflow before publication.
+    value = Components(Pack(value, kind), kind)
+    velocity = Components(Pack(velocity, kind), kind)
+    local next_state = { Value = value, Velocity = velocity, Target = state.Target }
+    if Resting(next_state, config, kind):
+        return { Value = state.Target, Velocity = Zero(kind), Target = state.Target }
+    return next_state
+
+local New = func(initial, options):
+    local kind = KindOf(initial)
+    local value = Components(initial, kind)
+    local config = Config(options)
+    local state = { Value = value, Velocity = Zero(kind), Target = value }
+    initial = nil
+    options = nil
+    value = nil
+    local claims = 0
+    local Mutate = func(operation, input):
+        local ticket = claims++
+        if ticket != 0: throw "mSpring mutation is busy."
+        try:
+            local current = state
+            local next_state = current
+            if operation == "step":
+                next_state = StepState(current, input, config, kind)
+            elif operation == "target":
+                next_state = { Value = current.Value, Velocity = current.Velocity, Target = Components(input, kind) }
+            elif operation == "reset":
+                local axes = Components(input, kind)
+                next_state = { Value = axes, Velocity = Zero(kind), Target = axes }
+            elif operation == "snap":
+                next_state = { Value = current.Target, Velocity = Zero(kind), Target = current.Target }
+            else:
+                local impulse = Components(input, kind)
+                local velocity = []
+                for index in range(kind):
+                    local component = current.Velocity[index] + impulse[index]
+                    if not Finite(component): throw "mSpring impulse exceeded finite numeric range."
+                    velocity.push(component)
+                velocity = Components(Pack(velocity, kind), kind)
+                next_state = { Value = current.Value, Velocity = velocity, Target = current.Target }
+            state = next_state
+            return Pack(next_state.Value, kind)
+        finally:
+            claims = 0
+    local spring = {}
+    spring.SetTarget = func(target): Mutate("target", target)
+    spring.Step = expr(dt): Mutate("step", dt)
+    spring.Impulse = func(velocity): Mutate("impulse", velocity)
+    spring.Snap = func(): Mutate("snap", nil)
+    spring.Reset = func(next_value): Mutate("reset", next_value)
+    spring.GetValue = func():
+        local current = state
+        return Pack(current.Value, kind)
+    spring.GetVelocity = func():
+        local current = state
+        return Pack(current.Velocity, kind)
+    spring.GetTarget = func():
+        local current = state
+        return Pack(current.Target, kind)
+    spring.IsResting = func():
+        local current = state
+        return Resting(current, config, kind)
+    return spring
+
+return { New = New }

@@ -1,0 +1,260 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mBan = import("/mLibraries/mBan")
+local kit = import("/mLibraries/mTestKit")
+local INVALID = "Invalid mBan data."
+local Record = func(user_id, id, issued, expires):
+    return { Id = id, UserId = user_id, Name = "Account" + user_id, ActorId = 1, Actor = "Owner", Reason = "Rules", IssuedAt = issued, ExpiresAt = expires }
+local Records = func(record):
+    local records = {}
+    records[tostring(record.UserId)] = record
+    return records
+
+local Run = func():
+    local suite = kit.New("mBan")
+    local bans = mBan.New(nil)
+    local Reject = func(work):
+        local raised = false
+        local failure = nil
+        try: work()
+        catch problem:
+            raised = true
+            failure = problem
+        suite.Expect(raised, "invalid input throws")
+        suite.Equal(failure, INVALID, "static validation error")
+
+    suite.Test("default and maximum configured capacities are bounded", func():
+        local records = {}
+        for index in range(128):
+            local record = Record(index + 1, "ban:" + index, 0, 0)
+            records[tostring(record.UserId)] = record
+        suite.Expect(bans.Validate(records), "default 128 records")
+        records["129"] = Record(129, "ban:128", 0, 0)
+        Reject(func(): bans.Validate(records))
+        suite.Expect(mBan.New({ Limit = 1024 }).Validate(records), "larger explicit bound")
+        suite.Expect(mBan.New({ Limit = 1 }).Validate({}), "minimum bound")
+    )
+    suite.Test("malformed constructor shapes and limits throw", func():
+        for config in [false, 1, "config", [], { Other = true }, { Limit = 1, Extra = nil }]:
+            Reject(func(): mBan.New(config))
+        for value in [0, -1, 1025, 0.5, 1 + 5e-11, false, "1", 0 / 0, 1 / 0]:
+            Reject(func(): mBan.New({ Limit = value }))
+        suite.Expect(mBan.New({}).Validate({}), "empty config has defaults")
+    )
+    suite.Test("root values require plain maps even for zero entries", func():
+        for records in [nil, false, 1, "records", [], { length = 0 }]:
+            Reject(func(): bans.Validate(records))
+        suite.Expect(bans.Validate({}), "empty map")
+    )
+    suite.Test("records require exactly the documented flat fields", func():
+        for value in [nil, false, 1, "record", [], {}, { UserId = 2 }]:
+            local records = {}
+            records["2"] = value
+            Reject(func(): bans.Validate(records))
+        local record = Record(2, "ban:1", 0, 0)
+        record.Extra = nil
+        Reject(func(): bans.Validate(Records(record)))
+        record = Record(2, "ban:1", 0, 0)
+        table.remove(record, "Name")
+        Reject(func(): bans.Validate(Records(record)))
+    )
+    suite.Test("map keys must exactly match the record's canonical account ID", func():
+        for key in ["02", "+2", " 2", "2.0", "3", "", 2, false, {}]:
+            local records = {}
+            records[key] = Record(2, "ban:1", 0, 0)
+            Reject(func(): bans.Validate(records))
+        suite.Expect(bans.Validate(Records(Record(-2, "ban:1", 0, 0))), "explicit test identity key")
+    )
+    suite.Test("duplicate ban IDs are rejected across accounts", func():
+        local records = Records(Record(2, "same", 0, 0))
+        records["3"] = Record(3, "same", 1, 2)
+        Reject(func(): bans.Validate(records))
+        records["3"].Id = "different"
+        suite.Expect(bans.Validate(records), "distinct IDs")
+    )
+    suite.Test("subject and actor IDs are exact nonzero safe integers", func():
+        for value in [0, -0.5, 1.5, 1 + 5e-11, -1 + 5e-11, 9007199254740992, -9007199254740992, false, "2", 0 / 0, 1 / 0]:
+            local record = Record(2, "ban:1", 0, 0)
+            record.UserId = value
+            Reject(func(): bans.Validate(Records(record)))
+            record = Record(2, "ban:1", 0, 0)
+            record.ActorId = value
+            Reject(func(): bans.Validate(Records(record)))
+        for value in [-9007199254740991, 9007199254740991, -1, 1]:
+            local record = Record(value, "ban:1", 0, 0)
+            record.ActorId = value
+            suite.Expect(bans.Validate(Records(record)), "safe ID boundary")
+    )
+    suite.Test("text limits preserve empty display fields but require a ban ID", func():
+        local record = Record(2, string.repeat("i", 64), 0, 0)
+        record.Name = string.repeat("n", 64)
+        record.Actor = string.repeat("a", 64)
+        record.Reason = string.repeat("r", 256)
+        suite.Expect(bans.Validate(Records(record)), "exact field bounds")
+        for field in ["Name", "Actor", "Reason"]: record[field] = ""
+        suite.Expect(bans.Validate(Records(record)), "empty descriptive text")
+        record.Id = ""
+        Reject(func(): bans.Validate(Records(record)))
+        for entry in [{ Key = "Id", Length = 65 }, { Key = "Name", Length = 65 }, { Key = "Actor", Length = 65 }, { Key = "Reason", Length = 257 }]:
+            record = Record(2, "ban:1", 0, 0)
+            record[entry.Key] = string.repeat("x", entry.Length)
+            Reject(func(): bans.Validate(Records(record)))
+    )
+    suite.Test("control characters and forged text fields are rejected", func():
+        for field in ["Id", "Name", "Actor", "Reason"]:
+            for value in ["a\nb", "a\tb", false, 1, {}, []]:
+                local record = Record(2, "ban:1", 0, 0)
+                record[field] = value
+                Reject(func(): bans.Validate(Records(record)))
+    )
+    suite.Test("timestamps require nonnegative finite numbers without coercion", func():
+        for field in ["IssuedAt", "ExpiresAt"]:
+            for value in [-1, false, "0", {}, 0 / 0, 1 / 0]:
+                local record = Record(2, "ban:1", 0, 0)
+                record[field] = value
+                Reject(func(): bans.Validate(Records(record)))
+        local record = Record(2, "ban:1", 0, 0.5)
+        suite.Expect(bans.Validate(Records(record)), "fractional UTC seconds")
+    )
+    suite.Test("temporary expiry must follow issue time while zero is permanent", func():
+        for expiry in [10, 9]:
+            Reject(func(): bans.Validate(Records(Record(2, "ban:1", 10, expiry))))
+        suite.Expect(bans.Validate(Records(Record(2, "ban:1", 10, 0))), "permanent zero")
+        suite.Expect(bans.Validate(Records(Record(2, "ban:1", 10, 10.5))), "expiry follows issue")
+    )
+    suite.Test("reads filter expiry exactly at its boundary without deleting history", func():
+        local records = Records(Record(2, "ban:1", 10, 20))
+        suite.Expect(bans.Get(records, 2, 19.999) != nil, "active just before expiry")
+        suite.Equal(bans.Get(records, 2, 20), nil, "expired at boundary")
+        suite.Equal(bans.Get(records, 2, 21), nil, "expired afterward")
+        suite.Expect(bans.Validate(records), "expired record remains valid")
+        suite.Equal(table.count(records), 1, "read does not prune input")
+        suite.Equal(bans.List(records, 20).length, 0, "list filters expiry")
+    )
+    suite.Test("permanent zero expiry survives all read clocks including zero", func():
+        local records = Records(Record(2, "ban:1", 0, 0))
+        suite.Equal(bans.Get(records, 2, 0).ExpiresAt, 0, "zero clock and permanent expiry")
+        suite.Equal(bans.Get(records, 2, 1e15).IssuedAt, 0, "old permanent record")
+        suite.Equal(bans.Get(records, 3, 0), nil, "missing account")
+        local brief = Records(Record(2, "brief", 0, 5e-11))
+        suite.Expect(bans.Get(brief, 2, 0) != nil, "small positive expiry is temporary")
+        suite.Equal(bans.Get(brief, 2, 5e-11), nil, "small expiry boundary stays exact")
+    )
+    suite.Test("every operation validates clocks and query identities", func():
+        local record = Record(2, "ban:1", 0, 0)
+        for now in [-1, false, "0", 0 / 0, 1 / 0]:
+            Reject(func(): bans.Get({}, 2, now))
+            Reject(func(): bans.List({}, now))
+            Reject(func(): bans.Set({}, record, now))
+            Reject(func(): bans.Remove({}, 2, "ban:1", now))
+        for id in [0, 1.5, "2", false]:
+            Reject(func(): bans.Get({}, id, 0))
+            Reject(func(): bans.Remove({}, id, "ban:1", 0))
+    )
+    suite.Test("all APIs reject corrupt records before filtering or pruning", func():
+        local records = Records(Record(2, "ban:1", 0, 1))
+        records["2"].Reason = {}
+        Reject(func(): bans.Get(records, 3, 2))
+        Reject(func(): bans.List(records, 2))
+        Reject(func(): bans.Set(records, Record(3, "ban:2", 2, 0), 2))
+        Reject(func(): bans.Remove(records, 3, "ban:2", 2))
+        suite.Equal(table.count(records), 1, "corrupt input not discarded")
+    )
+    suite.Test("Get and List return detached records in numeric account order", func():
+        local records = Records(Record(12, "ban:1", 0, 0))
+        records["2"] = Record(2, "ban:2", 0, 0)
+        records["-1"] = Record(-1, "ban:3", 0, 0)
+        local list = bans.List(records, 0)
+        suite.Equal(list[0].UserId, -1, "negative ID sorts first")
+        suite.Equal(list[1].UserId, 2, "numeric rather than lexical ordering")
+        suite.Equal(list[2].UserId, 12, "larger account")
+        list[0].Reason = "changed list"
+        local one = bans.Get(records, 2, 0)
+        one.Reason = "changed read"
+        suite.Equal(records["-1"].Reason, "Rules", "list copy")
+        suite.Equal(records["2"].Reason, "Rules", "single copy")
+    )
+    suite.Test("Set copies input records and publishes only complete output", func():
+        local original = Record(2, "ban:1", 0, 0)
+        local records = Records(original)
+        local incoming = Record(3, "ban:2", 0, 0)
+        local result = bans.Set(records, incoming, 0)
+        suite.Expect(result.Ok, "new ban accepted")
+        result.Value["2"].Reason = "output change"
+        incoming.Reason = "later input change"
+        suite.Equal(records["2"].Reason, "Rules", "existing nested record copied")
+        suite.Equal(result.Value["3"].Reason, "Rules", "incoming record copied")
+        suite.Equal(table.count(records), 1, "input root not mutated")
+    )
+    suite.Test("Set replaces the same account at capacity with a fresh ban ID", func():
+        local one = mBan.New({ Limit = 1 })
+        local records = Records(Record(2, "old", 0, 0))
+        local result = one.Set(records, Record(2, "new", 1, 0), 1)
+        suite.Expect(result.Ok, "replace full list entry")
+        suite.Equal(result.Value["2"].Id, "new", "replacement ID")
+        suite.Equal(records["2"].Id, "old", "old input retained")
+    )
+    suite.Test("Set rejects a full active registry without partial output", func():
+        local one = mBan.New({ Limit = 1 })
+        local records = Records(Record(2, "old", 0, 0))
+        local result = one.Set(records, Record(3, "new", 1, 0), 1)
+        suite.Equal(result.Ok, false, "capacity failure")
+        suite.Equal(result.Code, "Full", "capacity code")
+        suite.Equal(result.Value, nil, "no partial replacement")
+        suite.Equal(table.count(records), 1, "input retained")
+    )
+    suite.Test("Set prunes expired records before capacity checks", func():
+        local one = mBan.New({ Limit = 1 })
+        local records = Records(Record(2, "old", 0, 10))
+        local result = one.Set(records, Record(3, "new", 10, 0), 10)
+        suite.Expect(result.Ok, "expired slot reused")
+        suite.Equal(table.count(result.Value), 1, "bounded new registry")
+        suite.Equal(result.Value["2"], nil, "expired entry erased")
+        suite.Equal(records["2"].Id, "old", "input history retained")
+    )
+    suite.Test("Set rejects already expired incoming bans", func():
+        local result = bans.Set({}, Record(2, "expired", 0, 1), 1)
+        suite.Equal(result.Ok, false, "expired incoming record")
+        suite.Equal(result.Code, "Expired", "expiry code")
+        suite.Equal(result.Value, nil, "no output")
+    )
+    suite.Test("Set rejects IDs already held by another active account", func():
+        local records = Records(Record(2, "shared", 0, 0))
+        local result = bans.Set(records, Record(3, "shared", 1, 0), 1)
+        suite.Equal(result.Code, "Conflict", "ID collision")
+        suite.Equal(result.Value, nil, "no partial output")
+        suite.Equal(table.count(records), 1, "unchanged input")
+    )
+    suite.Test("Remove requires the exact current ban ID", func():
+        local records = Records(Record(2, "new", 1, 0))
+        local result = bans.Remove(records, 2, "old", 1)
+        suite.Equal(result.Ok, false, "stale remove rejected")
+        suite.Equal(result.Code, "Conflict", "stale ID code")
+        suite.Equal(result.Value, nil, "no replacement on conflict")
+        suite.Equal(records["2"].Id, "new", "new ban retained")
+        result = bans.Remove(records, 2, "new", 1)
+        suite.Expect(result.Ok and result.Removed, "current ban removed")
+        suite.Equal(table.count(result.Value), 0, "actual key removed")
+        suite.Equal(table.count(records), 1, "input not changed")
+    )
+    suite.Test("Remove returns copied pruned no-ops for missing or expired bans", func():
+        local records = Records(Record(2, "old", 0, 1))
+        records["3"] = Record(3, "active", 0, 0)
+        local result = bans.Remove(records, 4, "missing", 1)
+        suite.Expect(result.Ok and not result.Removed, "missing no-op")
+        suite.Equal(table.count(result.Value), 1, "expired record pruned")
+        result.Value["3"].Reason = "new output"
+        suite.Equal(records["3"].Reason, "Rules", "no-op still copies")
+        result = bans.Remove(records, 2, "old", 1)
+        suite.Expect(result.Ok and not result.Removed, "expired no-op")
+        suite.Equal(table.count(records), 2, "input untouched")
+    )
+    suite.Test("Remove rejects absent or malformed expected IDs", func():
+        for expected in [nil, "", false, 1, "bad\n", string.repeat("x", 65)]:
+            Reject(func(): bans.Remove({}, 2, expected, 0))
+    )
+
+    return suite.Report()
+
+return { Run = Run }

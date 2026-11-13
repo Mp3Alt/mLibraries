@@ -1,0 +1,714 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mReactive = import("/mLibraries/mReactive")
+local mState = import("/mLibraries/mState")
+local mSpring = import("/mLibraries/mSpring")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local Near = func(suite, actual, expected):
+    suite.Expect(math.abs(actual - expected) < 0.00001, "expected " + expected + ", got " + actual)
+
+local Run = func():
+    local suite = mTestKit.New("mReactive")
+    suite.Test("spring retargets inside tolerance snap after a positive step", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        try:
+            local source = ui.Value(0)
+            local value = ui.Spring(source, { PositionTolerance = 2, VelocityTolerance = 1000 })
+            local changes = 0
+            value.Observe(func(next_value): changes++)
+            source.Set(1)
+            suite.Equal(ui.Step(0).length, 0, "zero step succeeds")
+            suite.Equal(value.Get(), 0, "zero step does not snap")
+            suite.Equal(ui.Step(0.1).length, 0, "positive step succeeds")
+            suite.Equal(value.Get(), 1, "near target snaps instead of being skipped")
+            suite.Expect(value.IsResting(), "snapped output is resting")
+            ui.Step(1)
+            suite.Equal(changes, 1, "idle step does not notify again")
+            source.Set(0)
+            ui.Step(0.1)
+            suite.Equal(value.Get(), 0, "zero retarget also snaps")
+        finally:
+            ui.Destroy()
+    )
+    suite.Test("vector springs snap tolerance-satisfied retargets", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        try:
+            local source = ui.Value(new Vector2(1, 2))
+            local value = ui.Spring(source, { PositionTolerance = 2, VelocityTolerance = 1000 })
+            source.Set(new Vector2(2, 4))
+            ui.Step(0)
+            suite.Equal(value.Get().X, 1, "zero step keeps x")
+            suite.Equal(value.Get().Y, 2, "zero step keeps y")
+            suite.Equal(ui.Step(0.1).length, 0, "positive vector step succeeds")
+            suite.Equal(value.Get().X, 2, "target x reached")
+            suite.Equal(value.Get().Y, 4, "target y reached")
+            suite.Expect(value.IsResting(), "vector output is resting")
+        finally:
+            ui.Destroy()
+    )
+    suite.Test("motion resting state includes queued targets and disposal", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local target = ui.Value(0)
+        local spring = ui.Spring(target)
+        local tween = ui.Tween(target, 0.2)
+        suite.Expect(spring.IsResting() and tween.IsResting(), "initial outputs are resting")
+        target.Set(1)
+        suite.Expect(not spring.IsResting() and not tween.IsResting(), "pending target is not resting")
+        for frame in range(240): ui.Step(1 / 60)
+        suite.Expect(spring.IsResting() and tween.IsResting(), "both outputs settle")
+        spring.Destroy()
+        suite.Throws(spring.IsResting, "destroyed output rejects queries")
+        ui.Destroy()
+    )
+    suite.Test("paused motion freezes time and adopts queued targets on resume", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local target = ui.Value(0)
+        local motion = ui.Tween(target, 1)
+        target.Set(10)
+        ui.Step(0.25)
+        Near(suite, motion.Get(), 2.5)
+        motion.SetPaused(true)
+        target.Set(20)
+        ui.Step(0.5)
+        Near(suite, motion.Get(), 2.5)
+        suite.Expect(motion.IsPaused() and not motion.IsResting(), "paused output retains pending work")
+        motion.SetPaused(false)
+        ui.Step(0.5)
+        Near(suite, motion.Get(), 11.25)
+        suite.Throws(func(): motion.SetPaused(0), "boolean pause required")
+        ui.Destroy()
+        suite.Throws(motion.IsPaused, "disposed query rejected")
+    )
+    suite.Test("scope options preserve false and reject unknown settings", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        suite.Equal(ui.GetFrameConnectionCount(), 0, "manual scope has no frame hook")
+        ui.Destroy()
+        for options in [false, [], { AutoStep = 0 }, { Unknown = true }]:
+            suite.Throws(func(): mReactive.Scope(options), "invalid scope options")
+    )
+    suite.Test("owned values preserve false zero and nil", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local value = ui.Value(false)
+        suite.Equal(value.Get(), false, "false initial")
+        value.Set(0)
+        suite.Equal(value.Get(), 0, "zero update")
+        value.Set(nil)
+        suite.Equal(value.Get(), nil, "nil update")
+        ui.Destroy()
+        suite.Expect(value.IsDestroyed(), "scope destroys value")
+    )
+    suite.Test("manual value disposal releases its ownership slot", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        for index in range(40):
+            local value = ui.Value(index)
+            suite.Equal(ui.GetCount(), 1, "one live registration")
+            value.Destroy()
+            value.Destroy()
+            suite.Equal(ui.GetCount(), 0, "no retired registrations")
+        ui.Destroy()
+    )
+    suite.Test("queued state disposal releases its ownership slot immediately", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local value = ui.Value(2)
+        local derived = ui.Computed([value], expr(values): values[0] * 2)
+        derived.RequestDestroy()
+        suite.Expect(derived.IsDestroyed(), "computed closed immediately")
+        suite.Equal(ui.GetCount(), 1, "computed ownership slot released")
+        value.RequestDestroy()
+        suite.Equal(ui.GetCount(), 0, "value ownership slot released")
+        ui.Destroy()
+    )
+    suite.Test("computed dependencies settle before batch observers", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local first = ui.Value(1)
+        local second = ui.Value(2)
+        local total = ui.Computed([first, second], expr(values): values[0] + values[1])
+        local seen = []
+        ui.Observe(total, func(value): seen.push(value))
+        local errors = mReactive.Batch(func():
+            first.Set(4)
+            second.Set(6)
+        )
+        suite.Equal(errors.length, 0, "batch succeeds")
+        suite.Equal(total.Get(), 10, "settled result")
+        suite.Equal(seen.length, 2, "initial and one coalesced update")
+        suite.Equal(seen[1], 10, "no intermediate sum")
+        suite.Throws(func(): total.Set(50), "computed is read only")
+        ui.Destroy()
+    )
+    suite.Test("Observe applies immediately and is independently removable", func():
+        local source = mState.New(2)
+        local ui = mReactive.Scope({ AutoStep = false })
+        local seen = 0
+        local watch = ui.Observe(source, func(value): seen += value)
+        suite.Equal(seen, 2, "initial apply")
+        source.Set(3)
+        suite.Equal(seen, 5, "future apply")
+        watch.Disconnect()
+        suite.Equal(ui.GetCount(), 0, "watch slot released")
+        source.Set(4)
+        suite.Equal(seen, 5, "no later apply")
+        ui.Destroy()
+        suite.Expect(not source.IsDestroyed(), "borrowed source survives")
+        source.Destroy()
+    )
+    suite.Test("child scopes expose reactive helpers and unlink on disposal", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local child = ui.Child()
+        local value = child.Value(3)
+        local derived = child.Computed([value], expr(values): values[0] * 2)
+        suite.Equal(derived.Get(), 6, "child computation")
+        suite.Equal(ui.GetCount(), 1, "one child registration")
+        child.Destroy()
+        suite.Expect(value.IsDestroyed() and derived.IsDestroyed(), "child values destroyed")
+        suite.Equal(ui.GetCount(), 0, "child registration removed")
+        ui.Destroy()
+    )
+    suite.Test("scoped spring follows the existing numeric solver", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(0)
+        local value = ui.Spring(source, { Frequency = 3, Damping = 0.7 })
+        local reference = mSpring.New(0, { Frequency = 3, Damping = 0.7 })
+        source.Set(8)
+        reference.SetTarget(8)
+        for delta in [0, 0.01, 0.04, 0.1]:
+            suite.Equal(ui.Step(delta).length, 0, "step succeeds")
+            Near(suite, value.Get(), reference.Step(delta))
+        suite.Equal(ui.GetFrameConnectionCount(), 0, "manual motion never subscribes")
+        ui.Destroy()
+        source.Destroy()
+    )
+    suite.Test("spring snapshots Vector2 targets rather than retaining mutable axes", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(new Vector2())
+        local value = ui.Spring(source, nil)
+        local target = new Vector2(10, 20)
+        source.Set(target)
+        target.X = 900
+        ui.Step(4)
+        Near(suite, value.Get().X, 10)
+        Near(suite, value.Get().Y, 20)
+        ui.Destroy()
+        source.Destroy()
+    )
+    suite.Test("tween reaches exact endpoints and stops notifying at rest", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(0)
+        local value = ui.Tween(source, 1, nil)
+        local calls = 0
+        ui.Observe(value, func(next_value): calls++)
+        source.Set(10)
+        suite.Equal(value.Get(), 0, "retarget waits for Step")
+        ui.Step(0.5)
+        Near(suite, value.Get(), 5)
+        ui.Step(0.5)
+        suite.Equal(value.Get(), 10, "exact endpoint")
+        ui.Step(1)
+        suite.Equal(calls, 3, "initial midpoint endpoint only")
+        ui.Destroy()
+        source.Destroy()
+    )
+    suite.Test("zero-duration tween retains a zero target", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(5)
+        local value = ui.Tween(source, 0, "Linear")
+        source.Set(0)
+        ui.Step(0)
+        suite.Equal(value.Get(), 0, "zero target and duration")
+        ui.Destroy()
+        source.Destroy()
+    )
+    suite.Test("retargeting starts at the current tween position", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(0)
+        local value = ui.Tween(source, 1, nil)
+        source.Set(10)
+        ui.Step(0.5)
+        source.Set(15)
+        ui.Step(0.5)
+        Near(suite, value.Get(), 10)
+        ui.Step(0.5)
+        suite.Equal(value.Get(), 15, "new target reached")
+        ui.Destroy()
+        source.Destroy()
+    )
+    suite.Test("tween easing is explicit and deterministic", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(0)
+        local value = ui.Tween(source, 1, "QuadOut")
+        source.Set(8)
+        ui.Step(0.5)
+        Near(suite, value.Get(), 6)
+        suite.Throws(func(): ui.Tween(source, 1, "Unknown"), "unknown easing")
+        ui.Destroy()
+        source.Destroy()
+    )
+    suite.Test("Vector3 tween interpolates all axes", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(new Vector3(0, 2, 4))
+        local value = ui.Tween(source, 2, "Linear")
+        source.Set(new Vector3(4, 6, 8))
+        ui.Step(1)
+        local next_value = value.Get()
+        Near(suite, next_value.X, 2)
+        Near(suite, next_value.Y, 4)
+        Near(suite, next_value.Z, 6)
+        ui.Destroy()
+        source.Destroy()
+    )
+    suite.Test("motion outputs are read-only mState dependencies", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = ui.Value(0)
+        local value = ui.Tween(source, 1, nil)
+        local doubled = ui.Computed([value], expr(values): values[0] * 2)
+        suite.Throws(func(): value.Set(20), "motion is read only")
+        source.Set(4)
+        ui.Step(0.5)
+        suite.Equal(doubled.Get(), 4, "computed consumes motion")
+        ui.Destroy()
+    )
+    suite.Test("invalid motion targets retain the last valid target and recover", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(0)
+        local value = ui.Tween(source, 1, nil)
+        source.Set(10)
+        source.Set(new Vector2())
+        suite.Expect(value.GetError() != nil, "wrong target type recorded")
+        ui.Step(1)
+        suite.Equal(value.Get(), 10, "last valid target applied")
+        source.Set(2)
+        suite.Equal(value.GetError(), nil, "valid update clears error")
+        ui.Step(1)
+        suite.Equal(value.Get(), 2, "recovered target applied")
+        ui.Destroy()
+        source.Destroy()
+    )
+    suite.Test("invalid motion construction and step inputs leave no resources", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(0)
+        for duration in [nil, -1, 61, false, "1"]:
+            suite.Throws(func(): ui.Tween(source, duration, nil), "invalid duration")
+        suite.Throws(func(): ui.Spring(source, { Unknown = true }), "invalid spring options")
+        suite.Equal(ui.GetCount(), 0, "failed motions release resources")
+        for delta in [nil, -1, 61, false, "1", tonumber("1e999")]:
+            suite.Throws(func(): ui.Step(delta), "invalid step")
+        ui.Destroy()
+        source.Destroy()
+    )
+    suite.Test("closing an owner during source adoption cannot publish a dead motion", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local reads = 0
+        local connected = false
+        local source = {
+            Get = func():
+                reads++
+                if reads == 2: ui.Destroy()
+                return 0
+            ,
+            Observe = func(callback):
+                connected = true
+                return { Disconnect = func(): connected = false }
+        }
+        suite.Throws(func(): ui.Tween(source, 1, nil), "construction cancelled by owner disposal")
+        suite.Expect(ui.IsDestroyed(), "owner closed")
+        suite.Equal(ui.GetMotionCount(), 0, "no late motion registry entry")
+        suite.Equal(ui.GetCount(), 0, "no late ownership registration")
+        suite.Expect(not connected, "late subscription disconnected")
+    )
+    suite.Test("manual motion disposal unlinks targets and ownership slots", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(0)
+        for index in range(30):
+            local value = ui.Tween(source, 1, nil)
+            suite.Equal(ui.GetMotionCount(), 1, "one live motion")
+            value.Destroy()
+            suite.Equal(ui.GetMotionCount(), 0, "motion removed")
+            suite.Equal(ui.GetCount(), 0, "watch and lifetime slots removed")
+        source.Set(5)
+        suite.Equal(ui.Step(1).length, 0, "no stale motion writes")
+        ui.Destroy()
+        source.Destroy()
+    )
+    suite.Test("parent stepping advances child motion through the shared scheduler", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local child = ui.Child()
+        local source = ui.Value(0)
+        local value = child.Tween(source, 1, nil)
+        source.Set(8)
+        ui.Step(0.5)
+        suite.Equal(value.Get(), 4, "child motion advanced by parent")
+        child.Step(0.5)
+        suite.Equal(value.Get(), 8, "child shares the same scheduler")
+        child.Destroy()
+        suite.Equal(ui.GetMotionCount(), 0, "child disposal removes its motion")
+        ui.Destroy()
+    )
+    suite.Test("reentrant stepping is rejected and the next step remains usable", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = ui.Value(0)
+        local value = ui.Tween(source, 1, nil)
+        local attempts = 0
+        value.Observe(func(next_value):
+            attempts++
+            suite.Throws(func(): ui.Step(0), "nested step must reject")
+        )
+        source.Set(2)
+        suite.Equal(ui.Step(0.5).length, 0, "outer step succeeds")
+        suite.Equal(ui.Step(0.5).length, 0, "gate released")
+        suite.Equal(attempts, 2, "both output waves observed")
+        ui.Destroy()
+    )
+    suite.Test("scope disposal from an observer closes every owned resource", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local source = mState.New(0)
+        local first = ui.Tween(source, 1, nil)
+        local second = ui.Spring(source, nil)
+        first.Observe(func(next_value): ui.Destroy())
+        source.Set(5)
+        ui.Step(0.5)
+        suite.Expect(ui.IsDestroyed() and first.IsDestroyed() and second.IsDestroyed(), "complete disposal")
+        suite.Equal(ui.GetCount(), 0, "no owned resources")
+        suite.Expect(not source.IsDestroyed(), "external source survives")
+        suite.Throws(func(): ui.Step(0), "closed scope rejects stepping")
+        suite.Throws(func(): ui.Value(1), "closed scope rejects construction")
+        source.Destroy()
+    )
+    return suite.Report()
+
+local RunNative = func():
+    local suite = mTestKit.New("mReactiveNative")
+    suite.Test("keyed rows retain identity and computed state across reorder", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        try:
+            local parent = ui.New("UIPanel", nil)
+            local source = ui.Value([{ Id = 0, Name = "First" }, { Id = 1, Name = "Second" }])
+            local renders = 0
+            local list = ui.For(parent, source, expr(item, index): item.Id, func(row, item, index, identity):
+                renders++
+                local text = row.Computed([item, index], expr(values): values[1] + ": " + values[0].Name)
+                return row.New("UITextPanel", { Text = mReactive.Bind(text) })
+            )
+            local first = list.GetRoot(0)
+            local second = list.GetRoot(1)
+            source.Set([{ Id = 1, Name = "Updated" }, { Id = 0, Name = "First" }, { Id = 2, Name = "Third" }])
+            suite.Equal(list.GetCount(), 2, "changes queue until Step")
+            suite.Equal(ui.GetPendingListCount(), 1, "one queued reconciliation")
+            suite.Equal(ui.Step(0).length, 0, "new computed row built outside source dispatch")
+            suite.Equal(list.GetRoot(0), first, "first key identity retained")
+            suite.Equal(list.GetRoot(1), second, "second key identity retained")
+            suite.Equal(renders, 3, "only new key renders")
+            suite.Equal(second.Text, "0: Updated", "item and index settled together")
+            local children = parent.GetChildren()
+            suite.Equal(children[0], second, "native first row reordered")
+            suite.Equal(children[1], first, "native second row reordered")
+            suite.Equal(children[2], list.GetRoot(2), "new row appended")
+        finally:
+            ui.Destroy()
+    )
+    suite.Test("multiple source changes queue one reconciliation with latest data", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        try:
+            local parent = ui.New("UIPanel", nil)
+            local source = ui.Value([])
+            local builds = 0
+            local list = ui.For(parent, source, expr(item, index): item, func(row, item, index, identity):
+                builds++
+                return row.New("UIPanel", { Name = tostring(identity) })
+            )
+            source.Set([1])
+            source.Set([2])
+            source.Set([3, 4])
+            suite.Equal(ui.GetPendingListCount(), 1, "one slot per list")
+            ui.Step(0)
+            suite.Equal(builds, 2, "intermediate lists never rendered")
+            suite.Equal(list.GetRoot(1), nil, "intermediate key absent")
+            suite.Equal(list.GetCount(), 2, "latest list retained")
+        finally:
+            ui.Destroy()
+    )
+    suite.Test("duplicate keys fail before mutating retained rows", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        try:
+            local parent = ui.New("UIPanel", nil)
+            local source = ui.Value(["A", "B"])
+            local list = ui.For(parent, source, expr(item, index): item, func(row, item, index, identity):
+                return row.New("UIPanel", { Name = identity })
+            )
+            local original = list.GetRoot("A")
+            source.Set(["A", "A"])
+            suite.Equal(ui.Step(0).length, 1, "invalid update reported")
+            suite.Expect(list.GetError() != nil, "list error retained")
+            suite.Equal(list.GetCount(), 2, "previous rows preserved")
+            suite.Equal(list.GetRoot("A"), original, "previous root preserved")
+            source.Set(["B"])
+            suite.Equal(ui.Step(0).length, 0, "later valid update succeeds")
+            suite.Equal(list.GetError(), nil, "error cleared")
+        finally:
+            ui.Destroy()
+    )
+    suite.Test("failed renderer destroys all staged rows and leaves old rows intact", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        try:
+            local parent = ui.New("UIPanel", nil)
+            local source = ui.Value(["A"])
+            local staged = []
+            local list = ui.For(parent, source, expr(item, index): item, func(row, item, index, identity):
+                if identity != "A": staged.push(row)
+                local root = row.New("UIPanel", { Name = identity })
+                if identity == "C": throw "render failed"
+                return root
+            )
+            local original = list.GetRoot("A")
+            source.Set(["A", "B", "C"])
+            suite.Equal(ui.Step(0).length, 1, "render error reported")
+            suite.Equal(list.GetCount(), 1, "uncommitted rows absent")
+            suite.Equal(list.GetRoot("A"), original, "retained row intact")
+            suite.Equal(parent.GetChildren().length, 1, "staged roots removed")
+            suite.Expect(staged[0].IsDestroyed() and staged[1].IsDestroyed(), "all staged scopes destroyed")
+        finally:
+            ui.Destroy()
+    )
+    suite.Test("removed rows release their state and list teardown clears pending work", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        try:
+            local parent = ui.New("UIPanel", nil)
+            local source = ui.Value([0, 1])
+            local states = []
+            local list = ui.For(parent, source, expr(item, index): item, func(row, item, index, identity):
+                states.push(item)
+                return row.New("UIPanel", nil)
+            )
+            source.Set([1])
+            ui.Step(0)
+            suite.Expect(states[0].IsDestroyed(), "removed item state destroyed")
+            suite.Expect(not states[1].IsDestroyed(), "retained state lives")
+            source.Set([2])
+            list.Destroy()
+            suite.Equal(ui.GetPendingListCount(), 0, "pending reconciliation removed")
+            suite.Equal(parent.GetChildren().length, 0, "all row roots removed")
+            suite.Expect(states[1].IsDestroyed(), "remaining item state destroyed")
+            suite.Equal(ui.Step(0).length, 0, "no stale queued work")
+            suite.Throws(list.Refresh, "disposed list cannot refresh")
+        finally:
+            ui.Destroy()
+    )
+    suite.Test("initial invalid keys release list ownership and staged resources", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        try:
+            local parent = ui.New("UIPanel", nil)
+            local source = ui.Value([1, 1])
+            local count = ui.GetCount()
+            suite.Throws(func(): ui.For(parent, source, expr(item, index): item, expr(row, item, index, identity): row.New("UIPanel", nil)), "duplicate initial key")
+            suite.Equal(ui.GetCount(), count, "failed list unlinked")
+            suite.Equal(ui.GetPendingListCount(), 0, "failed list not queued")
+            suite.Equal(parent.GetChildren().length, 0, "nothing parented")
+        finally:
+            ui.Destroy()
+    )
+    suite.Test("distinct keys cannot share one rendered native root", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local shared = new UIPanel()
+        try:
+            local parent = ui.New("UIPanel", nil)
+            local source = ui.Value([1, 2])
+            local count = ui.GetCount()
+            suite.Throws(func(): ui.For(parent, source, expr(item, index): item, expr(row, item, index, identity): shared), "duplicate root rejected")
+            suite.Equal(ui.GetCount(), count, "failed list ownership removed")
+            suite.Equal(parent.GetChildren().length, 0, "nothing committed")
+            suite.Throws(func(): shared.Parent = parent, "shared staged root destroyed")
+        finally:
+            ui.Destroy()
+            shared.Destroy()
+    )
+    suite.Test("rejecting a new row cannot adopt and destroy a retained root", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        try:
+            local parent = ui.New("UIPanel", nil)
+            local source = ui.Value(["A"])
+            local retained = nil
+            local list = ui.For(parent, source, expr(item, index): item, func(row, item, index, identity):
+                if identity == "B": return retained
+                return row.New("UIPanel", { Name = identity })
+            )
+            retained = list.GetRoot("A")
+            source.Set(["A", "B"])
+            suite.Equal(ui.Step(0).length, 1, "invalid alias rejected")
+            suite.Equal(list.GetCount(), 1, "previous list retained")
+            suite.Equal(list.GetRoot("A"), retained, "previous root identity retained")
+            suite.Equal(retained.Parent, parent, "retained root still alive and parented")
+            suite.Equal(parent.GetChildren().length, 1, "no duplicate row committed")
+        finally:
+            ui.Destroy()
+    )
+    suite.Test("removed row cleanup failures are reported without retaining its root", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        try:
+            local parent = ui.New("UIPanel", nil)
+            local source = ui.Value([1])
+            local list = ui.For(parent, source, expr(item, index): item, func(row, item, index, identity):
+                row.Add(func(): throw "row cleanup failed")
+                return row.New("UIPanel", nil)
+            )
+            source.Set([])
+            local errors = ui.Step(0)
+            suite.Equal(errors.length, 1, "cleanup failure surfaced during reconciliation")
+            suite.Equal(list.GetError(), "row cleanup failed", "original cleanup error retained")
+            suite.Equal(list.GetCount(), 0, "removed row no longer committed")
+            suite.Equal(parent.GetChildren().length, 0, "root destroyed despite cleanup failure")
+        finally:
+            ui.Destroy()
+    )
+    suite.Test("staged rollback retains cleanup failures for owner disposal", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local parent = ui.New("UIPanel", nil)
+        local source = ui.Value([])
+        local list = ui.For(parent, source, expr(item, index): item, func(row, item, index, identity):
+            row.Add(func(): throw "staged cleanup failed")
+            local root = row.New("UIPanel", nil)
+            if identity == 2: throw "render failed"
+            return root
+        )
+        source.Set([1, 2])
+        local errors = ui.Step(0)
+        suite.Equal(errors.length, 1, "render failure surfaced")
+        suite.Equal(list.GetError(), "render failed", "render failure remains primary")
+        suite.Equal(parent.GetChildren().length, 0, "all staged roots destroyed")
+        suite.Equal(ui.Destroy().length, 2, "both rollback cleanup failures remain observable")
+    )
+    suite.Test("cancelled construction destroys a raw root returned after teardown", func():
+        local ui = mReactive.Scope({ AutoStep = false })
+        local parent = new UIPanel()
+        local source = mState.New([1])
+        local root = nil
+        suite.Throws(func():
+            ui.For(parent, source, expr(item, index): item, func(row, item, index, identity):
+                root = new UIPanel()
+                ui.Destroy()
+                return root
+            )
+        , "construction cancelled")
+        suite.Equal(ui.GetPendingListCount(), 0, "no late queued list")
+        suite.Equal(ui.GetMotionCount(), 0, "no row motion retained")
+        suite.Throws(func(): root.Parent = parent, "late raw root was destroyed")
+        parent.Destroy()
+        source.Destroy()
+    )
+    return suite.Report()
+
+local RunConcurrent = func():
+    local suite = mTestKit.New("mReactiveConcurrent")
+    local ui = mReactive.Scope()
+    local source = mState.New(0)
+    local first = ui.Tween(source, 0.05, nil)
+    local second = ui.Spring(source, nil)
+    source.Set(10)
+    local turns = 0
+    while first.Get() != 10 and turns < 240:
+        turns++
+        wait()
+    suite.Test("automatic motion shares one native frame subscription", func():
+        suite.Equal(ui.GetFrameConnectionCount(), 1, "one hook for both motion values")
+        suite.Equal(first.Get(), 10, "automatic tween reaches target")
+        suite.Expect(second.Get() > 0, "automatic spring advances")
+        suite.Equal(ui.GetError(), nil, "no frame error")
+    )
+    ui.Destroy()
+    suite.Test("automatic scope disposal disconnects its frame subscription", func():
+        suite.Equal(ui.GetFrameConnectionCount(), 0, "frame hook disconnected")
+        suite.Equal(ui.GetMotionCount(), 0, "all motions removed")
+        suite.Expect(first.IsDestroyed() and second.IsDestroyed(), "readable outputs disposed")
+        suite.Expect(not source.IsDestroyed(), "external source remains live")
+    )
+    source.Destroy()
+    suite.Test("native tasks closing motion owners leave no published resources", func():
+        local errors = []
+        local completed = 0
+        for round in range(12):
+            local owner = mReactive.Scope({ AutoStep = false })
+            local target = mState.New(0)
+            local outputs = []
+            local done = 0
+            spawn(func():
+                try:
+                    for index in range(24):
+                        if owner.IsDestroyed(): break
+                        try: outputs.push(owner.Tween(target, 1, nil))
+                        catch failure:
+                            if not owner.IsDestroyed(): errors.push(failure)
+                        if index % 4 == 0: wait()
+                catch failure:
+                    errors.push(failure)
+                finally:
+                    done++
+            )
+            spawn(func():
+                try:
+                    wait()
+                    for failure in owner.Destroy(): errors.push(failure)
+                catch failure:
+                    errors.push(failure)
+                finally:
+                    done++
+            )
+            local turns = 0
+            while done < 2 and turns < 240:
+                turns++
+                wait()
+            owner.Destroy()
+            if done == 2: completed++
+            suite.Equal(owner.GetMotionCount(), 0, "closed owner has no published motions")
+            suite.Equal(owner.GetCount(), 0, "closed owner has no resource registrations")
+            for output in outputs: suite.Expect(output.IsDestroyed(), "returned output closed")
+            target.Destroy()
+        suite.Equal(completed, 12, "all bounded workers finished")
+        suite.Equal(errors.length, 0, "no unexpected construction or cleanup errors")
+    )
+    suite.Test("native parenting callbacks can close lists without leaking staged rows", func():
+        local completed = 0
+        for round in range(4):
+            local observer = mReactive.Scope({ AutoStep = false })
+            local owner = mReactive.Scope({ AutoStep = false })
+            local parent = observer.New("UIPanel", nil)
+            local target = mState.New([])
+            local scopes = []
+            local closed = false
+            local close_claims = 0
+            local list = nil
+            try:
+                list = owner.For(parent, target, expr(item, index): item, func(row, item, index, identity):
+                    scopes.push(row)
+                    local root = row.New("UIPanel", nil)
+                    observer.On(root, "ParentChanged", func(next_parent):
+                        if next_parent != parent: return
+                        local ticket = close_claims++
+                        if ticket != 0: return
+                        try: list.Destroy()
+                        finally: closed = true
+                    )
+                    return root
+                )
+                local items = []
+                for index in range(96): items.push(index)
+                target.Set(items)
+                owner.Step(0)
+                local turns = 0
+                while not closed and turns < 240:
+                    turns++
+                    wait()
+                if closed: completed++
+                suite.Expect(list.IsDestroyed(), "native callback closed list")
+                suite.Equal(list.GetCount(), 0, "closed list has no committed rows")
+                suite.Equal(parent.GetChildren().length, 0, "staged and committed roots destroyed")
+                suite.Equal(owner.GetPendingListCount(), 0, "no queued work after close")
+                for row in scopes: suite.Expect(row.IsDestroyed(), "every staged row scope closed")
+            finally:
+                owner.Destroy()
+                observer.Destroy()
+                target.Destroy()
+        suite.Equal(completed, 4, "all native parenting closures observed")
+    )
+    return suite.Report()
+
+return { Run = Run, RunNative = RunNative, RunConcurrent = RunConcurrent }

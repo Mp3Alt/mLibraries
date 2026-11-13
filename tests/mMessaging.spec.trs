@@ -1,0 +1,450 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# Injected storage tests. No native storage or network calls.
+local module = import("/mLibraries/mMessaging")
+local kit = import("/mLibraries/mTestKit")
+local Record = func(value):
+    try:
+        table.keys(value)
+        return true
+    catch invalid: return false
+local Copy = nil
+Copy = func(value):
+    if value == nil or value == true or value == false: return value
+    try:
+        string.length(value)
+        return value
+    catch text: pass
+    if Record(value):
+        local result = {}
+        for key in table.keys(value): result[key] = Copy(value[key])
+        return result
+    try:
+        local length = value.length
+        local result = []
+        for index in range(length): result.push(Copy(value[index]))
+        return result
+    catch scalar: return value
+local Harness = func():
+    local state = { Time = 1000, Values = {}, Reads = 0, Writes = 0, FailRead = false, FailWrite = false, DropAck = false, Conflict = nil, ReadHook = nil, UpdateHook = nil }
+    local backend = {}
+    backend.GetAsync = func(key):
+        state.Reads += 1
+        if state.FailRead: throw "injected read failure"
+        local hook = state.ReadHook
+        state.ReadHook = nil
+        if hook != nil: hook()
+        return Copy(state.Values[key])
+    backend.UpdateAsync = func(key, transform):
+        state.Writes += 1
+        if state.FailWrite: throw "injected write failure"
+        local hook = state.UpdateHook
+        state.UpdateHook = nil
+        if hook != nil: hook()
+        local proposed = transform(Copy(state.Values[key]))
+        local conflict = state.Conflict
+        state.Conflict = nil
+        if conflict != nil:
+            conflict()
+            proposed = transform(Copy(state.Values[key]))
+        if proposed == nil: return nil
+        state.Values[key] = Copy(proposed)
+        if state.DropAck:
+            state.DropAck = false
+            throw "injected lost acknowledgement"
+        return Copy(proposed)
+    local New = func(config):
+        if config == nil: config = { Topic = "admin", PollSeconds = 5 }
+        return module.New(config, { Store = backend, Clock = expr(): state.Time })
+    return { State = state, New = New }
+
+local Run = func():
+    local suite = kit.New("mMessaging")
+    suite.Test("construction performs no read or write", func():
+        local h = Harness()
+        local bus = h.New()
+        suite.Equal(h.State.Reads, 0, "no read during construction")
+        suite.Equal(h.State.Writes, 0, "no write during construction")
+        bus.Destroy()
+    )
+    suite.Test("first poll establishes a cursor without replaying retained history", func():
+        local h = Harness()
+        local a = h.New()
+        suite.Expect(a.Publish({ Kind = "old" }).Ok, "history stored")
+        local b = h.New()
+        local seen = 0
+        b.Subscribe(func(message): seen += 1)
+        local result = b.Step()
+        suite.Expect(result.Ok and result.Value.Initialized, "cursor initialized")
+        suite.Equal(result.Value.Sequence, 1, "latest sequence retained")
+        suite.Equal(seen, 0, "no historical delivery")
+        a.Destroy()
+        b.Destroy()
+    )
+    suite.Test("independent services receive new committed messages in sequence", func():
+        local h = Harness()
+        local a = h.New()
+        local b = h.New()
+        suite.Expect(b.Step().Ok, "receiver initialized")
+        local seen = []
+        b.Subscribe(func(message): seen.push(message))
+        suite.Expect(a.Publish({ Count = 0, Enabled = false }).Ok, "zero and false publication")
+        suite.Expect(a.Publish({ Kind = "second" }).Ok, "second publication")
+        h.State.Time += 5
+        local result = b.Step()
+        suite.Expect(result.Ok, "poll succeeded")
+        suite.Equal(result.Value.Delivered, 2, "both new messages")
+        suite.Equal(seen[0].Sequence, 1, "first sequence")
+        suite.Equal(seen[1].Sequence, 2, "second sequence")
+        suite.Equal(seen[0].Data.Count, 0, "zero preserved")
+        suite.Equal(seen[0].Data.Enabled, false, "false preserved")
+        a.Destroy()
+        b.Destroy()
+    )
+    suite.Test("poll pacing avoids reads before the explicit deadline", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        for index in range(10): suite.Expect(bus.Step().Value.Noop, "early Step is a no-op")
+        suite.Equal(h.State.Reads, 1, "one read")
+        h.State.Time += 4.9
+        suite.Expect(bus.Step().Value.Noop, "fractional deadline respected")
+        h.State.Time += 0.1
+        suite.Expect(not bus.Step().Value.Noop, "due poll runs")
+        suite.Equal(h.State.Reads, 2, "second due read")
+        bus.Destroy()
+    )
+    suite.Test("a failed read preserves the cursor and consumes its polling interval", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        bus.Publish({ Kind = "retained" })
+        h.State.Time += 5
+        h.State.FailRead = true
+        suite.Equal(bus.Step().Ok, false, "injected failure returned")
+        suite.Expect(bus.Step().Value.Noop, "failure does not start a retry loop")
+        h.State.FailRead = false
+        h.State.Time += 5
+        suite.Equal(bus.Step().Value.Delivered, 1, "cursor did not skip the pending message")
+        bus.Destroy()
+    )
+    suite.Test("publication and subscriber values cannot mutate stored history", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        local input = { Nested = { Count = 7 } }
+        local published = bus.Publish(input)
+        input.Nested.Count = 90
+        published.Value.Data.Nested.Count = 91
+        local observed = nil
+        bus.Subscribe(func(message): message.Data.Nested.Count = 92)
+        bus.Subscribe(func(message): observed = message.Data.Nested.Count)
+        h.State.Time += 5
+        suite.Equal(bus.Step().Value.Delivered, 1, "one message delivered")
+        suite.Equal(observed, 7, "each subscriber gets an independent copy")
+        local later = h.New()
+        later.Step()
+        suite.Equal(h.State.Values["topic:admin"].Data.Messages[0].Data.Nested.Count, 7, "stored data untouched")
+        bus.Destroy()
+        later.Destroy()
+    )
+    suite.Test("listener exceptions do not block later listeners or cause replay", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        local delivered = 0
+        bus.Subscribe(func(message): throw "injected listener failure")
+        bus.Subscribe(func(message): delivered += 1)
+        bus.Publish({ Kind = "test" })
+        h.State.Time += 5
+        local result = bus.Step()
+        suite.Equal(result.Value.ListenerErrors, 1, "listener failure reported")
+        suite.Equal(delivered, 1, "later listener ran")
+        h.State.Time += 5
+        suite.Equal(bus.Step().Value.Delivered, 0, "failed listener is not retried")
+        bus.Destroy()
+    )
+    suite.Test("disconnection and subscription changes follow ordered signal semantics", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        local seen = ""
+        local second = nil
+        local added = false
+        bus.Subscribe(func(message):
+            seen += "A"
+            second.Disconnect()
+            if not added:
+                added = true
+                bus.Subscribe(func(next): seen += "C")
+        )
+        second = bus.Subscribe(func(message): seen += "B")
+        bus.Publish({})
+        h.State.Time += 5
+        bus.Step()
+        suite.Equal(seen, "A", "removed listener skipped; new listener waits")
+        bus.Publish({})
+        h.State.Time += 5
+        bus.Step()
+        suite.Equal(seen, "AAC", "registration order retained")
+        bus.Destroy()
+    )
+    suite.Test("small retained rings report missing sequence history", func():
+        local h = Harness()
+        local writer = h.New({ Topic = "admin", Capacity = 2 })
+        local reader = h.New()
+        reader.Step()
+        for index in range(5): suite.Expect(writer.Publish({ Number = index }).Ok, "bounded publication")
+        h.State.Time += 5
+        local result = reader.Step().Value
+        suite.Equal(result.Delivered, 2, "retained suffix delivered")
+        suite.Equal(result.Missed, 3, "discarded history reported")
+        suite.Equal(result.Sequence, 5, "cursor advances through the observed history")
+        writer.Destroy()
+        reader.Destroy()
+    )
+    suite.Test("expired messages are skipped and never replayed", func():
+        local h = Harness()
+        local bus = h.New({ Topic = "admin", PollSeconds = 5, MaxAge = 10 })
+        bus.Step()
+        bus.Publish({})
+        h.State.Time += 11
+        local result = bus.Step().Value
+        suite.Equal(result.Delivered, 0, "expired message not dispatched")
+        suite.Equal(result.Expired, 1, "expiry reported")
+        h.State.Time += 5
+        suite.Equal(bus.Step().Value.Expired, 0, "cursor consumes expired entry")
+        bus.Destroy()
+    )
+    suite.Test("publishing removes expired retained records", func():
+        local h = Harness()
+        local bus = h.New({ Topic = "admin", MaxAge = 10 })
+        bus.Publish({ Kind = "old" })
+        h.State.Time += 11
+        bus.Publish({ Kind = "new" })
+        local messages = h.State.Values["topic:admin"].Data.Messages
+        suite.Equal(messages.length, 1, "expired prefix removed")
+        suite.Equal(messages[0].Sequence, 2, "sequence remains monotonic")
+        bus.Destroy()
+    )
+    suite.Test("a stale cached reply cannot rewind a receiver cursor", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        bus.Publish({ Kind = "one" })
+        local old = Copy(h.State.Values["topic:admin"])
+        bus.Publish({ Kind = "two" })
+        local latest = Copy(h.State.Values["topic:admin"])
+        h.State.Time += 5
+        suite.Equal(bus.Step().Value.Delivered, 2, "latest values consumed")
+        h.State.Values["topic:admin"] = old
+        h.State.Time += 5
+        local stale = bus.Step().Value
+        suite.Expect(stale.Stale, "older cache identified")
+        suite.Equal(stale.Sequence, 2, "cursor did not rewind")
+        h.State.Values["topic:admin"] = latest
+        h.State.Time += 5
+        suite.Equal(bus.Step().Value.Delivered, 0, "old values not delivered twice")
+        bus.Destroy()
+    )
+    suite.Test("corrupt topic data preserves the previous cursor", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        bus.Publish({ Kind = "pending" })
+        local good = Copy(h.State.Values["topic:admin"])
+        h.State.Values["topic:admin"] = { Invalid = true }
+        h.State.Time += 5
+        suite.Equal(bus.Step().Ok, false, "corrupt envelope rejected")
+        h.State.Values["topic:admin"] = good
+        h.State.Time += 5
+        suite.Equal(bus.Step().Value.Delivered, 1, "pending message survived failure")
+        bus.Destroy()
+    )
+    suite.Test("malformed topic sequences and message records are rejected", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        bus.Publish({})
+        local good = Copy(h.State.Values["topic:admin"])
+        for bad in [
+            { Sequence = -1, Messages = [] },
+            { Sequence = 1 + 5e-11, Messages = [] },
+            { Sequence = 1, Messages = { length = 0 } },
+            { Sequence = 1, Messages = [{ Sequence = 1, SentAt = 1000, Data = false }] },
+            { Sequence = 1, Messages = [{ Sequence = 1, SentAt = -1, Data = {} }] },
+            { Sequence = 2, Messages = [{ Sequence = 1, SentAt = 1000, Data = {} }] },
+            { Sequence = 1, Messages = [{ Sequence = 1, SentAt = 1000, Data = {} }, { Sequence = 1, SentAt = 1000, Data = {} }] }
+        ]:
+            h.State.Values["topic:admin"] = Copy(good)
+            h.State.Values["topic:admin"].Data = bad
+            h.State.Time += 5
+            suite.Equal(bus.Step().Ok, false, "malformed topic rejected")
+        h.State.Values["topic:admin"] = good
+        h.State.Time += 5
+        suite.Equal(bus.Step().Value.Delivered, 1, "invalid rows did not advance cursor")
+        bus.Destroy()
+    )
+    suite.Test("conflict reruns retain an independent publisher's committed message", func():
+        local h = Harness()
+        local a = h.New()
+        local b = h.New()
+        local reader = h.New()
+        reader.Step()
+        local order = ""
+        reader.Subscribe(func(message): order += message.Data.Kind)
+        h.State.Conflict = func(): suite.Expect(b.Publish({ Kind = "B" }).Ok, "competing writer committed")
+        local saved = a.Publish({ Kind = "A" })
+        suite.Expect(saved.Ok, "outer publication confirmed")
+        suite.Equal(saved.Value.Sequence, 2, "rerun uses latest sequence")
+        h.State.Time += 5
+        reader.Step()
+        suite.Equal(order, "BA", "both committed values retained in order")
+        a.Destroy()
+        b.Destroy()
+        reader.Destroy()
+    )
+    suite.Test("an unconfirmed publication is not automatically retried", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        h.State.DropAck = true
+        suite.Equal(bus.Publish({ Kind = "committed" }).Ok, false, "lost acknowledgement reported")
+        suite.Equal(h.State.Writes, 1, "no wrapper write retry")
+        h.State.Time += 5
+        suite.Equal(bus.Step().Value.Delivered, 1, "committed value can still be observed")
+        bus.Destroy()
+    )
+    suite.Test("failed writes release the publication gate", func():
+        local h = Harness()
+        local bus = h.New()
+        h.State.FailWrite = true
+        suite.Equal(bus.Publish({}).Ok, false, "write error returned")
+        h.State.FailWrite = false
+        suite.Expect(bus.Publish({}).Ok, "subsequent explicit publication admitted")
+        bus.Destroy()
+    )
+    suite.Test("reentrant publication and polling are refused without extra I/O", func():
+        local h = Harness()
+        local bus = h.New()
+        local nested = nil
+        h.State.UpdateHook = func(): nested = bus.Publish({})
+        suite.Expect(bus.Publish({}).Ok, "outer publication completed")
+        suite.Equal(nested.Code, "Busy", "nested publication refused")
+        suite.Equal(h.State.Writes, 1, "one write")
+        h.State.ReadHook = func(): nested = bus.Step()
+        suite.Expect(bus.Step().Ok, "outer poll completed")
+        suite.Equal(nested.Code, "Busy", "nested poll refused")
+        suite.Equal(h.State.Reads, 1, "one read")
+        bus.Destroy()
+    )
+    suite.Test("listener destruction stops later dispatch and disconnects subscriptions", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        local later = 0
+        local connection = bus.Subscribe(func(message): bus.Destroy())
+        bus.Subscribe(func(message): later += 1)
+        bus.Publish({})
+        bus.Publish({})
+        h.State.Time += 5
+        local result = bus.Step()
+        suite.Expect(result.Ok and result.Value.Stopped, "poll reports callback teardown")
+        suite.Equal(later, 0, "later subscriber did not run")
+        suite.Equal(connection.IsConnected(), false, "owned signal disconnected")
+        suite.Equal(bus.Step().Code, "Closed", "future polls refused")
+        suite.Equal(bus.Publish({}).Code, "Closed", "future writes refused")
+        suite.Throws(func(): bus.Subscribe(func(message): pass), "closed subscribe rejected")
+        bus.Destroy()
+    )
+    suite.Test("destruction during a read cannot deliver or initialize stale work", func():
+        local h = Harness()
+        local bus = h.New()
+        h.State.ReadHook = func(): bus.Destroy()
+        suite.Equal(bus.Step().Code, "Closed", "late read result refused")
+        suite.Expect(bus.IsDestroyed(), "destruction retained")
+    )
+    suite.Test("invalid and backwards clocks perform no additional I/O", func():
+        local h = Harness()
+        local bus = h.New()
+        bus.Step()
+        h.State.Time = 999
+        suite.Equal(bus.Step().Code, "ClockError", "backwards poll rejected")
+        suite.Equal(bus.Publish({}).Code, "ClockError", "backwards publication rejected")
+        h.State.Time = 0 / 0
+        suite.Equal(bus.Publish({}).Code, "ClockError", "nonfinite clock rejected")
+        suite.Equal(h.State.Reads, 1, "no failed-clock reads")
+        suite.Equal(h.State.Writes, 0, "no failed-clock writes")
+        bus.Destroy()
+    )
+    suite.Test("payload boundaries preserve valid data and reject objects cycles and oversized values", func():
+        local h = Harness()
+        local bus = h.New()
+        local full = { Items = [] }
+        for index in range(126): full.Items.push(index)
+        suite.Expect(bus.Publish(full).Ok, "128-node payload accepted")
+        full.Items.push(126)
+        suite.Equal(bus.Publish(full).Code, "InvalidPayload", "129-node payload rejected")
+        suite.Expect(bus.Publish({ Text = string.repeat("x", 2044) }).Ok, "2048 text characters accepted including key")
+        suite.Equal(bus.Publish({ Text = string.repeat("x", 2045) }).Code, "InvalidPayload", "text overflow rejected")
+        local cycle = {}
+        cycle.Self = cycle
+        local identity = {}
+        local wrong_keys = {}
+        wrong_keys[identity] = 1
+        for value in [false, 0, "text", [], { Fn = func(): pass }, { Number = 0 / 0 }, cycle, wrong_keys, { A = { B = { C = { D = { E = 1 } } } } }]:
+            suite.Equal(bus.Publish(value).Code, "InvalidPayload", "unsupported message rejected")
+        bus.Destroy()
+    )
+    suite.Test("aggregate retention stays inside the shared-record budget", func():
+        local h = Harness()
+        local bus = h.New({ Topic = "admin", Capacity = 64, PollSeconds = 5 })
+        bus.Step()
+        bus.Publish({})
+        local payload = { Items = [] }
+        for index in range(126): payload.Items.push(index)
+        local record = h.State.Values["topic:admin"].Data
+        record.Sequence = 31
+        record.Messages = []
+        for index in range(31): record.Messages.push({ Sequence = index + 1, SentAt = 1000, Data = Copy(payload) })
+        local result = bus.Publish(payload)
+        suite.Expect(result.Ok, "largest valid payload still publishes")
+        suite.Equal(result.Value.Sequence, 32, "new sequence confirmed")
+        suite.Equal(h.State.Values["topic:admin"].Data.Messages.length, 31, "aggregate budget bounds effective retained count")
+        h.State.Time += 5
+        suite.Equal(bus.Step().Value.Missed, 1, "budget eviction is reported as missing history")
+        bus.Destroy()
+    )
+    suite.Test("configuration and subscription capacities are bounded", func():
+        local h = Harness()
+        for config in [
+            {}, { Topic = "" }, { Topic = "bad topic" }, { Topic = string.repeat("a", 33) },
+            { Topic = "admin", PollSeconds = 4.9 }, { Topic = "admin", Capacity = 0 },
+            { Topic = "admin", Capacity = 65 }, { Topic = "admin", Capacity = 1.5 },
+            { Topic = "admin", Capacity = 1 + 5e-11 },
+            { Topic = "admin", MaxAge = 9 }, { Topic = "admin", Name = "" }
+        ]: suite.Throws(func(): h.New(config), "invalid configuration rejected")
+        local bus = h.New()
+        local connections = []
+        for index in range(64): connections.push(bus.Subscribe(func(message): pass))
+        suite.Throws(func(): bus.Subscribe(func(message): pass), "subscriber bound enforced")
+        connections[0].Disconnect()
+        suite.Expect(bus.Subscribe(func(message): pass).IsConnected(), "disconnected slot reusable")
+        bus.Destroy()
+    )
+    suite.Test("topics have independent histories within a named backend", func():
+        local h = Harness()
+        local a = h.New({ Topic = "one", PollSeconds = 5 })
+        local b = h.New({ Topic = "two", PollSeconds = 5 })
+        a.Step()
+        b.Step()
+        a.Publish({})
+        h.State.Time += 5
+        suite.Equal(a.Step().Value.Delivered, 1, "same topic observes own publication")
+        suite.Equal(b.Step().Value.Delivered, 0, "other topic remains empty")
+        a.Destroy()
+        b.Destroy()
+    )
+    return suite.Report()
+
+return { Run = Run }

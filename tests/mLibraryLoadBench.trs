@@ -1,0 +1,583 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+# CPU-side library workloads. Every storage and transport adapter below is local.
+# local report = import("/mLibraries/tests/mLibraryLoadBench").Run(nil, nil)
+
+local mSignal = import("/mLibraries/mSignal")
+local mCleanup = import("/mLibraries/mCleanup")
+local mAsync = import("/mLibraries/mAsync")
+local mCommand = import("/mLibraries/mCommand")
+local mPacket = import("/mLibraries/mPacket")
+local mNet = import("/mLibraries/mNet")
+local mState = import("/mLibraries/mState")
+local mPlayer = import("/mLibraries/mPlayer")
+local mData = import("/mLibraries/mData")
+local mSpring = import("/mLibraries/mSpring")
+local mStore = import("/mLibraries/mStore")
+local mBan = import("/mLibraries/mBan")
+local mMessaging = import("/mLibraries/mMessaging")
+
+local Same = expr(a, b): not (a < b or a > b)
+local Require = func(value, message):
+    if value != true: throw message
+local Noop = func(): pass
+local ExactCount = expr(value, expected): Same(value, expected)
+local Fixture = func(run, verify, destroy):
+    if destroy == nil: destroy = Noop
+    return { Run = run, Verify = verify, Destroy = destroy }
+
+# No waits, callback replay, serialization, cache or network latency is simulated.
+# Values belong to these fixtures. Public methods still perform their own copies.
+local RawStore = func():
+    local rows = {}
+    local calls = { Reads = 0, Updates = 0 }
+    return {
+        Rows = rows,
+        Calls = calls,
+        GetAsync = func(key):
+            calls.Reads += 1
+            return rows[key]
+        ,
+        UpdateAsync = func(key, transform):
+            calls.Updates += 1
+            local next = transform(rows[key])
+            if next != nil: rows[key] = next
+            return next
+    }
+
+local Records = func(count):
+    local result = []
+    for index in range(count):
+        result.push({ Id = index + 1, Quantity = index % 17, Flags = index % 8 })
+    return result
+
+local Codec = func():
+    return mPacket.New({ Id = 7, Fields = [
+        { Name = "Id", Type = "integer", Min = 0, Max = 65535 },
+        { Name = "Quantity", Type = "integer", Min = 0, Max = 65535 },
+        { Name = "Flags", Type = "integer", Min = 0, Max = 255 }
+    ] })
+
+local BanRecords = func(count):
+    local result = {}
+    for index in range(count):
+        local id = index + 1
+        result[tostring(id)] = {
+            Id = "fixture:" + id,
+            UserId = id,
+            Name = "Player " + id,
+            ActorId = 999,
+            Actor = "Owner",
+            Reason = "Fixture record",
+            IssuedAt = 1000,
+            ExpiresAt = 0
+        }
+    return result
+
+local cases = []
+local Add = func(name, unit, operations, cap, build):
+    cases.push({ Name = name, Unit = unit, Operations = operations, Cap = cap, Build = build })
+
+Add("control.loop", "loop iteration", 1, 65536, func():
+    local total = 0
+    return Fixture(func(count):
+        for index in range(count): total += index % 17
+        return count
+    , expr(count): total >= 0, nil)
+)
+
+Add("signal.fanout32", "listener delivery", 32, 8192, func():
+    local signal = mSignal.New()
+    local deliveries = 0
+    local handler = func(payload): deliveries += payload
+    for index in range(32): signal.Connect(handler)
+    return Fixture(func(count):
+        for index in range(count):
+            Require(signal.Fire(1).length == 0, "Signal listener failed.")
+        return count
+    , expr(count): ExactCount(deliveries, count * 32) and signal.GetListenerCount() == 32, signal.Destroy)
+)
+
+Add("signal.connect-disconnect32", "connection lifetime", 32, 2048, func():
+    local signal = mSignal.New()
+    return Fixture(func(count):
+        for index in range(count):
+            local connections = []
+            for listener in range(32): connections.push(signal.Connect(Noop))
+            for connection in connections: connection.Disconnect()
+        return count
+    , expr(count): signal.GetListenerCount() == 0, signal.Destroy)
+)
+
+Add("cleanup.retire32", "cleanup callback", 32, 4096, func():
+    local retired = 0
+    local callback = func(): retired += 1
+    return Fixture(func(count):
+        for index in range(count):
+            local owner = mCleanup.New()
+            for resource in range(32): owner.Add(callback)
+            Require(owner.Destroy().length == 0, "Cleanup callback failed.")
+            Require(owner.GetCount() == 0, "Cleanup retained callbacks.")
+        return count
+    , expr(count): ExactCount(retired, count * 32), nil)
+)
+
+Add("async.immediate", "completed job", 1, 8192, func():
+    local runs = 0
+    local tasks = mAsync.New({ Spawn = func(work): work(), Wait = Noop })
+    local work = func(token, payload):
+        token.Checkpoint()
+        runs += 1
+        return payload
+    return Fixture(func(count):
+        for index in range(count):
+            local outcome = tasks.Run(work, index).GetOutcome()
+            Require(outcome.Status == "Succeeded" and Same(outcome.Value, index), "Async completion failed.")
+        return count
+    , expr(count): ExactCount(runs, count), nil)
+)
+
+Add("async.cancel-pending", "cancelled job shell", 1, 8192, func():
+    local queued = nil
+    local runs = 0
+    local tasks = mAsync.New({ Spawn = func(work): queued = work, Wait = Noop })
+    local work = func(token, payload): runs += 1
+    return Fixture(func(count):
+        for index in range(count):
+            local job = tasks.Run(work, index)
+            Require(job.Cancel(), "Async cancellation rejected.")
+            local dispatch = queued
+            queued = nil
+            dispatch()
+            Require(job.GetOutcome().Status == "Cancelled", "Cancelled job ran.")
+        return count
+    , expr(count): runs == 0 and queued == nil, nil)
+)
+
+local CommandFixture = func(parse_only):
+    local commands = mCommand.New()
+    local runs = 0
+    Require(commands.Register({ Name = "sample", Arguments = [
+        { Name = "amount", Type = "number" },
+        { Name = "enabled", Type = "boolean" },
+        { Name = "text", Type = "string" }
+    ], Run = func(context, args):
+        runs += 1
+        return args.amount
+    }).Ok, "Command registration failed.")
+    local context = { Authorize = expr(description): true }
+    local text = "sample 12.5 true \"two words\""
+    return Fixture(func(count):
+        for index in range(count):
+            local result = nil
+            if parse_only: result = commands.Parse(text)
+            else: result = commands.Execute(context, text)
+            Require(result.Ok, "Command workload failed.")
+        return count
+    , func(count):
+        if parse_only: return runs == 0
+        return ExactCount(runs, count)
+    , nil)
+Add("command.parse-quoted", "bounded parse", 1, 4096, expr(): CommandFixture(true))
+Add("command.authorized", "authorized dispatch", 1, 4096, expr(): CommandFixture(false))
+
+Add("state.chain16", "derived recomputation", 16, 2048, func():
+    local source = mState.New(0)
+    local leaf = source
+    for depth in range(16): leaf = mState.Derived([leaf], expr(values): values[0] + 1)
+    local deliveries = 0
+    leaf.Observe(func(value): deliveries += 1)
+    return Fixture(func(count):
+        for index in range(count): Require(source.Set(index + 1).length == 0, "State chain failed.")
+        return count
+    , expr(count): ExactCount(deliveries, count) and ExactCount(leaf.Get(), count + 16), source.Destroy)
+)
+
+Add("state.batch32", "derived recomputation", 32, 2048, func():
+    local left = mState.New(0)
+    local right = mState.New(0)
+    local nodes = []
+    local deliveries = 0
+    for index in range(32):
+        local node = mState.Derived([left, right], expr(values): values[0] + values[1])
+        node.Observe(func(value): deliveries += 1)
+        nodes.push(node)
+    return Fixture(func(count):
+        for index in range(count):
+            Require(mState.Batch(func():
+                left.Set(index + 1)
+                right.Set(index + 1)
+            ).length == 0, "State batch failed.")
+        return count
+    , expr(count): ExactCount(deliveries, count * 32) and ExactCount(nodes[0].Get(), count * 2), func():
+        left.Destroy()
+        right.Destroy()
+    )
+)
+
+Add("spring.retarget32", "scalar spring step", 32, 4096, func():
+    local springs = []
+    for index in range(32): springs.push(mSpring.New(0, nil))
+    local steps = 0
+    return Fixture(func(count):
+        for index in range(count):
+            local target = index % 2
+            for spring in springs:
+                spring.SetTarget(target)
+                local value = spring.Step(1 / 60)
+                Require(value >= 0 and value <= 1, "Spring value escaped its bounds.")
+                steps += 1
+        return count
+    , expr(count): ExactCount(steps, count * 32), nil)
+)
+
+local PacketFixture = func(operation):
+    local codec = Codec()
+    local records = Records(64)
+    local packet = codec.Encode(records)
+    Require(packet.Ok, "Packet preparation failed.")
+    Require(codec.Decode(packet.Value).Ok, "Packet roundtrip failed.")
+    if operation == "invalid": packet.Value[packet.Value.length - 1] = 999
+    local accepted = 0
+    local rejected = 0
+    return Fixture(func(count):
+        for index in range(count):
+            local result = nil
+            if operation == "encode": result = codec.Encode(records)
+            else: result = codec.Decode(packet.Value)
+            if result.Ok: accepted += 1
+            else: rejected += 1
+        return count
+    , func(count):
+        if operation == "invalid": return rejected == count and accepted == 0
+        return accepted == count and rejected == 0
+    , nil)
+Add("packet.encode64", "record encoded", 64, 2048, expr(): PacketFixture("encode"))
+Add("packet.decode64", "record decoded", 64, 2048, expr(): PacketFixture("decode"))
+Add("packet.invalid-tail64", "packet rejected", 1, 2048, expr(): PacketFixture("invalid"))
+
+local NetFixture = func(allowed):
+    local now = 1000
+    local peer = {}
+    local receive_server = nil
+    local receive_client = nil
+    local client = nil
+    local runs = 0
+    local closed = 0
+    local server = mNet.NewServer({
+        Clock = expr(): now,
+        Burst = 8,
+        Rate = 4,
+        Connect = func(receive):
+            receive_server = receive
+            return { Disconnect = func(): closed += 1 }
+        ,
+        Send = func(sender, wire): receive_client(wire)
+    })
+    client = mNet.NewClient({
+        Clock = expr(): now,
+        Connect = func(receive):
+            receive_client = receive
+            return { Disconnect = func(): closed += 1 }
+        ,
+        Send = func(wire): receive_server(peer, wire)
+    })
+    local codec = Codec()
+    local payload = codec.Encode(Records(32)).Value
+    server.Register({
+        Name = "sample",
+        Kind = "Request",
+        Authorize = expr(context): allowed,
+        Validate = codec.Decode,
+        Run = func(context, value):
+            runs += 1
+            return value.length
+    })
+    return Fixture(func(count):
+        for index in range(count):
+            now += 1
+            local outcome = client.Request("sample", payload).GetOutcome()
+            if allowed: Require(outcome.Ok and outcome.Value == 32, "Injected net roundtrip failed.")
+            else: Require(outcome.Code == "Denied", "Injected net denial failed.")
+        return count
+    , func(count):
+        if allowed: return runs == count
+        return runs == 0
+    , func():
+        client.Destroy()
+        server.Destroy()
+        Require(closed == 2, "Net adapters retained connections.")
+    )
+Add("net.packet-echo32-local", "local request roundtrip", 1, 2048, expr(): NetFixture(true))
+Add("net.denied32-local", "local denied request", 1, 4096, expr(): NetFixture(false))
+
+Add("player.adopt-retire32-local", "player and character lifetime", 32, 256, func():
+    local roster = []
+    for index in range(32): roster.push({ UserId = index + 1, Character = {}, Present = true })
+    local connections = 0
+    local retired = 0
+    local adopted = 0
+    local Connect = func(callback):
+        connections += 1
+        local disconnected = false
+        return { Disconnect = func():
+            if disconnected: return
+            disconnected = true
+            connections -= 1
+        }
+    local adapter = {
+        GetPlayers = func():
+            local result = []
+            for player in roster: result.push(player)
+            return result
+        ,
+        IsPresent = expr(player): player.Present,
+        GetCharacter = expr(player): player.Character,
+        ConnectAdded = Connect,
+        ConnectRemoved = Connect,
+        ConnectCharacter = func(player, callback): return Connect(callback),
+        ConnectEnded = func(character, callback): return Connect(callback)
+    }
+    local Adopt = func(scope):
+        adopted += 1
+        scope.Add(func(): retired += 1)
+    return Fixture(func(count):
+        for index in range(count):
+            local watch = mPlayer.New({ OnPlayer = Adopt, OnCharacter = Adopt }, adapter)
+            Require(watch.GetPlayers().length == 32, "Player adoption failed.")
+            watch.Destroy()
+        return count
+    , expr(count): connections == 0 and adopted == count * 64 and retired == adopted, nil)
+)
+
+local ProfileFixture = func(operation):
+    local raw = RawStore()
+    local now = 1000
+    local service = mData.New({ Name = "LoadFixture", Defaults = { Coins = 0, Items = Records(128) }, Retries = 1 }, {
+        Store = raw,
+        Clock = expr(): now,
+        Wait = func(seconds): throw "CPU fixture attempted a wait.",
+        Spawn = func(work): work(),
+        SessionId = "library-load"
+    })
+    local loaded = service.Load("profile")
+    Require(loaded.Ok, "Profile preparation failed.")
+    local profile = loaded.Profile
+    local edit = func(draft): draft.Coins += 1
+    return Fixture(func(count):
+        for index in range(count):
+            if operation == "get": Require(profile.Get().Items.length == 128, "Profile snapshot failed.")
+            elif operation == "update": profile.Update(edit)
+            else: Require(profile.Save().Ok, "Injected profile save failed.")
+        return count
+    , func(count):
+        if operation == "update": return profile.Get().Coins == count
+        if operation == "save": return raw.Calls.Updates == count + 1 and not profile.GetStatus().Dirty
+        return raw.Calls.Updates == 1
+    , func():
+        Require(profile.Release().Ok, "Profile retirement failed.")
+        Require(service.GetCount() == 0, "Profile was retained.")
+    )
+Add("data.snapshot128-local", "profile snapshot", 1, 512, expr(): ProfileFixture("get"))
+Add("data.update128-local", "profile edit", 1, 256, expr(): ProfileFixture("update"))
+Add("data.save128-local", "local fenced save", 1, 256, expr(): ProfileFixture("save"))
+
+local StoreFixture = func(operation):
+    local raw = RawStore()
+    local store = mStore.New({ Name = "LoadFixture", Key = "policy", Defaults = { RevisionHint = 0, Bans = BanRecords(128), Locked = false } }, { Store = raw })
+    Require(store.Update(expr(draft, revision): { Ok = true, Value = draft }).Ok, "Shared record preparation failed.")
+    local edit = func(draft, revision):
+        draft.RevisionHint += 1
+        return { Ok = true, Value = draft }
+    return Fixture(func(count):
+        for index in range(count):
+            local result = nil
+            if operation == "update": result = store.Update(edit)
+            else: result = store.Read(operation == "fresh")
+            Require(result.Ok, "Injected shared record operation failed.")
+        return count
+    , func(count):
+        local result = store.Read(false)
+        if not result.Ok: return false
+        if operation == "update": return result.Revision == count + 1 and result.Value.RevisionHint == count
+        return result.Revision == 1 and result.Value.RevisionHint == 0
+    , store.Destroy)
+Add("store.read128-local", "shared record read", 1, 128, expr(): StoreFixture("read"))
+Add("store.fresh128-local", "local cancelled-transform read", 1, 128, expr(): StoreFixture("fresh"))
+Add("store.update128-local", "shared record edit", 1, 128, expr(): StoreFixture("update"))
+
+local BanFixture = func(operation):
+    local bans = mBan.New({ Limit = 128 })
+    local records = BanRecords(128)
+    Require(bans.Validate(records), "Ban map preparation failed.")
+    local record = records["64"]
+    return Fixture(func(count):
+        for index in range(count):
+            if operation == "get": Require(bans.Get(records, 64, 1000).UserId == 64, "Ban lookup failed.")
+            elif operation == "list": Require(bans.List(records, 1000).length == 128, "Ban list failed.")
+            else:
+                local result = bans.Set(records, record, 1000)
+                Require(result.Ok, "Ban replacement failed.")
+                records = result.Value
+        return count
+    , expr(count): bans.Validate(records) and records["64"].Id == "fixture:64", nil)
+Add("ban.get128", "validated ban lookup", 1, 256, expr(): BanFixture("get"))
+Add("ban.list128", "sorted ban snapshot", 1, 128, expr(): BanFixture("list"))
+Add("ban.replace128", "ban replacement", 1, 128, expr(): BanFixture("set"))
+
+Add("messaging.publish-poll32-local", "local publication and poll", 1, 128, func():
+    local raw = RawStore()
+    local now = 1000
+    local runtime = { Store = raw, Clock = expr(): now }
+    local options = { Topic = "libraryLoad", Capacity = 32, PollSeconds = 5, MaxAge = 3600 }
+    local publisher = mMessaging.New(options, runtime)
+    local receiver = mMessaging.New(options, runtime)
+    local data = { Kind = "RecordChanged", Revision = 1 }
+    for index in range(32): Require(publisher.Publish(data).Ok, "Message preparation failed.")
+    local deliveries = 0
+    for index in range(8): receiver.Subscribe(func(message): deliveries += 1)
+    Require(receiver.Step().Ok, "Message cursor preparation failed.")
+    return Fixture(func(count):
+        for index in range(count):
+            now += 5
+            Require(publisher.Publish(data).Ok, "Injected publication failed.")
+            local result = receiver.Step()
+            Require(result.Ok and result.Value.Delivered == 1 and result.Value.Missed == 0 and result.Value.ListenerErrors == 0, "Injected poll failed.")
+        return count
+    , expr(count): deliveries == count * 8 and raw.Rows["topic:libraryLoad"].Data.Messages.length == 32, func():
+        receiver.Destroy()
+        publisher.Destroy()
+    )
+)
+
+local Find = func(name):
+    for entry in cases:
+        if entry.Name == name: return entry
+    throw "Unknown library benchmark case."
+
+local List = func():
+    local result = []
+    for entry in cases: result.push({ Name = entry.Name, Unit = entry.Unit, Operations = entry.Operations, MaxIterations = entry.Cap })
+    return result
+
+local Measure = func(name, iterations):
+    local entry = Find(name)
+    local whole = math.floor(iterations)
+    Require(iterations >= 1 and iterations <= entry.Cap and Same(iterations, whole), "Invalid benchmark iteration count.")
+    local fixture = entry.Build()
+    local sample = nil
+    try:
+        local before = host.time()
+        local checksum = fixture.Run(iterations)
+        local after = host.time()
+        Require(after >= before, "Benchmark clock moved backwards.")
+        Require(Same(checksum, iterations) and fixture.Verify(iterations), "Benchmark verification failed.")
+        sample = {
+            Name = name,
+            Unit = entry.Unit,
+            Iterations = iterations,
+            Operations = iterations * entry.Operations,
+            Start = before,
+            End = after,
+            ElapsedMs = (after - before) * 1000,
+            Checksum = checksum,
+            Verified = true
+        }
+    finally: fixture.Destroy()
+    return sample
+
+local Option = func(value, fallback, low, high, whole):
+    if value == nil: return fallback
+    Require((value >= low and value <= high) and not math.is_nan(value) and not math.is_infinite(value), "Invalid benchmark option.")
+    if whole: Require(Same(value, math.floor(value)), "Benchmark option must be a whole number.")
+    return value
+
+local Run = func(options, callbacks):
+    if options == nil: options = {}
+    if callbacks == nil: callbacks = {}
+    local target = Option(options.TargetMs, 30, 10, 200, false)
+    local trials = Option(options.Trials, 5, 3, 9, true)
+    local warmups = Option(options.WarmupIterations, 4, 1, 16, true)
+    local max_iterations = Option(options.MaxIterations, 8192, 1, 65536, true)
+    local budget = Option(options.MaxSeconds, 120, 5, 300, false)
+    local order_offset = Option(options.OrderOffset, 0, 0, 1000000, true)
+    local selected = cases
+    if options.Cases != nil:
+        selected = []
+        for name in options.Cases: selected.push(Find(name))
+    Require(selected.length >= 1 and selected.length <= cases.length, "Invalid benchmark selection.")
+    local start = host.time()
+    local report = {
+        Kind = "mLibraries CPU-side load",
+        Clock = "host.time Unix seconds, documented millisecond precision",
+        TargetMs = target,
+        Trials = trials,
+        WarmupIterations = warmups,
+        OrderOffset = order_offset,
+        Storage = "synchronous local raw adapter, no native I/O",
+        Transport = "synchronous local function calls, no remote serialization",
+        Samples = [],
+        Calibration = [],
+        Failures = [],
+        Truncated = false,
+        Start = start,
+        End = nil,
+        ClockMinimumPositiveMs = nil
+    }
+    local previous = host.time()
+    for reading in range(2048):
+        local now = host.time()
+        local delta = (now - previous) * 1000
+        if delta > 0 and (report.ClockMinimumPositiveMs == nil or delta < report.ClockMinimumPositiveMs): report.ClockMinimumPositiveMs = delta
+        previous = now
+    local Yield = func():
+        if callbacks.Yield != nil: callbacks.Yield()
+    local Expired = func():
+        local now = host.time()
+        return now < start or now - start >= budget
+    local counts = {}
+    for entry in selected:
+        if Expired():
+            report.Truncated = true
+            break
+        try:
+            Measure(entry.Name, math.min(warmups, entry.Cap))
+            local count = 1
+            local cap = math.min(entry.Cap, max_iterations)
+            while true:
+                local sample = Measure(entry.Name, count)
+                report.Calibration.push(sample)
+                Yield()
+                if sample.ElapsedMs >= target or count >= cap: break
+                if Expired():
+                    report.Truncated = true
+                    break
+                count = math.min(count * 2, cap)
+            counts[entry.Name] = count
+        catch failure:
+            report.Failures.push({ Name = entry.Name, Phase = "calibration", Error = tostring(failure) })
+        Yield()
+    for trial in range(trials):
+        for position in range(selected.length):
+            if Expired():
+                report.Truncated = true
+                break
+            local index = (position + trial + order_offset) % selected.length
+            local entry = selected[index]
+            local count = counts[entry.Name]
+            if count == nil: continue
+            try:
+                local sample = Measure(entry.Name, count)
+                sample.Trial = trial + 1
+                sample.Position = position + 1
+                sample.TargetReached = sample.ElapsedMs >= target
+                report.Samples.push(sample)
+                if callbacks.Sample != nil: callbacks.Sample(sample)
+            catch failure:
+                report.Failures.push({ Name = entry.Name, Trial = trial + 1, Phase = "trial", Error = tostring(failure) })
+            Yield()
+        if report.Truncated: break
+    report.End = host.time()
+    return report
+
+return { List = List, Measure = Measure, Run = Run }

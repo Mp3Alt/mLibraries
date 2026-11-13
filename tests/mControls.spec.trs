@@ -1,0 +1,213 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Mp3
+
+local mControls = import("/mLibraries/mControls")
+local mTestKit = import("/mLibraries/mTestKit")
+
+local Run = func():
+    local suite = mTestKit.New("mControls")
+    suite.Test("theme preserves explicit zero tokens", func():
+        local theme = mControls.Theme({ Radius = 0, Padding = 0, Spacing = 0, AnimationSpeed = 0 })
+        suite.Equal(theme.Radius, 0, "square radius")
+        suite.Equal(theme.Padding, 0, "no padding")
+        suite.Equal(theme.Spacing, 0, "no spacing")
+        suite.Equal(theme.AnimationSpeed, 0, "motion disabled")
+    )
+    suite.Test("theme tables and colors are independent", func():
+        local color = new Color4(0.2, 0.3, 0.4)
+        local first = mControls.Theme({ Accent = color })
+        local second = mControls.Theme({ Accent = color })
+        local expected = second.Accent.ToHex()
+        color.R = 1
+        first.Accent.G = 1
+        first.Height = 80
+        suite.Equal(second.Accent.ToHex(), expected, "separate native color values")
+        suite.Equal(mControls.Theme().Height, 36, "private default unchanged")
+    )
+    suite.Test("theme rejects unknown tokens and invalid numeric ranges", func():
+        suite.Throws(func(): mControls.Theme({ Raduus = 8 }), "typo rejected")
+        suite.Throws(func(): mControls.Theme({ Height = 0 }), "zero height rejected")
+        suite.Throws(func(): mControls.Theme({ BorderWidth = -1 }), "negative stroke rejected")
+        suite.Throws(func(): mControls.Theme({ AnimationSpeed = math.huge }), "infinity rejected")
+        suite.Throws(func(): mControls.Theme({ Accent = false }), "invalid color rejected")
+    )
+    suite.Test("parent is required before constructing native resources", func():
+        suite.Throws(func(): mControls.New({}), "missing parent")
+    )
+    return suite.Report()
+
+# Call from a real client script. TextChanged checks need a scheduler turn.
+local RunNative = func():
+    local suite = mTestKit.New("mControls native")
+    local screen = new ScreenUI() { Name = "mControlsSpec", Parent = game.UICanvas }
+    local kit = mControls.New({ Parent = screen, AutoStep = false })
+    try:
+        suite.Test("toggle requests user changes and programmatic writes stay silent", func():
+            local calls = 0
+            local toggle = kit.Toggle({ Value = false, OnChanged = func(value): calls += 1 })
+            toggle.SetValue(true)
+            suite.Equal(calls, 0, "silent setter")
+            toggle.SetDisabled(true)
+            suite.Equal(toggle.Activate(), false, "disabled activation refused")
+            suite.Equal(calls, 0, "disabled callback absent")
+            toggle.SetDisabled(false)
+            suite.Equal(toggle.Activate(), true, "enabled activation")
+            suite.Equal(toggle.GetValue(), false, "boolean changed")
+            suite.Equal(calls, 1, "one semantic request")
+            toggle.SetVisible(false)
+            suite.Equal(toggle.Activate(), false, "hidden activation refused")
+            toggle.Destroy()
+            toggle.Destroy()
+            suite.Equal(kit.GetCount(), 0, "component registration released")
+        )
+        suite.Test("input setter normalizes through native limits without a callback", func():
+            local calls = 0
+            local field = kit.Input({ MaxLength = 4, OnChanged = func(value): calls += 1 })
+            field.SetValue("abcdef")
+            wait(0)
+            suite.Equal(field.GetValue(), field.Root.Text, "native normalized readback retained")
+            suite.Equal(calls, 0, "native TextChanged echo suppressed")
+            field.SetValue("")
+            wait(0)
+            suite.Equal(field.GetValue(), "", "empty text retained")
+            suite.Equal(calls, 0, "clear stayed silent")
+            field.Destroy()
+        )
+        suite.Test("slider clamps and quantizes without formatting stored values", func():
+            local slider = kit.Slider({ Min = 0, Max = 2, Step = 0.1, Value = 0 })
+            slider.SetValue(1.74)
+            suite.Expect(math.abs(slider.GetValue() - 1.7) < 0.000001, "step quantization")
+            slider.SetValue(-5)
+            suite.Equal(slider.GetValue(), 0, "zero minimum")
+            slider.SetValue(20)
+            suite.Equal(slider.GetValue(), 2, "maximum clamp")
+            kit.Step(1)
+            suite.Equal(kit.GetActiveCount(), 0, "motion settles")
+            slider.Destroy()
+        )
+        suite.Test("finite ranges retain small values and sub-resolution increments", func():
+            local small = nil
+            local tiny = nil
+            try:
+                small = kit.Slider({ Min = 0, Max = 1e-12, Value = 0 })
+                small.SetValue(1e-12)
+                suite.Expect(not (small.GetValue() < 1e-12 or small.GetValue() > 1e-12), "small endpoint retained exactly")
+                small.SetValue(0)
+                suite.Expect(not (small.GetValue() < 0 or small.GetValue() > 0), "small value can return to zero")
+                tiny = kit.Slider({ Min = 0, Max = 1, Step = 1e-320, Value = 0.5 })
+                suite.Expect(not (tiny.GetValue() < 0.5 or tiny.GetValue() > 0.5), "finite value survives an unrepresentable quotient")
+                tiny.SetValue(0.75)
+                suite.Expect(not (tiny.GetValue() < 0.75 or tiny.GetValue() > 0.75), "later writes retain finite precision")
+            finally:
+                if small != nil: small.Destroy()
+                if tiny != nil: tiny.Destroy()
+        )
+        suite.Test("dropdown copies options and validates selection atomically", func():
+            local choices = ["One", "Two"]
+            local dropdown = kit.Dropdown({ Options = choices, Value = "One" })
+            choices[0] = "Changed"
+            dropdown.SetValue("Two")
+            suite.Throws(func(): dropdown.SetValue("Missing"), "unknown choice")
+            suite.Equal(dropdown.GetValue(), "Two", "last valid selection retained")
+            dropdown.SetValue(nil)
+            suite.Equal(dropdown.GetValue(), nil, "selection can clear")
+            dropdown.SetOpen(true)
+            dropdown.SetDisabled(true)
+            suite.Equal(dropdown.GetOpen(), false, "disable closes popup")
+            dropdown.Destroy()
+        )
+        suite.Test("failed construction releases native trees and ownership", func():
+            local before_children = screen.GetChildren().length
+            local before_owned = kit.Scope.GetCount()
+            suite.Throws(func(): kit.Dropdown({ Options = ["One"], Value = "Missing" }), "bad initial selection")
+            suite.Throws(func(): kit.IconButton({}), "missing icon image")
+            suite.Throws(func(): kit.Slider({ Min = 1, Max = 1 }), "empty range")
+            suite.Equal(screen.GetChildren().length, before_children, "partial trees removed")
+            suite.Equal(kit.Scope.GetCount(), before_owned, "partial child scopes removed")
+            suite.Equal(kit.GetCount(), 0, "no partial registrations")
+        )
+        suite.Test("dropdown portal escapes layout siblings and releases on hide", func():
+            local before_canvas = game.UICanvas.GetChildren().length
+            local dropdown = kit.Dropdown({ Position = new Vector2(20, 20), Options = ["One", "Two"], Value = "One" })
+            suite.Equal(dropdown.Portal.Parent, game.UICanvas, "portal owns an independent screen")
+            suite.Equal(dropdown.Popup.Parent, dropdown.Portal, "popup escaped clipped component ancestry")
+            wait(0)
+            wait(0)
+            local viewport = game.UICanvas.ViewportSize
+            if viewport.X >= 300 and viewport.Y >= 200:
+                dropdown.SetOpen(true)
+                suite.Expect(dropdown.GetOpen(), "usable viewport opened portal")
+                suite.Equal(dropdown.Portal.DisplayOrder, screen.DisplayOrder + 1, "portal stacks above source screen")
+                suite.Equal(kit.GetOverlayCount(), 1, "one owned open overlay")
+                suite.Expect(dropdown.Popup.Position.Y >= dropdown.Root.AbsolutePosition.Y + dropdown.Root.AbsoluteSize.Y, "popup positioned below trigger")
+                suite.Expect(math.abs(dropdown.Popup.Size.X - dropdown.Root.AbsoluteSize.X) < 0.001, "popup follows trigger width")
+                dropdown.SetVisible(false)
+                suite.Equal(kit.GetOverlayCount(), 0, "hide removed placement work")
+                suite.Equal(dropdown.Portal.Visible, false, "hide dismissed portal")
+            dropdown.Destroy()
+            suite.Equal(game.UICanvas.GetChildren().length, before_canvas, "owned portal screen destroyed")
+        )
+        suite.Test("kit themes preserve component overrides and public snapshots are copied", func():
+            local own = new Color4(0.9, 0.2, 0.1)
+            local inherited = kit.Text({ Text = "Inherited" })
+            local overridden = kit.Text({ Text = "Override", Theme = { Text = own } })
+            local next_color = new Color4(0.2, 0.9, 0.5)
+            kit.Theme.Text.R = 1
+            kit.SetTheme({ Text = next_color })
+            suite.Equal(inherited.Root.TextColor.ToHex(), next_color.ToHex(), "inherited token updated")
+            suite.Equal(overridden.Root.TextColor.ToHex(), own.ToHex(), "component override retained")
+            inherited.Destroy()
+            overridden.Destroy()
+        )
+        suite.Test("all noninteractive containers own their native roots", func():
+            local handles = [kit.Panel({}), kit.Text({}), kit.Button({}), kit.Checkbox({}), kit.Progress({}), kit.Separator({}), kit.Scroll({}), kit.Row({}), kit.Column({}), kit.Window({})]
+            suite.Equal(kit.GetCount(), handles.length, "one registration per component")
+            for handle in handles:
+                suite.Equal(handle.Root.Parent, screen, "parent assigned")
+                handle.Destroy()
+            suite.Equal(kit.GetCount(), 0, "all released")
+        )
+        suite.Test("external root destruction eventually releases its component", func():
+            local control = kit.Toggle({})
+            control.Root.Destroy()
+            for turn in range(5):
+                if control.IsDestroyed(): break
+                wait(0)
+            suite.Expect(control.IsDestroyed(), "native destroyed signal disposed scope")
+            suite.Equal(kit.GetCount(), 0, "external deletion released registration")
+        )
+        suite.Test("repeated component retirement returns to ownership baselines", func():
+            local before_owned = kit.Scope.GetCount()
+            local before_descendants = screen.GetDescendants().length
+            for iteration in range(100):
+                local button = kit.Button({ Text = "Temporary" })
+                local toggle = kit.Toggle({ Value = false })
+                local dropdown = kit.Dropdown({ Options = ["A", "B"], Value = "A" })
+                toggle.SetValue(true)
+                dropdown.SetValue("B")
+                button.Destroy()
+                toggle.Destroy()
+                dropdown.Destroy()
+                if iteration % 10 == 9: wait(0)
+            suite.Equal(kit.GetCount(), 0, "no retired component registrations")
+            suite.Equal(kit.Scope.GetCount(), before_owned, "ownership returned to baseline")
+            suite.Equal(screen.GetDescendants().length, before_descendants, "native descendants returned to baseline")
+            suite.Equal(kit.GetActiveCount(), 0, "no retired animation entries")
+        )
+        suite.Test("destroy cancels active animation and refuses later setters", func():
+            local toggle = kit.Toggle({ Value = false })
+            toggle.SetValue(true)
+            suite.Equal(kit.GetActiveCount(), 1, "one active animation")
+            kit.Destroy()
+            suite.Equal(kit.GetActiveCount(), 0, "active list released")
+            suite.Expect(toggle.IsDestroyed(), "child scope destroyed")
+            suite.Throws(func(): toggle.SetValue(false), "late setter refused")
+            suite.Equal(toggle.Activate(), false, "late callback refused")
+            suite.Equal(screen.GetChildren().length, 0, "native roots released")
+        )
+    finally:
+        kit.Destroy()
+        screen.Destroy()
+    return suite.Report()
+
+return { Run = Run, RunNative = RunNative }
